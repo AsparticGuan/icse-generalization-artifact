@@ -10,6 +10,15 @@ cp init_token_template.sh init_token.sh
 ```
 Then setup your tokens in `init_token.sh`
 
+#### Step 2: Compile cost utility
+```
+cd ./utils/cost
+./compile.sh
+```
+
+#### Step 3: Install alive2 utility
+Please 
+
 #### Step 2: Init the environment
 For example, setup the Qwen-3 model environment
 ```
