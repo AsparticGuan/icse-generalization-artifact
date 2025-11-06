@@ -1,0 +1,535 @@
+{
+  "wall_time": 146.43539023399353,
+  "knowledge": [
+    [
+      "base_model",
+      "2023-12-31+0000"
+    ],
+    [
+      "hint:bug_functions",
+      "2025-08-11+0000"
+    ],
+    [
+      "is_single_func_fix",
+      "2025-08-11+0000"
+    ],
+    [
+      "hint:line_level_bug_locations",
+      "2025-08-11+0000"
+    ]
+  ],
+  "build_count": 4,
+  "build_failure_count": 2,
+  "fast_check_count": 1,
+  "full_check_count": 3,
+  "fast_check_pass": false,
+  "full_check_pass": false,
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 6e4689863407..9b5b4979df15 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -1325,6 +1325,7 @@ Value *InstCombinerImpl::foldAndOrOfICmpsUsingRanges(ICmpInst *ICmp1,\n   const APInt *C1, *C2;\n   if (!match(ICmp1, m_ICmp(Pred1, m_Value(V1), m_APInt(C1))) ||\n       !match(ICmp2, m_ICmp(Pred2, m_Value(V2), m_APInt(C2))))\n+\n     return nullptr;\n \n   // Look through add of a constant offset on V1, V2, or both operands. This\n@@ -1355,12 +1356,100 @@ Value *InstCombinerImpl::foldAndOrOfICmpsUsingRanges(ICmpInst *ICmp1,\n   Value *NewV = V1;\n   std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n   if (!CR) {\n+    // Handle the specific case: (X & -32) != 128 && X != 127  -->  (X - 160) u< -33\n+    if (IsAnd && Pred1 == ICmpInst::ICMP_NE && Pred2 == ICmpInst::ICMP_NE &&\n+        ICmp1 && ICmp2 && C1 && C2) {\n+      const APInt *AndMask = nullptr;\n+      Value *X = nullptr;\n+      if (match(ICmp1->getOperand(0), m_And(m_Value(X), m_APInt(AndMask))) &&\n+          X == ICmp2->getOperand(0)) {\n+        // Check if the AND mask is a negative power of two (like -32)\n+        if (AndMask->isStrictlyNegative() && (-*AndMask).isPowerOf2()) {\n+          APInt Mask = -*AndMask; // positive power of two, e.g., 32\n+          APInt AndValue = *C1;   // value being compared to (X & -M), e.g., 128\n+          APInt XValue = *C2;     // value being compared to X, e.g., 127\n+\n+          // We want: (X & ~Mask+1) == AndValue  -->  X in [AndValue, AndValue + Mask - 1]\n+          // But condition is NE, so we are saying X not in [AndValue, AndValue + Mask - 1]\n+          // And separately X != XValue.\n+          // If XValue == AndValue - 1, then the combined range becomes X not in [AndValue - 1, AndValue + Mask - 1]\n+          // i.e., X - AndValue u< -(Mask + 1) covers the gap?\n+\n+          // Special case: when XValue + 1 == AndValue, then we have:\n+          // X != AndValue - 1 and (X & -Mask) != AndValue  => X not in [AndValue, AndValue + Mask - 1]\n+          // So overall X not in [AndValue - 1, AndValue + Mask - 1]\n+          if (XValue + 1 == AndValue) {\n+            APInt LowerBound = XValue; // = AndValue - 1\n+            APInt UpperBound = AndValue + Mask - 1;\n+            APInt RangeSize = UpperBound - LowerBound + 1;\n+\n+            // We can express: !((X - LowerBound) < RangeSize) as (X - LowerBound) u>= RangeSize\n+            // But we want to return true when X is NOT in the interval, so we want:\n+            // (X - LowerBound) u>= RangeSize  -->  icmp ult (X - LowerBound), RangeSize is false\n+            // So we want: icmp uge (X - LowerBound), RangeSize\n+            // But we can use: icmp ult (X - LowerBound), ~RangeSize + 1? No.\n+\n+            // Actually, we want to return true if X < LowerBound or X > UpperBound.\n+            // That is: (X - LowerBound) u> (UpperBound - LowerBound)\n+            // i.e., (X - LowerBound) u< -(UpperBound - LowerBound + 1) is false.\n+\n+            APInt Range = UpperBound - LowerBound; // e.g., (128+31) - 127 = 160 - 127 = 33\n+            APInt NegRangeMinusOne = -Range - 1;   // e.g., -34? But expected -33\n+\n+            // Wait: the expected result is: icmp ult (x + -160), -33\n+            // -160 = -LowerBound? LowerBound = 127 -> -127, not -160.\n+\n+            // Let's recompute with example:\n+            // X != 127 and (X & -32) != 128\n+            // (X & -32) != 128 means X not in [128, 159] (because 128 + 32 - 1 = 159)\n+            // X != 127\n+            // So overall: X not in [127, 159]\n+            // That is: (X - 127) u> 32 (i.e., >= 33) -> (X - 127) u>= 33\n+            // But we can write: (X - 127) u< 33 -> false => we want !(X - 127 u< 33)\n+            // But that's not efficient.\n+\n+            // Instead, the expected code uses: (X - 160) u< -33\n+            // -33 is 0xFFFFFFDF in i32, which is 4294967263, meaning the range [160, 160+4294967262] wraps.\n+            // But that doesn't match.\n+\n+            // Let me reinterpret expected output:\n+            // %1 = add i32 %x, -160\n+            // %ret = icmp ult i32 %1, -33\n+            // -33 is 0xFFFFFFDF = 4294967263\n+            // So this is: (x - 160) <u 4294967263\n+            // Which is true for x in [160, 0xFFFFFFDF + 159] = [160, 159 + 4294967263] -> wraps to [160, 159] (empty?) no.\n+\n+            // Actually: (x - 160) <u 4294967263 means all values except when (x-160) >= 4294967263\n+            // i.e., x >= 160 + 4294967263 = 4294967423, and x < 160? No.\n+\n+            // Wait: 4294967263 = 2^32 - 33\n+            // So (x - 160) <u (2^32 - 33)  =>  x - 160 in [0, 2^32-34]\n+            // => x in [160, 159 + 2^32 - 33] = [160, 2^32 - 1] and [0, 126] (since 159 + 2^32 - 33 = 2^32 - 1, then next is 0 to 126 to complete?)\n+            // No: it's just [160, 2^32-1] \u222a [0, 126]? But 160 + (2^32 - 34) = 2^32 - 34 + 160 = 2^32 + 126 -> wraps to 126.\n+            // So yes: x in [160, 2^32-1] \u222a [0, 126] => x not in [127, 159] -> exactly what we want.\n+\n+            // So the condition (x-160) <u (2^32-33) is equivalent to x not in [127,159].\n+\n+            // Therefore: LowerBound = 127, UpperBound = 159, Size = 33.\n+            // So we want: (x - (UpperBound+1)) <u (-Size)  => (x - 160) <u -33\n+\n+            APInt Size = UpperBound - LowerBound + 1; // 159 - 127 + 1 = 33\n+            APInt StartAfter = UpperBound + 1; // 160\n+\n+            Value *Add = Builder.CreateAdd(X, ConstantInt::get(Ty, -StartAfter));\n+            return Builder.CreateICmp(ICmpInst::ICMP_ULT, Add, ConstantInt::get(Ty, -Size));\n+          }\n+        }\n+      }\n+    }\n+\n     if (!(ICmp1->hasOneUse() && ICmp2->hasOneUse()) || CR1.isWrappedSet() ||\n         CR2.isWrappedSet())\n       return nullptr;\n \n     // Check whether we have equal-size ranges that only differ by one bit.\n     // In that case we can apply a mask to map one range onto the other.\n+\n     APInt LowerDiff = CR1.getLower() ^ CR2.getLower();\n     APInt UpperDiff = (CR1.getUpper() - 1) ^ (CR2.getUpper() - 1);\n     APInt CR1Size = CR1.getUpper() - CR1.getLower();\n",
+  "log": {
+    "model": "qwen/qwen3-235b-a22b-2507",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an LLVM maintainer.\nUsers have reported a case where LLVM failed to optimize a specific program.\nYou are adding new code or modifying existing code to implement the missing optimization.\nPlease answer with the code directly. Do not include any additional information in the output.\nPlease answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.\n"
+      },
+      {
+        "role": "user",
+        "content": "This is a missed-optimization in InstCombine.\n\nThe following program reveals the missed optimization.\nThe source program is\n```llvm\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n\n```\n\nHowever, current LLVM cannot optimize the source program. The expected optimized program is\n```llvm\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %1 = add i32 %x, -160\n  %ret = icmp ult i32 %1, -33\n  ret i1 %ret\n}\n\n```\nPlease modify the following code in llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp:InstCombinerImpl::foldAndOrOfICmpsUsingRanges to implement the missed optimization:\n```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n  if (V1 != V2) {\n    Value *X;\n    if (match(V1, m_Add(m_Value(X), m_APInt(Offset1))))\n      V1 = X;\n    if (match(V2, m_Add(m_Value(X), m_APInt(Offset2))))\n      V2 = X;\n  }\n\n  if (V1 != V2)\n    return nullptr;\n\n  ConstantRange CR1 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred1) : Pred1, *C1);\n  if (Offset1)\n    CR1 = CR1.subtract(*Offset1);\n\n  ConstantRange CR2 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred2) : Pred2, *C2);\n  if (Offset2)\n    CR2 = CR2.subtract(*Offset2);\n\n  Type *Ty = V1->getType();\n  Value *NewV = V1;\n  std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n  if (!CR) {\n    if (!(ICmp1->hasOneUse() && ICmp2->hasOneUse()) || CR1.isWrappedSet() ||\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```\n\nPlease answer with the code directly. Do not include any additional information in the output.\nPlease answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.\nPlease make sure the answer includes the prefix:\n```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n```\nand the suffix:\n```cpp\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```\n"
+      },
+      {
+        "role": "assistant",
+        "content": "```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n  if (V1 != V2) {\n    Value *X;\n    if (match(V1, m_Add(m_Value(X), m_APInt(Offset1))))\n      V1 = X;\n    if (match(V2, m_Add(m_Value(X), m_APInt(Offset2))))\n      V2 = X;\n  }\n\n  if (V1 != V2)\n    return nullptr;\n\n  ConstantRange CR1 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred1) : Pred1, *C1);\n  if (Offset1)\n    CR1 = CR1.subtract(*Offset1);\n\n  ConstantRange CR2 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred2) : Pred2, *C2);\n  if (Offset2)\n    CR2 = CR2.subtract(*Offset2);\n\n  Type *Ty = V1->getType();\n  Value *NewV = V1;\n  std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n  if (!CR) {\n    // Attempt to optimize cases involving and with power-of-2 alignment mask\n    // and icmp ne patterns that can be combined into a single range check.\n    if (ICmp1 && ICmp2 && Pred1 == ICmpInst::ICMP_NE && Pred2 == ICmpInst::ICMP_NE &&\n        IsAnd && C1 && C2 && V1 == V2) {\n      const APInt *AndMask = nullptr;\n      Value *AndSrc = nullptr;\n      if (match(ICmp1->getOperand(0), m_And(m_Value(AndSrc), m_APInt(AndMask))) &&\n          AndSrc == V1 && AndMask->isPowerOf2() && AndSrc == ICmp2->getOperand(0)) {\n        // We have: (X & -M) != C1  &&  X != C2\n        // This can be optimized if the constraints imply X is outside a single range.\n        // Specifically, if C2 is just below a multiple of M, and C1 is that multiple,\n        // then this represents X not in [C2+1, C2+M-1].\n        APInt M = -*AndMask; // positive power of two\n        if (M.isPowerOf2()) {\n          APInt Low = (*C2 + 1);\n          APInt High = (*C2 + M - 1);\n          if (Low == *C1 && High == (Low + M - 1)) {\n            // Then the condition is equivalent to !(Low <= X <= High)\n            // i.e., X - Low u< -M (since range size is M-1, so -M is unsigned greater than M-1)\n            Value *Add = Builder->CreateAdd(V1, ConstantInt::get(Ty, -Low));\n            return Builder->CreateICmp(ICmpInst::ICMP_ULT, Add, ConstantInt::get(Ty, -M));\n          }\n        }\n      }\n    }\n\n    if (!(ICmp1->hasOneUse() && ICmp2->hasOneUse()) || CR1.isWrappedSet() ||\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```"
+      },
+      {
+        "role": "user",
+        "content": "Your generated code caused the following build failure:\nllvm-project/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp:1378:33: error: base operand of \u2018->\u2019 has non-pointer type \u2018llvm::InstCombiner::BuilderTy\u2019 {aka \u2018llvm::IRBuilder<llvm::TargetFolder, llvm::IRBuilderCallbackInserter>\u2019}\nllvm-project/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp:1379:27: error: base operand of \u2018->\u2019 has non-pointer type \u2018llvm::InstCombiner::BuilderTy\u2019 {aka \u2018llvm::IRBuilder<llvm::TargetFolder, llvm::IRBuilderCallbackInserter>\u2019}\nPlease adjust your code according to the feedback.\nPlease answer with the code directly. Do not include any additional information in the output.\nPlease answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.\nPlease make sure the answer includes the prefix:\n```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n```\nand the suffix:\n```cpp\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```\n"
+      },
+      {
+        "role": "assistant",
+        "content": "```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n  if (V1 != V2) {\n    Value *X;\n    if (match(V1, m_Add(m_Value(X), m_APInt(Offset1))))\n      V1 = X;\n    if (match(V2, m_Add(m_Value(X), m_APInt(Offset2))))\n      V2 = X;\n  }\n\n  if (V1 != V2)\n    return nullptr;\n\n  ConstantRange CR1 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred1) : Pred1, *C1);\n  if (Offset1)\n    CR1 = CR1.subtract(*Offset1);\n\n  ConstantRange CR2 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred2) : Pred2, *C2);\n  if (Offset2)\n    CR2 = CR2.subtract(*Offset2);\n\n  Type *Ty = V1->getType();\n  Value *NewV = V1;\n  std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n  if (!CR) {\n    // Attempt to optimize cases involving and with power-of-2 alignment mask\n    // and icmp ne patterns that can be combined into a single range check.\n    if (ICmp1 && ICmp2 && Pred1 == ICmpInst::ICMP_NE && Pred2 == ICmpInst::ICMP_NE &&\n        IsAnd && C1 && C2 && V1 == V2) {\n      const APInt *AndMask = nullptr;\n      Value *AndSrc = nullptr;\n      if (match(ICmp1->getOperand(0), m_And(m_Value(AndSrc), m_APInt(AndMask))) &&\n          AndSrc == V1 && AndMask->isPowerOf2() && AndSrc == ICmp2->getOperand(0)) {\n        // We have: (X & -M) != C1  &&  X != C2\n        // This can be optimized if the constraints imply X is outside a single range.\n        // Specifically, if C2 is just below a multiple of M, and C1 is that multiple,\n        // then this represents X not in [C2+1, C2+M-1].\n        APInt M = -*AndMask; // positive power of two\n        if (M.isPowerOf2()) {\n          APInt Low = (*C2 + 1);\n          APInt High = (*C2 + M - 1);\n          if (Low == *C1 && High == (Low + M - 1)) {\n            // Then the condition is equivalent to !(Low <= X <= High)\n            // i.e., X - Low u< -M (since range size is M-1, so -M is unsigned greater than M-1)\n            Value *Add = Builder.CreateAdd(V1, ConstantInt::get(Ty, -Low));\n            return Builder.CreateICmp(ICmpInst::ICMP_ULT, Add, ConstantInt::get(Ty, -M));\n          }\n        }\n      }\n    }\n\n    if (!(ICmp1->hasOneUse() && ICmp2->hasOneUse()) || CR1.isWrappedSet() ||\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```"
+      },
+      {
+        "role": "user",
+        "content": "The previous test program `@and_icmp_ne_and_pow2_commute` was not successfully optimized.\nThe expected optimized program is:\n```llvm\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %1 = add i32 %x, -160\n  %ret = icmp ult i32 %1, -33\n  ret i1 %ret\n}\n\n```\n, but the current optimized program is:\n```llvm\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n\n```\nPlease revisit your generated code and adjust it according to the feedback.\n\nPlease answer with the code directly. Do not include any additional information in the output.\nPlease answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.\nPlease make sure the answer includes the prefix:\n```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n```\nand the suffix:\n```cpp\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```\n"
+      },
+      {
+        "role": "assistant",
+        "content": "```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n  if (V1 != V2) {\n    Value *X;\n    if (match(V1, m_Add(m_Value(X), m_APInt(Offset1))))\n      V1 = X;\n    if (match(V2, m_Add(m_Value(X), m_APInt(Offset2))))\n      V2 = X;\n  }\n\n  if (V1 != V2)\n    return nullptr;\n\n  ConstantRange CR1 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred1) : Pred1, *C1);\n  if (Offset1)\n    CR1 = CR1.subtract(*Offset1);\n\n  ConstantRange CR2 = ConstantRange::makeExactICmpRegion(\n      IsAnd ? ICmpInst::getInverseCmpPredicate(Pred2) : Pred2, *C2);\n  if (Offset2)\n    CR2 = CR2.subtract(*Offset2);\n\n  Type *Ty = V1->getType();\n  Value *NewV = V1;\n  std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n  if (!CR) {\n    // Handle the specific case: (X & -32) != 128 && X != 127  -->  (X - 160) u< -33\n    if (IsAnd && Pred1 == ICmpInst::ICMP_NE && Pred2 == ICmpInst::ICMP_NE &&\n        ICmp1 && ICmp2 && C1 && C2) {\n      const APInt *AndMask = nullptr;\n      Value *X = nullptr;\n      if (match(ICmp1->getOperand(0), m_And(m_Value(X), m_APInt(AndMask))) &&\n          X == ICmp2->getOperand(0)) {\n        // Check if the AND mask is a negative power of two (like -32)\n        if (AndMask->isStrictlyNegative() && (-*AndMask).isPowerOf2()) {\n          APInt Mask = -*AndMask; // positive power of two, e.g., 32\n          APInt AndValue = *C1;   // value being compared to (X & -M), e.g., 128\n          APInt XValue = *C2;     // value being compared to X, e.g., 127\n\n          // We want: (X & ~Mask+1) == AndValue  -->  X in [AndValue, AndValue + Mask - 1]\n          // But condition is NE, so we are saying X not in [AndValue, AndValue + Mask - 1]\n          // And separately X != XValue.\n          // If XValue == AndValue - 1, then the combined range becomes X not in [AndValue - 1, AndValue + Mask - 1]\n          // i.e., X - AndValue u< -(Mask + 1) covers the gap?\n\n          // Special case: when XValue + 1 == AndValue, then we have:\n          // X != AndValue - 1 and (X & -Mask) != AndValue  => X not in [AndValue, AndValue + Mask - 1]\n          // So overall X not in [AndValue - 1, AndValue + Mask - 1]\n          if (XValue + 1 == AndValue) {\n            APInt LowerBound = XValue; // = AndValue - 1\n            APInt UpperBound = AndValue + Mask - 1;\n            APInt RangeSize = UpperBound - LowerBound + 1;\n\n            // We can express: !((X - LowerBound) < RangeSize) as (X - LowerBound) u>= RangeSize\n            // But we want to return true when X is NOT in the interval, so we want:\n            // (X - LowerBound) u>= RangeSize  -->  icmp ult (X - LowerBound), RangeSize is false\n            // So we want: icmp uge (X - LowerBound), RangeSize\n            // But we can use: icmp ult (X - LowerBound), ~RangeSize + 1? No.\n\n            // Actually, we want to return true if X < LowerBound or X > UpperBound.\n            // That is: (X - LowerBound) u> (UpperBound - LowerBound)\n            // i.e., (X - LowerBound) u< -(UpperBound - LowerBound + 1) is false.\n\n            APInt Range = UpperBound - LowerBound; // e.g., (128+31) - 127 = 160 - 127 = 33\n            APInt NegRangeMinusOne = -Range - 1;   // e.g., -34? But expected -33\n\n            // Wait: the expected result is: icmp ult (x + -160), -33\n            // -160 = -LowerBound? LowerBound = 127 -> -127, not -160.\n\n            // Let's recompute with example:\n            // X != 127 and (X & -32) != 128\n            // (X & -32) != 128 means X not in [128, 159] (because 128 + 32 - 1 = 159)\n            // X != 127\n            // So overall: X not in [127, 159]\n            // That is: (X - 127) u> 32 (i.e., >= 33) -> (X - 127) u>= 33\n            // But we can write: (X - 127) u< 33 -> false => we want !(X - 127 u< 33)\n            // But that's not efficient.\n\n            // Instead, the expected code uses: (X - 160) u< -33\n            // -33 is 0xFFFFFFDF in i32, which is 4294967263, meaning the range [160, 160+4294967262] wraps.\n            // But that doesn't match.\n\n            // Let me reinterpret expected output:\n            // %1 = add i32 %x, -160\n            // %ret = icmp ult i32 %1, -33\n            // -33 is 0xFFFFFFDF = 4294967263\n            // So this is: (x - 160) <u 4294967263\n            // Which is true for x in [160, 0xFFFFFFDF + 159] = [160, 159 + 4294967263] -> wraps to [160, 159] (empty?) no.\n\n            // Actually: (x - 160) <u 4294967263 means all values except when (x-160) >= 4294967263\n            // i.e., x >= 160 + 4294967263 = 4294967423, and x < 160? No.\n\n            // Wait: 4294967263 = 2^32 - 33\n            // So (x - 160) <u (2^32 - 33)  =>  x - 160 in [0, 2^32-34]\n            // => x in [160, 159 + 2^32 - 33] = [160, 2^32 - 1] and [0, 126] (since 159 + 2^32 - 33 = 2^32 - 1, then next is 0 to 126 to complete?)\n            // No: it's just [160, 2^32-1] \u222a [0, 126]? But 160 + (2^32 - 34) = 2^32 - 34 + 160 = 2^32 + 126 -> wraps to 126.\n            // So yes: x in [160, 2^32-1] \u222a [0, 126] => x not in [127, 159] -> exactly what we want.\n\n            // So the condition (x-160) <u (2^32-33) is equivalent to x not in [127,159].\n\n            // Therefore: LowerBound = 127, UpperBound = 159, Size = 33.\n            // So we want: (x - (UpperBound+1)) <u (-Size)  => (x - 160) <u -33\n\n            APInt Size = UpperBound - LowerBound + 1; // 159 - 127 + 1 = 33\n            APInt StartAfter = UpperBound + 1; // 160\n\n            Value *Add = Builder.CreateAdd(X, ConstantInt::get(Ty, -StartAfter));\n            return Builder.CreateICmp(ICmpInst::ICMP_ULT, Add, ConstantInt::get(Ty, -Size));\n          }\n        }\n      }\n    }\n\n    if (!(ICmp1->hasOneUse() && ICmp2->hasOneUse()) || CR1.isWrappedSet() ||\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```"
+      },
+      {
+        "role": "user",
+        "content": "Your generated code caused the following build failure:\nllvm-project/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp:1367:22: error: \u2018const class llvm::APInt\u2019 has no member named \u2018isStrictlyNegative\u2019; did you mean \u2018isStrictlyPositive\u2019?\nPlease adjust your code according to the feedback.\nPlease answer with the code directly. Do not include any additional information in the output.\nPlease answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.\nPlease make sure the answer includes the prefix:\n```cpp\n    return nullptr;\n\n  // Look through add of a constant offset on V1, V2, or both operands. This\n  // allows us to interpret the V + C' < C'' range idiom into a proper range.\n  const APInt *Offset1 = nullptr, *Offset2 = nullptr;\n```\nand the suffix:\n```cpp\n        CR2.isWrappedSet())\n      return nullptr;\n\n    // Check whether we have equal-size ranges that only differ by one bit.\n    // In that case we can apply a mask to map one range onto the other.\n```\n"
+      }
+    ]
+  },
+  "check_fast_log": [
+    [
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "and_icmp_ne_and_pow2_commute",
+        "body": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmpx1qyugw_']' returned non-zero exit status 1.\n/tmp/tmpx1qyugw_:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n              ^\n<stdin>:4:41: note: scanning from here\ndefine i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n                                        ^\n<stdin>:5:2: note: possible intended match here\n %and = and i32 %x, -32\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmpx1qyugw_\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @and_icmp_ne_and_pow2_commute(i32 %x) { \nnext:3'0                                             X~~~~~~~~~ error: no match found\n          5:  %and = and i32 %x, -32 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          6:  %icmp1 = icmp ne i32 %and, 128 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          7:  %icmp2 = icmp ne i32 %x, 127 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = and i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %1 = add i32 %x, -160\n  %ret = icmp ult i32 %1, -33\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @and_icmp_ne_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp ne i32 %and, 128\n  %icmp2 = icmp ne i32 %x, 127\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_or_icmp_eq_and_non_pow2_mask",
+        "body": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_non_pow2_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[TMP3:%.*]] = icmp eq i32 [[TMP2]], 128\n; CHECK-NEXT:    [[TMP4:%.*]] = or i1 [[TMP1]], [[TMP3]]\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_non_pow2_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[TMP3:%.*]] = icmp eq i32 [[TMP2]], 128\n; CHECK-NEXT:    [[TMP4:%.*]] = or i1 [[TMP1]], [[TMP3]]\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967263\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967263\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 5,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_non_pow2_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[TMP3:%.*]] = icmp eq i32 [[TMP2]], 128\n; CHECK-NEXT:    [[TMP4:%.*]] = or i1 [[TMP1]], [[TMP3]]\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @neg_or_icmp_eq_and_non_pow2_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "or_icmp_eq_and_pow2_commute",
+        "body": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_commute(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[TMP4]]\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmpgfu5obzr']' returned non-zero exit status 1.\n/tmp/tmpgfu5obzr:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n              ^\n<stdin>:4:40: note: scanning from here\ndefine i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n                                       ^\n<stdin>:5:2: note: possible intended match here\n %and = and i32 %x, -32\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmpgfu5obzr\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @or_icmp_eq_and_pow2_commute(i32 %x) { \nnext:3'0                                            X~~~~~~~~~ error: no match found\n          5:  %and = and i32 %x, -32 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          6:  %icmp1 = icmp eq i32 %and, 128 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          7:  %icmp2 = icmp eq i32 %x, 127 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = or i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n  %1 = add i32 %x, -127\n  %ret = icmp ult i32 %1, 33\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @or_icmp_eq_and_pow2_commute(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp1 = icmp eq i32 %and, 128\n  %icmp2 = icmp eq i32 %x, 127\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "and_icmp_ne_and_pow2_mask_equal_to_icmp",
+        "body": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -128\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -128\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, 4294967232\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, 4294967232\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -128\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmp7msapl8s']' returned non-zero exit status 1.\n/tmp/tmp7msapl8s:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -128\n              ^\n<stdin>:4:52: note: scanning from here\ndefine i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n                                                   ^\n<stdin>:6:2: note: possible intended match here\n %and = and i32 %x, -64\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmp7msapl8s\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) { \nnext:3'0                                                        X~~~~~~~~~ error: no match found\n          5:  %icmp1 = icmp ne i32 %x, 63 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          6:  %and = and i32 %x, -64 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          7:  %icmp2 = icmp ne i32 %and, 64 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = and i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %1 = add i32 %x, -128\n  %ret = icmp ult i32 %1, -65\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @and_icmp_ne_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp ne i32 %and, 64\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_or_icmp_eq_and_pow2_multi_use",
+        "body": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_pow2_multi_use(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    call void @use32(i32 [[AND]])\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = or i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_pow2_multi_use(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    call void @use32(i32 [[AND]])\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = or i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndeclare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967264\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndeclare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967264\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 5,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_pow2_multi_use(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp eq i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    call void @use32(i32 [[AND]])\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = or i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "declare void @use32(i32)\n\ndefine i1 @neg_or_icmp_eq_and_pow2_multi_use(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  call void @use32(i32 %and)\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_and_icmp_ne_and_pow2_disjoint",
+        "body": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_pow2_disjoint(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 126\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_pow2_disjoint(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 126\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 5,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_pow2_disjoint(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 126\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @neg_and_icmp_ne_and_pow2_disjoint(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 126\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "and_icmp_ne_and_pow2",
+        "body": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @and_icmp_ne_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @and_icmp_ne_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n; CHECK-LABEL: @and_icmp_ne_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], -33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_ne_and_pow2(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmptczoyi3w']' returned non-zero exit status 1.\n/tmp/tmptczoyi3w:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -160\n              ^\n<stdin>:4:33: note: scanning from here\ndefine i1 @and_icmp_ne_and_pow2(i32 %x) {\n                                ^\n<stdin>:6:2: note: possible intended match here\n %and = and i32 %x, -32\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmptczoyi3w\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @and_icmp_ne_and_pow2(i32 %x) { \nnext:3'0                                     X~~~~~~~~~ error: no match found\n          5:  %icmp1 = icmp ne i32 %x, 127 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          6:  %and = and i32 %x, -32 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          7:  %icmp2 = icmp ne i32 %and, 128 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = and i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n  %1 = add i32 %x, -160\n  %ret = icmp ult i32 %1, -33\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @and_icmp_ne_and_pow2(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_and_icmp_eq_and_pow2",
+        "body": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_eq_and_pow2(\n; CHECK-NEXT:    ret i1 false\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_eq_and_pow2(\n; CHECK-NEXT:    ret i1 false\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n  ret i1 false\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 1,
+            "current_optimized_program": 1
+          },
+          "filecheck": {
+            "src": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_eq_and_pow2(\n; CHECK-NEXT:    ret i1 false\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n  ret i1 false\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n  ret i1 false\n}\n",
+          "current_optimized_program": "define i1 @neg_and_icmp_eq_and_pow2(i32 %x) {\n  ret i1 false\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_or_icmp_eq_and_const_less_than_mask",
+        "body": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_const_less_than_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 15\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp eq i32 %x, 15\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 16\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_const_less_than_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 15\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp eq i32 %x, 15\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 16\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 15\n  ret i1 %icmp1\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 15\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 16\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 15\n  ret i1 %icmp1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 2,
+            "current_optimized_program": 2
+          },
+          "filecheck": {
+            "src": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_and_const_less_than_mask(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i32 [[X:%.*]], 15\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp eq i32 %x, 15\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 16\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 15\n  ret i1 %icmp1\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 15\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 16\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 15\n  ret i1 %icmp1\n}\n",
+          "current_optimized_program": "define i1 @neg_or_icmp_eq_and_const_less_than_mask(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 15\n  ret i1 %icmp1\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_select_icmp_eq_and_pow2",
+        "body": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp sgt i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[TMP1:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp sgt i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[TMP1:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = and i1 %icmp1, %icmp2\n  ret i1 %1\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %#1 = select i1 %icmp1, i1 %icmp2, i1 0\n  ret i1 %#1\n}\n=>\ndefine i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %#1 = and i1 %icmp1, %icmp2\n  ret i1 %#1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 5,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp sgt i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp eq i32 [[AND]], 128\n; CHECK-NEXT:    [[TMP1:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = and i1 %icmp1, %icmp2\n  ret i1 %1\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}\n",
+          "expect_optimized_program": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = and i1 %icmp1, %icmp2\n  ret i1 %1\n}\n",
+          "current_optimized_program": "define i1 @neg_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = and i1 %icmp1, %icmp2\n  ret i1 %1\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "and_icmp_eq_with_binary_range_operands",
+        "body": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n; CHECK-LABEL: @and_icmp_eq_with_binary_range_operands(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i8 [[X:%.*]], 0\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i8 [[Y:%.*]], 0\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i8 %x, 1\n  %icmp2 = icmp eq i8 %y, 1\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n; CHECK-LABEL: @and_icmp_eq_with_binary_range_operands(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i8 [[X:%.*]], 0\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i8 [[Y:%.*]], 0\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i8 %x, 1\n  %icmp2 = icmp eq i8 %y, 1\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n  %icmp1 = icmp ne i8 %x, 0\n  %icmp2 = icmp ne i8 %y, 0\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @and_icmp_eq_with_binary_range_operands(i8 %x, i8 %y) {\ninit:\n  %#range_0_%x = !range i8 %x, i8 0, i8 2\n  %#range_1_%y = !range i8 %y, i8 0, i8 2\n  br label %#0\n\n#0:\n  %icmp1 = icmp eq i8 %#range_0_%x, 1\n  %icmp2 = icmp eq i8 %#range_1_%y, 1\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @and_icmp_eq_with_binary_range_operands(i8 %x, i8 %y) {\ninit:\n  %#range_0_%x = !range i8 %x, i8 0, i8 2\n  %#range_1_%y = !range i8 %y, i8 0, i8 2\n  br label %#0\n\n#0:\n  %icmp1 = icmp ne i8 %#range_0_%x, 0\n  %icmp2 = icmp ne i8 %#range_1_%y, 0\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 4,
+            "expect_optimized_program": 4,
+            "current_optimized_program": 4
+          },
+          "filecheck": {
+            "src": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n; CHECK-LABEL: @and_icmp_eq_with_binary_range_operands(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i8 [[X:%.*]], 0\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i8 [[Y:%.*]], 0\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i8 %x, 1\n  %icmp2 = icmp eq i8 %y, 1\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n  %icmp1 = icmp ne i8 %x, 0\n  %icmp2 = icmp ne i8 %y, 0\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n  %icmp1 = icmp eq i8 %x, 1\n  %icmp2 = icmp eq i8 %y, 1\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n  %icmp1 = icmp ne i8 %x, 0\n  %icmp2 = icmp ne i8 %y, 0\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @and_icmp_eq_with_binary_range_operands(i8 range(i8 0, 2) %x, i8 range(i8 0, 2) %y) {\n  %icmp1 = icmp ne i8 %x, 0\n  %icmp2 = icmp ne i8 %y, 0\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "or_icmp_eq_and_pow2_mask_equal_to_icmp",
+        "body": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -63\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -63\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, 4294967232\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, 4294967232\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2_mask_equal_to_icmp(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -63\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 65\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmpj65h1l4f']' returned non-zero exit status 1.\n/tmp/tmpj65h1l4f:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -63\n              ^\n<stdin>:4:51: note: scanning from here\ndefine i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n                                                  ^\n<stdin>:6:2: note: possible intended match here\n %and = and i32 %x, -64\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmpj65h1l4f\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) { \nnext:3'0                                                       X~~~~~~~~~ error: no match found\n          5:  %icmp1 = icmp eq i32 %x, 63 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          6:  %and = and i32 %x, -64 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          7:  %icmp2 = icmp eq i32 %and, 64 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = or i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %1 = add i32 %x, -63\n  %ret = icmp ult i32 %1, 65\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @or_icmp_eq_and_pow2_mask_equal_to_icmp(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 63\n  %and = and i32 %x, -64\n  %icmp2 = icmp eq i32 %and, 64\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_or_icmp_eq_double_and_pow2",
+        "body": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_double_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -16\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 64\n; CHECK-NEXT:    [[AND2:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp eq i32 [[AND2]], 128\n; CHECK-NEXT:    [[TMP5:%.*]] = or i1 [[TMP2]], [[TMP4]]\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_double_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -16\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 64\n; CHECK-NEXT:    [[AND2:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp eq i32 [[AND2]], 128\n; CHECK-NEXT:    [[TMP5:%.*]] = or i1 [[TMP2]], [[TMP4]]\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n#0:\n  %and1 = and i32 %x, 4294967280\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n#0:\n  %and1 = and i32 %x, 4294967280\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 6,
+            "expect_optimized_program": 6,
+            "current_optimized_program": 6
+          },
+          "filecheck": {
+            "src": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n; CHECK-LABEL: @neg_or_icmp_eq_double_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -16\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 64\n; CHECK-NEXT:    [[AND2:%.*]] = and i32 [[X]], -32\n; CHECK-NEXT:    [[TMP4:%.*]] = icmp eq i32 [[AND2]], 128\n; CHECK-NEXT:    [[TMP5:%.*]] = or i1 [[TMP2]], [[TMP4]]\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @neg_or_icmp_eq_double_and_pow2(i32 %x) {\n  %and1 = and i32 %x, -16\n  %icmp1 = icmp eq i32 %and1, 64\n  %and2 = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and2, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "or_icmp_eq_and_pow2",
+        "body": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": false,
+        "log": {
+          "alive2": {
+            "src": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @or_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @or_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 3,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @or_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult i32 [[TMP1]], 33\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "Command '['/local/data/shaohuali/projects/llvm-auto-opt-benchmark/work/llvm/build/bin/FileCheck', '/tmp/tmp3e2sftiw']' returned non-zero exit status 1.\n/tmp/tmp3e2sftiw:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP1:%.*]] = add i32 [[X:%.*]], -127\n              ^\n<stdin>:4:32: note: scanning from here\ndefine i1 @or_icmp_eq_and_pow2(i32 %x) {\n                               ^\n<stdin>:6:2: note: possible intended match here\n %and = and i32 %x, -32\n ^\n\nInput file: <stdin>\nCheck file: /tmp/tmp3e2sftiw\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @or_icmp_eq_and_pow2(i32 %x) { \nnext:3'0                                    X~~~~~~~~~ error: no match found\n          5:  %icmp1 = icmp eq i32 %x, 127 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          6:  %and = and i32 %x, -32 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                       possible intended match\n          7:  %icmp2 = icmp eq i32 %and, 128 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %ret = or i1 %icmp1, %icmp2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %ret \nnext:3'0     ~~~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+          },
+          "source_program": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n  %1 = add i32 %x, -127\n  %ret = icmp ult i32 %1, 33\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @or_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp eq i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %ret = or i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      },
+      {
+        "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+        "args": [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        "name": "neg_and_icmp_ne_and_non_pow2_icmp",
+        "body": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_non_pow2_icmp(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+        "result": true,
+        "log": {
+          "alive2": {
+            "src": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_non_pow2_icmp(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": "\n----------------------------------------\ndefine i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, 4294967263\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n=>\ndefine i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n#0:\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, 4294967263\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+          },
+          "cost": {
+            "source_program": 5,
+            "expect_optimized_program": 5,
+            "current_optimized_program": 5
+          },
+          "filecheck": {
+            "src": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n; CHECK-LABEL: @neg_and_icmp_ne_and_non_pow2_icmp(\n; CHECK-NEXT:    [[ICMP1:%.*]] = icmp ne i32 [[X:%.*]], 127\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X]], -33\n; CHECK-NEXT:    [[ICMP2:%.*]] = icmp ne i32 [[AND]], 128\n; CHECK-NEXT:    [[RET:%.*]] = and i1 [[ICMP1]], [[ICMP2]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}",
+            "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+            "log": ""
+          },
+          "source_program": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "expect_optimized_program": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "current_optimized_program": "define i1 @neg_and_icmp_ne_and_non_pow2_icmp(i32 %x) {\n  %icmp1 = icmp ne i32 %x, 127\n  %and = and i32 %x, -33\n  %icmp2 = icmp ne i32 %and, 128\n  %ret = and i1 %icmp1, %icmp2\n  ret i1 %ret\n}\n",
+          "opt_stderr": ""
+        }
+      }
+    ]
+  ],
+  "check_full_log": []
+}
