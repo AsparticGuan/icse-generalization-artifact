@@ -1,0 +1,1 @@
+clang++ -std=c++17 -O2 -o cost cost.cpp $(/usr/bin/llvm-config-20 --cxxflags --ldflags --libs all --system-libs)
