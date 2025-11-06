@@ -133,12 +133,15 @@ class Environment:
             "check_full_log": self.check_full_log,
         }
 
-    def check_fast(self):
+    def check_fast(self, skip_build=False):
         with TimeCompensationGuard(self):
             self.fast_check_count += 1
-            res, reason = self.build()
-            if not res:
-                return (False, reason)
+            if not skip_build:
+                res, reason = self.build()
+                if not res:
+                    return (False, reason)
+            else:
+                self.build_count += 1
             res, log = llvm_helper.verify_test_group(
                 repro=False, input=self.data["tests"], type=self.bug_type
             )
