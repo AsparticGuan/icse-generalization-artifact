@@ -1,0 +1,229 @@
+{
+  "bug_id": "134024",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/134024",
+  "bug_type": "missed-optimization",
+  "base_commit": "ad66e5495d598c9f64cfafba92ba48f2a24b8278",
+  "knowledge_cutoff": "2025-04-02T03:33:53Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "d20796dab776f80c26915c44d558357f3459a184",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          5808,
+          5813
+        ],
+        [
+          6054,
+          6059
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpEquality",
+        "InstCombinerImpl::foldICmpWithTrunc",
+        "foldICmpPow2Test"
+      ]
+    }
+  },
+  "patch": "commit d20796dab776f80c26915c44d558357f3459a184\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Wed Apr 30 00:19:23 2025 +0800\n\n    [InstCombine] Offset both sides of an equality icmp (#134086)\n    \n    Proof: https://alive2.llvm.org/ce/z/zQ2UW4\n    Closes https://github.com/llvm/llvm-project/issues/134024\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex b7b0bb736135..27d26900de6b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -5808,6 +5808,128 @@ static Instruction *foldICmpPow2Test(ICmpInst &I,\n   return nullptr;\n }\n \n+/// Find all possible pairs (BinOp, RHS) that BinOp V, RHS can be simplified.\n+using OffsetOp = std::pair<Instruction::BinaryOps, Value *>;\n+static void collectOffsetOp(Value *V, SmallVectorImpl<OffsetOp> &Offsets,\n+                            bool AllowRecursion) {\n+  Instruction *Inst = dyn_cast<Instruction>(V);\n+  if (!Inst || !Inst->hasOneUse())\n+    return;\n+\n+  switch (Inst->getOpcode()) {\n+  case Instruction::Add:\n+    Offsets.emplace_back(Instruction::Sub, Inst->getOperand(1));\n+    Offsets.emplace_back(Instruction::Sub, Inst->getOperand(0));\n+    break;\n+  case Instruction::Sub:\n+    Offsets.emplace_back(Instruction::Add, Inst->getOperand(1));\n+    break;\n+  case Instruction::Xor:\n+    Offsets.emplace_back(Instruction::Xor, Inst->getOperand(1));\n+    Offsets.emplace_back(Instruction::Xor, Inst->getOperand(0));\n+    break;\n+  case Instruction::Select:\n+    if (AllowRecursion) {\n+      collectOffsetOp(Inst->getOperand(1), Offsets, /*AllowRecursion=*/false);\n+      collectOffsetOp(Inst->getOperand(2), Offsets, /*AllowRecursion=*/false);\n+    }\n+    break;\n+  default:\n+    break;\n+  }\n+}\n+\n+enum class OffsetKind { Invalid, Value, Select };\n+\n+struct OffsetResult {\n+  OffsetKind Kind;\n+  Value *V0, *V1, *V2;\n+\n+  static OffsetResult invalid() {\n+    return {OffsetKind::Invalid, nullptr, nullptr, nullptr};\n+  }\n+  static OffsetResult value(Value *V) {\n+    return {OffsetKind::Value, V, nullptr, nullptr};\n+  }\n+  static OffsetResult select(Value *Cond, Value *TrueV, Value *FalseV) {\n+    return {OffsetKind::Select, Cond, TrueV, FalseV};\n+  }\n+  bool isValid() const { return Kind != OffsetKind::Invalid; }\n+  Value *materialize(InstCombiner::BuilderTy &Builder) const {\n+    switch (Kind) {\n+    case OffsetKind::Invalid:\n+      llvm_unreachable(\"Invalid offset result\");\n+    case OffsetKind::Value:\n+      return V0;\n+    case OffsetKind::Select:\n+      return Builder.CreateSelect(V0, V1, V2);\n+    }\n+  }\n+};\n+\n+/// Offset both sides of an equality icmp to see if we can save some\n+/// instructions: icmp eq/ne X, Y -> icmp eq/ne X op Z, Y op Z.\n+/// Note: This operation should not introduce poison.\n+static Instruction *foldICmpEqualityWithOffset(ICmpInst &I,\n+                                               InstCombiner::BuilderTy &Builder,\n+                                               const SimplifyQuery &SQ) {\n+  assert(I.isEquality() && \"Expected an equality icmp\");\n+  Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);\n+  if (!Op0->getType()->isIntOrIntVectorTy())\n+    return nullptr;\n+\n+  SmallVector<OffsetOp, 4> OffsetOps;\n+  collectOffsetOp(Op0, OffsetOps, /*AllowRecursion=*/true);\n+  collectOffsetOp(Op1, OffsetOps, /*AllowRecursion=*/true);\n+\n+  auto ApplyOffsetImpl = [&](Value *V, unsigned BinOpc, Value *RHS) -> Value * {\n+    Value *Simplified = simplifyBinOp(BinOpc, V, RHS, SQ);\n+    // Avoid infinite loops by checking if RHS is an identity for the BinOp.\n+    if (!Simplified || Simplified == V)\n+      return nullptr;\n+    // Reject constant expressions as they don't simplify things.\n+    if (isa<Constant>(Simplified) && !match(Simplified, m_ImmConstant()))\n+      return nullptr;\n+    // Check if the transformation introduces poison.\n+    return impliesPoison(RHS, V) ? Simplified : nullptr;\n+  };\n+\n+  auto ApplyOffset = [&](Value *V, unsigned BinOpc,\n+                         Value *RHS) -> OffsetResult {\n+    if (auto *Sel = dyn_cast<SelectInst>(V)) {\n+      if (!Sel->hasOneUse())\n+        return OffsetResult::invalid();\n+      Value *TrueVal = ApplyOffsetImpl(Sel->getTrueValue(), BinOpc, RHS);\n+      if (!TrueVal)\n+        return OffsetResult::invalid();\n+      Value *FalseVal = ApplyOffsetImpl(Sel->getFalseValue(), BinOpc, RHS);\n+      if (!FalseVal)\n+        return OffsetResult::invalid();\n+      return OffsetResult::select(Sel->getCondition(), TrueVal, FalseVal);\n+    }\n+    if (Value *Simplified = ApplyOffsetImpl(V, BinOpc, RHS))\n+      return OffsetResult::value(Simplified);\n+    return OffsetResult::invalid();\n+  };\n+\n+  for (auto [BinOp, RHS] : OffsetOps) {\n+    auto BinOpc = static_cast<unsigned>(BinOp);\n+\n+    auto Op0Result = ApplyOffset(Op0, BinOpc, RHS);\n+    if (!Op0Result.isValid())\n+      continue;\n+    auto Op1Result = ApplyOffset(Op1, BinOpc, RHS);\n+    if (!Op1Result.isValid())\n+      continue;\n+\n+    Value *NewLHS = Op0Result.materialize(Builder);\n+    Value *NewRHS = Op1Result.materialize(Builder);\n+    return new ICmpInst(I.getPredicate(), NewLHS, NewRHS);\n+  }\n+\n+  return nullptr;\n+}\n+\n Instruction *InstCombinerImpl::foldICmpEquality(ICmpInst &I) {\n   if (!I.isEquality())\n     return nullptr;\n@@ -6054,6 +6176,10 @@ Instruction *InstCombinerImpl::foldICmpEquality(ICmpInst &I) {\n                                   : ConstantInt::getNullValue(A->getType()));\n   }\n \n+  if (auto *Res = foldICmpEqualityWithOffset(\n+          I, Builder, getSimplifyQuery().getWithInstruction(&I)))\n+    return Res;\n+\n   return nullptr;\n }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-add.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_eq_add_undef2",
+          "test_body": "define <2 x i1> @icmp_eq_add_undef2(<2 x i32> %a) {\n; CHECK-LABEL: @icmp_eq_add_undef2(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[A:%.*]], <i32 5, i32 undef>\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 undef>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_add_undef2(<2 x i32> %a) {\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 undef>\n  ret <2 x i1> %cmp\n}\n",
+          "current_optimized_program": "define <2 x i1> @icmp_eq_add_undef2(<2 x i32> %a) {\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 undef>\n  ret <2 x i1> %cmp\n}\n",
+          "expect_optimized_program": "define <2 x i1> @icmp_eq_add_undef2(<2 x i32> %a) {\n  %cmp = icmp eq <2 x i32> %a, <i32 5, i32 undef>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_add_non_splat",
+          "test_body": "define <2 x i1> @icmp_eq_add_non_splat(<2 x i32> %a) {\n; CHECK-LABEL: @icmp_eq_add_non_splat(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[A:%.*]], <i32 5, i32 4>\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %add = add <2 x i32> %a, <i32 5, i32 6>\n  %cmp = icmp eq <2 x i32> %add, splat (i32 10)\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_add_non_splat(<2 x i32> %a) {\n  %add = add <2 x i32> %a, <i32 5, i32 6>\n  %cmp = icmp eq <2 x i32> %add, splat (i32 10)\n  ret <2 x i1> %cmp\n}\n",
+          "current_optimized_program": "define <2 x i1> @icmp_eq_add_non_splat(<2 x i32> %a) {\n  %cmp = icmp eq <2 x i32> %a, <i32 5, i32 4>\n  ret <2 x i1> %cmp\n}\n",
+          "expect_optimized_program": "define <2 x i1> @icmp_eq_add_non_splat(<2 x i32> %a) {\n  %cmp = icmp eq <2 x i32> %a, <i32 5, i32 4>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_add_non_splat2",
+          "test_body": "define <2 x i1> @icmp_eq_add_non_splat2(<2 x i32> %a) {\n; CHECK-LABEL: @icmp_eq_add_non_splat2(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[A:%.*]], <i32 5, i32 6>\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 11>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_add_non_splat2(<2 x i32> %a) {\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 11>\n  ret <2 x i1> %cmp\n}\n",
+          "current_optimized_program": "define <2 x i1> @icmp_eq_add_non_splat2(<2 x i32> %a) {\n  %add = add <2 x i32> %a, splat (i32 5)\n  %cmp = icmp eq <2 x i32> %add, <i32 10, i32 11>\n  ret <2 x i1> %cmp\n}\n",
+          "expect_optimized_program": "define <2 x i1> @icmp_eq_add_non_splat2(<2 x i32> %a) {\n  %cmp = icmp eq <2 x i32> %a, <i32 5, i32 6>\n  ret <2 x i1> %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-equality-xor.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "foo2",
+          "test_body": "define i1 @foo2(i32 %x, i32 %y) {\n; CHECK-LABEL: @foo2(\n; CHECK-NEXT:    [[NEG1:%.*]] = xor i32 [[Y:%.*]], [[X:%.*]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i32 [[NEG1]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %and = and i32 %x, -2147483648\n  %neg = and i32 %y, -2147483648\n  %and1 = xor i32 %neg, -2147483648\n  %cmp = icmp eq i32 %and, %and1\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @foo2(i32 %x, i32 %y) {\n  %and = and i32 %x, -2147483648\n  %neg = and i32 %y, -2147483648\n  %and1 = xor i32 %neg, -2147483648\n  %cmp = icmp eq i32 %and, %and1\n  ret i1 %cmp\n}\n",
+          "current_optimized_program": "define i1 @foo2(i32 %x, i32 %y) {\n  %neg1 = xor i32 %y, %x\n  %cmp = icmp slt i32 %neg1, 0\n  ret i1 %cmp\n}\n",
+          "expect_optimized_program": "define i1 @foo2(i32 %x, i32 %y) {\n  %neg1 = xor i32 %y, %x\n  %cmp = icmp slt i32 %neg1, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "foo3",
+          "test_body": "define <2 x i1> @foo3(<2 x i8> %x) {\n; CHECK-LABEL: @foo3(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne <2 x i8> [[X:%.*]], <i8 -9, i8 -80>\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\nentry:\n  %xor = xor <2 x i8> %x, <i8 -2, i8 -1>\n  %cmp = icmp ne <2 x i8> %xor, <i8 9, i8 79>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @foo3(<2 x i8> %x) {\nentry:\n  %xor = xor <2 x i8> %x, <i8 -2, i8 -1>\n  %cmp = icmp ne <2 x i8> %xor, <i8 9, i8 79>\n  ret <2 x i1> %cmp\n}\n",
+          "current_optimized_program": "define <2 x i1> @foo3(<2 x i8> %x) {\nentry:\n  %xor = xor <2 x i8> %x, <i8 -2, i8 -1>\n  %cmp = icmp ne <2 x i8> %xor, <i8 9, i8 79>\n  ret <2 x i1> %cmp\n}\n",
+          "expect_optimized_program": "define <2 x i1> @foo3(<2 x i8> %x) {\nentry:\n  %cmp = icmp ne <2 x i8> %x, <i8 -9, i8 -80>\n  ret <2 x i1> %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-select.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "discr_eq_add_commuted",
+          "test_body": "define i1 @discr_eq_add_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\n; CHECK-LABEL: @discr_eq_add_commuted(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[COND1:%.*]], i8 [[B:%.*]], i8 0\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND2:%.*]], i8 [[C:%.*]], i8 [[B]]\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_add_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_add_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_add_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %0 = select i1 %cond1, i8 %b, i8 0\n  %1 = select i1 %cond2, i8 %c, i8 %b\n  %res = icmp eq i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_constantexpr",
+          "test_body": "@g = external global i8\n\ndefine i1 @discr_eq_constantexpr(ptr %p) {\n; CHECK-LABEL: @discr_eq_constantexpr(\n; CHECK-NEXT:    [[I:%.*]] = ptrtoint ptr [[P:%.*]] to i64\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[I]], ptrtoint (ptr @g to i64)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[SUB]], -1\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %i = ptrtoint ptr %p to i64\n  %sub = sub i64 %i, ptrtoint (ptr @g to i64)\n  %cmp = icmp eq i64 %sub, -1\n  ret i1 %cmp\n}",
+          "source_program": "@g = external global i8\n\ndefine i1 @discr_eq_constantexpr(ptr %p) {\n  %i = ptrtoint ptr %p to i64\n  %sub = sub i64 %i, ptrtoint (ptr @g to i64)\n  %cmp = icmp eq i64 %sub, -1\n  ret i1 %cmp\n}\n",
+          "current_optimized_program": "@g = external global i8\n\ndefine i1 @discr_eq_constantexpr(ptr %p) {\n  %i = ptrtoint ptr %p to i64\n  %sub = sub i64 %i, ptrtoint (ptr @g to i64)\n  %cmp = icmp eq i64 %sub, -1\n  ret i1 %cmp\n}\n",
+          "expect_optimized_program": "@g = external global i8\n\ndefine i1 @discr_eq_constantexpr(ptr %p) {\n  %i = ptrtoint ptr %p to i64\n  %sub = sub i64 %i, ptrtoint (ptr @g to i64)\n  %cmp = icmp eq i64 %sub, -1\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "discr_eq_failed_to_simplify",
+          "test_body": "define i1 @discr_eq_failed_to_simplify(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_eq_failed_to_simplify(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD1:%.*]] = add i8 [[A:%.*]], -3\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A]], 1\n; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[CMP1]], i8 [[ADD1]], i8 1\n; CHECK-NEXT:    [[ADD2:%.*]] = add i8 [[B:%.*]], -2\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ugt i8 [[B]], 1\n; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[CMP2]], i8 [[ADD2]], i8 1\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[SEL1]], [[SEL2]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_failed_to_simplify(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_failed_to_simplify(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_failed_to_simplify(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq",
+          "test_body": "define i1 @discr_eq(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_eq(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ugt i8 [[B:%.*]], 1\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[CMP1]], i8 [[A]], i8 3\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[CMP2]], i8 [[B]], i8 3\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq(i8 %a, i8 %b) {\nentry:\n  %cmp1 = icmp ugt i8 %a, 1\n  %cmp2 = icmp ugt i8 %b, 1\n  %0 = select i1 %cmp1, i8 %a, i8 3\n  %1 = select i1 %cmp2, i8 %b, i8 3\n  %res = icmp eq i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_simple",
+          "test_body": "define i1 @discr_eq_simple(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_eq_simple(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[CMP1]], i8 [[A]], i8 3\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[B:%.*]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %res = icmp eq i8 %sel1, %add2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_simple(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %res = icmp eq i8 %sel1, %add2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_simple(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %res = icmp eq i8 %sel1, %add2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_simple(i8 %a, i8 %b) {\nentry:\n  %cmp1 = icmp ugt i8 %a, 1\n  %0 = select i1 %cmp1, i8 %a, i8 3\n  %res = icmp eq i8 %0, %b\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_sub",
+          "test_body": "define i1 @discr_eq_sub(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\n; CHECK-LABEL: @discr_eq_sub(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[COND1:%.*]], i8 [[B:%.*]], i8 0\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND2:%.*]], i8 [[C:%.*]], i8 0\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %b, %a\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_sub(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %b, %a\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_sub(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %b, %a\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_sub(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %0 = select i1 %cond1, i8 %b, i8 0\n  %1 = select i1 %cond2, i8 %c, i8 0\n  %res = icmp eq i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_xor_eq",
+          "test_body": "define i1 @discr_xor_eq(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_xor_eq(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ugt i8 [[B:%.*]], 1\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[CMP1]], i8 [[A]], i8 -4\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[CMP2]], i8 [[B]], i8 -4\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %xor1 = xor i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %xor1, i8 1\n  %xor2 = xor i8 %b, -3\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %xor2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_xor_eq(i8 %a, i8 %b) {\nentry:\n  %xor1 = xor i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %xor1, i8 1\n  %xor2 = xor i8 %b, -3\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %xor2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_xor_eq(i8 %a, i8 %b) {\nentry:\n  %xor1 = xor i8 %a, -3\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %xor1, i8 1\n  %xor2 = xor i8 %b, -3\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %xor2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_xor_eq(i8 %a, i8 %b) {\nentry:\n  %cmp1 = icmp ugt i8 %a, 1\n  %cmp2 = icmp ugt i8 %b, 1\n  %0 = select i1 %cmp1, i8 %a, i8 -4\n  %1 = select i1 %cmp2, i8 %b, i8 -4\n  %res = icmp eq i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_simple_vec",
+          "test_body": "define <2 x i1> @discr_eq_simple_vec(<2 x i8> %a, <2 x i8> %b, i1 %cond) {\n; CHECK-LABEL: @discr_eq_simple_vec(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD1:%.*]] = add <2 x i8> [[A:%.*]], <i8 poison, i8 -2>\n; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[COND:%.*]], <2 x i8> [[ADD1]], <2 x i8> splat (i8 1)\n; CHECK-NEXT:    [[ADD2:%.*]] = add <2 x i8> [[B:%.*]], <i8 -2, i8 poison>\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq <2 x i8> [[SEL1]], [[ADD2]]\n; CHECK-NEXT:    ret <2 x i1> [[RES]]\nentry:\n  %add1 = add <2 x i8> %a, <i8 poison, i8 -2>\n  %sel1 = select i1 %cond, <2 x i8> %add1, <2 x i8> splat (i8 1)\n  %add2 = add <2 x i8> %b, <i8 -2, i8 poison>\n  %res = icmp eq <2 x i8> %sel1, %add2\n  ret <2 x i1> %res\n}",
+          "source_program": "define <2 x i1> @discr_eq_simple_vec(<2 x i8> %a, <2 x i8> %b, i1 %cond) {\nentry:\n  %add1 = add <2 x i8> %a, <i8 poison, i8 -2>\n  %sel1 = select i1 %cond, <2 x i8> %add1, <2 x i8> splat (i8 1)\n  %add2 = add <2 x i8> %b, <i8 -2, i8 poison>\n  %res = icmp eq <2 x i8> %sel1, %add2\n  ret <2 x i1> %res\n}\n",
+          "current_optimized_program": "define <2 x i1> @discr_eq_simple_vec(<2 x i8> %a, <2 x i8> %b, i1 %cond) {\nentry:\n  %add1 = add <2 x i8> %a, <i8 poison, i8 -2>\n  %sel1 = select i1 %cond, <2 x i8> %add1, <2 x i8> splat (i8 1)\n  %add2 = add <2 x i8> %b, <i8 -2, i8 poison>\n  %res = icmp eq <2 x i8> %sel1, %add2\n  ret <2 x i1> %res\n}\n",
+          "expect_optimized_program": "define <2 x i1> @discr_eq_simple_vec(<2 x i8> %a, <2 x i8> %b, i1 %cond) {\nentry:\n  %add1 = add <2 x i8> %a, <i8 poison, i8 -2>\n  %sel1 = select i1 %cond, <2 x i8> %add1, <2 x i8> splat (i8 1)\n  %add2 = add <2 x i8> %b, <i8 -2, i8 poison>\n  %res = icmp eq <2 x i8> %sel1, %add2\n  ret <2 x i1> %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_multi_use",
+          "test_body": "declare void @use(i8)\n\ndefine i1 @discr_eq_multi_use(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_eq_multi_use(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD1:%.*]] = add i8 [[A:%.*]], -2\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A]], 1\n; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[CMP1]], i8 [[ADD1]], i8 1\n; CHECK-NEXT:    call void @use(i8 [[SEL1]])\n; CHECK-NEXT:    [[ADD2:%.*]] = add i8 [[B:%.*]], -2\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ugt i8 [[B]], 1\n; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[CMP2]], i8 [[ADD2]], i8 1\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[SEL1]], [[SEL2]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  call void @use(i8 %sel1)\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "declare void @use(i8)\n\ndefine i1 @discr_eq_multi_use(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  call void @use(i8 %sel1)\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "declare void @use(i8)\n\ndefine i1 @discr_eq_multi_use(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  call void @use(i8 %sel1)\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "declare void @use(i8)\n\ndefine i1 @discr_eq_multi_use(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  call void @use(i8 %sel1)\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_sub_commuted",
+          "test_body": "define i1 @discr_eq_sub_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\n; CHECK-LABEL: @discr_eq_sub_commuted(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[NEG:%.*]] = sub i8 0, [[A:%.*]]\n; CHECK-NEXT:    [[SUB1:%.*]] = sub i8 [[A]], [[B:%.*]]\n; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[COND1:%.*]], i8 [[SUB1]], i8 [[NEG]]\n; CHECK-NEXT:    [[SUB2:%.*]] = sub i8 [[A]], [[C:%.*]]\n; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[COND2:%.*]], i8 [[SUB2]], i8 [[NEG]]\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[SEL1]], [[SEL2]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %a, %c\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_sub_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %a, %c\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_sub_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %a, %c\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_sub_commuted(i8 noundef %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %neg = sub i8 0, %a\n  %sub1 = sub i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %sub1, i8 %neg\n  %sub2 = sub i8 %a, %c\n  %sel2 = select i1 %cond2, i8 %sub2, i8 %neg\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_ne",
+          "test_body": "define i1 @discr_ne(i8 %a, i8 %b) {\n; CHECK-LABEL: @discr_ne(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ugt i8 [[B:%.*]], 1\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[CMP1]], i8 [[A]], i8 3\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[CMP2]], i8 [[B]], i8 3\n; CHECK-NEXT:    [[RES:%.*]] = icmp ne i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp ne i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_ne(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp ne i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_ne(i8 %a, i8 %b) {\nentry:\n  %add1 = add i8 %a, -2\n  %cmp1 = icmp ugt i8 %a, 1\n  %sel1 = select i1 %cmp1, i8 %add1, i8 1\n  %add2 = add i8 %b, -2\n  %cmp2 = icmp ugt i8 %b, 1\n  %sel2 = select i1 %cmp2, i8 %add2, i8 1\n  %res = icmp ne i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_ne(i8 %a, i8 %b) {\nentry:\n  %cmp1 = icmp ugt i8 %a, 1\n  %cmp2 = icmp ugt i8 %b, 1\n  %0 = select i1 %cmp1, i8 %a, i8 3\n  %1 = select i1 %cmp2, i8 %b, i8 3\n  %res = icmp ne i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "discr_eq_add_commuted_implies_poison",
+          "test_body": "define i1 @discr_eq_add_commuted_implies_poison(i8 %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\n; CHECK-LABEL: @discr_eq_add_commuted_implies_poison(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[COND1:%.*]], i8 [[B:%.*]], i8 0\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND2:%.*]], i8 [[C:%.*]], i8 [[B]]\n; CHECK-NEXT:    [[RES:%.*]] = icmp eq i8 [[TMP0]], [[TMP1]]\n; CHECK-NEXT:    ret i1 [[RES]]\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}",
+          "source_program": "define i1 @discr_eq_add_commuted_implies_poison(i8 %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @discr_eq_add_commuted_implies_poison(i8 %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %add1 = add i8 %a, %b\n  %sel1 = select i1 %cond1, i8 %add1, i8 %a\n  %add2 = add i8 %c, %a\n  %sel2 = select i1 %cond2, i8 %add2, i8 %add1\n  %res = icmp eq i8 %sel1, %sel2\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @discr_eq_add_commuted_implies_poison(i8 %a, i8 %b, i8 %c, i1 %cond1, i1 %cond2) {\nentry:\n  %0 = select i1 %cond1, i8 %b, i8 0\n  %1 = select i1 %cond2, i8 %c, i8 %b\n  %res = icmp eq i8 %0, %1\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_select",
+          "test_body": "define i1 @icmp_slt_select(i1 %cond, i32 %a, i32 %b) {\n; CHECK-LABEL: @icmp_slt_select(\n; CHECK-NEXT:    [[LHS:%.*]] = select i1 [[COND:%.*]], i32 [[A:%.*]], i32 [[B:%.*]]\n; CHECK-NEXT:    [[RHS:%.*]] = select i1 [[COND]], i32 [[B]], i32 [[A]]\n; CHECK-NEXT:    [[RES:%.*]] = icmp slt i32 [[LHS]], [[RHS]]\n; CHECK-NEXT:    ret i1 [[RES]]\n  %lhs = select i1 %cond, i32 %a, i32 %b\n  %rhs = select i1 %cond, i32 %b, i32 %a\n  %res = icmp slt i32 %lhs, %rhs\n  ret i1 %res\n}",
+          "source_program": "define i1 @icmp_slt_select(i1 %cond, i32 %a, i32 %b) {\n  %lhs = select i1 %cond, i32 %a, i32 %b\n  %rhs = select i1 %cond, i32 %b, i32 %a\n  %res = icmp slt i32 %lhs, %rhs\n  ret i1 %res\n}\n",
+          "current_optimized_program": "define i1 @icmp_slt_select(i1 %cond, i32 %a, i32 %b) {\n  %lhs = select i1 %cond, i32 %a, i32 %b\n  %rhs = select i1 %cond, i32 %b, i32 %a\n  %res = icmp slt i32 %lhs, %rhs\n  ret i1 %res\n}\n",
+          "expect_optimized_program": "define i1 @icmp_slt_select(i1 %cond, i32 %a, i32 %b) {\n  %lhs = select i1 %cond, i32 %a, i32 %b\n  %rhs = select i1 %cond, i32 %b, i32 %a\n  %res = icmp slt i32 %lhs, %rhs\n  ret i1 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Remove common `add`s when `icmp eq`ing two `select`s [InstCombine]",
+    "body": "Take the following IR, extracted from part of how Rust generates `==` on enums:\n\n```llvm\ndefine noundef i64 @get_discr(i8 noundef %x) unnamed_addr {\nstart:\n  %_4 = icmp ule i8 %x, 1\n  %small = select i1 %_4, i8 3, i8 %x\n  %_5 = sub i8 %small, 2\n  %_0 = zext i8 %_5 to i64\n  ret i64 %_0\n}\n\ndefine noundef zeroext i1 @discr_eq(i8 noundef %a, i8 noundef %b) unnamed_addr {\nstart:\n  %_3 = call noundef i64 @get_discr(i8 noundef %a)\n  %_4 = call noundef i64 @get_discr(i8 noundef %b)\n  %_0 = icmp eq i64 %_3, %_4\n  ret i1 %_0\n}\n```\n\nToday, when optimizing `get_discr` InstCombine will change the <https://llvm.godbolt.org/z/6Eq87h6h7>\n```c\n(x <= 1 ? 3 : x) - 2\n```\nto\n```c\n(x <= 1 ? 1 : x - 2)\n```\nwhich is reasonable on its own.\n\nThe problem, though, is that that makes things worse later in `discr_eq`.\n\nIt's unable to undo that transformation after the inlining, and thus ends up as <https://llvm.godbolt.org/z/31MdEhfcv>\n```llvm\ndefine noundef zeroext i1 @discr_eq(i8 noundef %a, i8 noundef %b) unnamed_addr #0 {\n  %0 = add i8 %a, -2\n  %_4.inv.i = icmp ugt i8 %a, 1\n  %_5.i = select i1 %_4.inv.i, i8 %0, i8 1\n  %1 = add i8 %b, -2\n  %_4.inv.i1 = icmp ugt i8 %b, 1\n  %_5.i2 = select i1 %_4.inv.i1, i8 %1, i8 1\n  %_0 = icmp eq i8 %_5.i, %_5.i2\n  ret i1 %_0\n}\n```\n\nBut there's no reason to do those `add`s any more -- they could be pulled outside the `select`s where they'd cancel out.\n\nPhrased as C, it's doing\n```c\n(x <= 1 ? 1 : x - 2) == (y <= 1 ? 1 : y - 2)\n```\nwhen instead it could be doing\n```c\n(x <= 1 ? 3 : x) == (y <= 1 ? 3 : y)\n```\n\nSo InstCombine should be able to detect this case, and rewrite it back to\n```llvm\ndefine noundef zeroext i1 @discr_eq(i8 noundef %a, i8 noundef %b) unnamed_addr #0 {\n  %_4.inv.i = icmp ugt i8 %a, 1\n  %_5.i = select i1 %_4.inv.i, i8 %a, i8 3\n  %_4.inv.i1 = icmp ugt i8 %b, 1\n  %_5.i2 = select i1 %_4.inv.i1, i8 %b, i8 3\n  %_0 = icmp eq i8 %_5.i, %_5.i2\n  ret i1 %_0\n}\n```\nAlive2 proof of correctness for that: <https://alive2.llvm.org/ce/z/AWCmDs>\n\n",
+    "author": "scottmcm",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "scottmcm",
+        "body": "Hmm, I tried fixing this on the rust side (for how we emit enum discriminants, https://github.com/rust-lang/rust/pull/139729), but it looks like the \"move inside the select\" part runs before the \"it's an add on both sides of `eq`\" part: <https://llvm.godbolt.org/z/7q3bsKMP9>\n\nSo that might be a good thing to fix too?"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> it looks like the \"move inside the select\" part runs before the \"it's an add on both sides of eq\" part\n\nYeah. It is the canonical form.\nSee also https://github.com/llvm/llvm-project/blob/3ed83630b263f667bacd1ef1a65f26d8665c282e/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp#L863-L864.\n"
+      },
+      {
+        "author": "nikic",
+        "body": "Looks like at least one of the motivating cases does not fold because of multi-use in an assume:\n```llvm\ndefine noundef zeroext i1 @mid_giant_eq_discr(i128 noundef range(i128 2, 8) %a, i128 noundef range(i128 2, 8) %b) unnamed_addr #0 {\nentry:\n  %0 = trunc nuw nsw i128 %a to i64\n  %1 = add nsw i64 %0, -5\n  %2 = icmp samesign ugt i128 %a, 4\n  %3 = icmp ne i64 %1, 1\n  tail call void @llvm.assume(i1 %3)\n  %_3 = select i1 %2, i64 %1, i64 1\n  %4 = trunc nuw nsw i128 %b to i64\n  %5 = add nsw i64 %4, -5\n  %6 = icmp samesign ugt i128 %b, 4\n  %7 = icmp ne i64 %5, 1\n  tail call void @llvm.assume(i1 %7)\n  %_4 = select i1 %6, i64 %5, i64 1\n  %_0 = icmp eq i64 %_3, %_4\n  ret i1 %_0\n}\n```"
+      },
+      {
+        "author": "scottmcm",
+        "body": "I might be able to move the asserts to the input value instead of to the select argument in order to address that.  With https://github.com/rust-lang/rust/pull/143684 coming soon I think that'd be fine even if it's slightly less good on 20.\n\nThat said, do range operand bundles exist yet?  I'd love to move these kinds of assumes into those instead of `sub`+`icmp`s..."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}
