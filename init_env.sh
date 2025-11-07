@@ -48,7 +48,7 @@ fi
 
 
 # experimental settings
-export LAB_LLM_MAX_SAMPLE_COUNT=2
+export LAB_LLM_MAX_SAMPLE_COUNT=1
 export LAB_PROMPT_TYPE=cot # cot or direct
 export LAB_USE_BISECTION=OFF
 
