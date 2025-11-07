@@ -631,8 +631,9 @@ def fix_issue(issue_id):
         shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
         # copy the build directory
         shutil.copytree(llvm_build_cache_dir, llvm_helper.llvm_build_dir)
-    res, log = env.check_fast(skip_build=True)
-    if not os.path.exists(llvm_build_cache_dir):
+        res, log = env.check_fast(skip_build=True)
+    else:
+        res, log = env.check_fast(skip_build=False)
         # copy the build directory
         shutil.copytree(llvm_helper.llvm_build_dir, llvm_build_cache_dir)
             
