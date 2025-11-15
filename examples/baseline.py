@@ -223,6 +223,7 @@ def chat_with_tooling(env, messages, full_messages):
                 .message
             )
             if response.tool_calls is None or len(response.tool_calls) == 0:
+                # Will break here because tool_calls is None.
                 break
 
             if hasattr(response, "reasoning_content"):
@@ -530,7 +531,7 @@ def issue_fixing_iter(
                     else:
                         prompted_test_fail_count += 1
                         feedback += f"The previous test program `@{test_name}` was not successfully optimized.\n"
-                        feedback += f"The expected optimized program is:\n```llvm\n{test_log['log']['expect_optimized_program']}\n```\n, but the current optimized program is:\n```llvm\n{test_log['log']['current_optimized_program']}\n```\n"
+                        feedback += f"The expected optimized program is:\n```llvm\n{test_log['log']['expect_optimized_program']}\n```\nBut the current optimized program is:\n```llvm\n{test_log['log']['current_optimized_program']}\n```\n"
         if prompted_test_fail_count == 0:
             # add new test to the prompt
             for test_file in env.get_tests():
@@ -552,9 +553,11 @@ def issue_fixing_iter(
                                 "current_optimized_program": -1,
                             }
                         }
+                        source_program = test_log["log"]["source_program"]
+                        expect_optimized_program = test_log["log"]["expect_optimized_program"]
                         feedback += f"Here is another failed to optimize program:\n" + \
-                            "The source program is:\n```llvm\n{source_program}\n```\n" + \
-                            "The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
+                            f"The source program is:\n```llvm\n{source_program}\n```\n" + \
+                            f"The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
@@ -647,7 +650,9 @@ def fix_issue(issue_id):
     # desc += "Detailed information:\n"
     # desc += normalize_feedback(log) + "\n"
     file, hunk = get_hunk_short(env)
-    desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+    # desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+    desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
+        \n```cpp\n{hunk}\n```\n"
     prefix = "\n".join(hunk.splitlines()[:5])
     suffix = "\n".join(hunk.splitlines()[-5:])
     context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
@@ -664,6 +669,7 @@ def fix_issue(issue_id):
             with open(fix_log_path, "w") as f:
                 f.write(json.dumps(cert, indent=2))
             return
+    print(messages)
     # except Exception as e:
     #     # import traceback
     #     # print("⚠️ An exception occurred:")
