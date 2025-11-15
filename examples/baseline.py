@@ -534,16 +534,18 @@ def issue_fixing_iter(
         if prompted_test_fail_count == 0:
             # add new test to the prompt
             for test_file in env.get_tests():
+                # print(test_file)
                 for test in test_file["tests"]:
-                    if test["name"] in env.prompted_tests:
+                    # print(test)
+                    if test["test_name"] in env.prompted_tests:
                         continue
                     for test_log in log:
-                        if test_log["name"] != test["name"]:
+                        if test_log["name"] != test["test_name"]:
                             continue
                         if test_log["log"]["cost"]["current_optimized_program"] < test_log["log"]["cost"]["source_program"] or \
                             test_log["log"]["cost"]["current_optimized_program"] <= test_log["log"]["cost"]["expect_optimized_program"]:
                             continue
-                        env.prompted_tests[test["name"]] = {
+                        env.prompted_tests[test["test_name"]] = {
                             "cost": {
                                 "source_program": test_log["log"]["cost"]["source_program"],
                                 "expect_optimized_program": test_log["log"]["cost"]["expect_optimized_program"],
@@ -597,7 +599,11 @@ def fix_issue(issue_id):
     )
     bug_type = env.get_bug_type()
     bug_func_name = next(iter(bug_funcs.values()))[0]
-    component = next(iter(env.get_hint_components()))
+    # component = next(iter(env.get_hint_components()))
+    component = next(iter(env.get_hint_components()), None)
+    if component is None:
+        print("component is None")
+        return
     # get the unoptimized test program
     issue_desc = ""
     flag_prompted_test = False
@@ -647,19 +653,23 @@ def fix_issue(issue_id):
     context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
     desc += format_requirement + context_requirement
     append_message(messages, full_messages, {"role": "user", "content": desc})
-    try:
-        for idx in range(max_sample_count):
-            print(f"Round {idx + 1}")
-            if issue_fixing_iter(
-                env, file, hunk, messages, full_messages, context_requirement
-            ):
-                cert = env.dump(normalize_messages(full_messages))
-                print(cert)
-                with open(fix_log_path, "w") as f:
-                    f.write(json.dumps(cert, indent=2))
-                return
-    except Exception:
-        pass
+    # try:
+    for idx in range(max_sample_count):
+        print(f"Round {idx + 1}")
+        if issue_fixing_iter(
+            env, file, hunk, messages, full_messages, context_requirement
+        ):
+            cert = env.dump(normalize_messages(full_messages))
+            print(cert)
+            with open(fix_log_path, "w") as f:
+                f.write(json.dumps(cert, indent=2))
+            return
+    # except Exception as e:
+    #     # import traceback
+    #     # print("⚠️ An exception occurred:")
+    #     # traceback.print_exc()  
+    #     pass
+
     cert = env.dump(normalize_messages(full_messages))
     with open(fix_log_path, "w") as f:
         f.write(json.dumps(cert, indent=2))
