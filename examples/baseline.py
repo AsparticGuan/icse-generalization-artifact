@@ -522,6 +522,7 @@ def issue_fixing_iter(
             test = env.prompted_tests[test_name]
             for test_log in log:
                 if test_log["name"] == test_name:
+                    print(test_log["log"])
                     test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
                     test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
                     test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
@@ -560,6 +561,7 @@ def issue_fixing_iter(
                             f"The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
+        print("LOGGGGGGG", log)
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
             normalize_feedback(log) + \
             "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
@@ -650,9 +652,9 @@ def fix_issue(issue_id):
     # desc += "Detailed information:\n"
     # desc += normalize_feedback(log) + "\n"
     file, hunk = get_hunk_short(env)
-    # desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
-    desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
-        \n```cpp\n{hunk}\n```\n"
+    desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+    # desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
+    #     \n```cpp\n{hunk}\n```\n"
     prefix = "\n".join(hunk.splitlines()[:5])
     suffix = "\n".join(hunk.splitlines()[-5:])
     context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
