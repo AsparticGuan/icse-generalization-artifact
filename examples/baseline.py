@@ -495,10 +495,22 @@ def get_issue_desc_from_programs(env: Env) -> str:
 
 
 def normalize_feedback(log) -> str:
+    # if not isinstance(log, list):
+    #     if len(log) > max_log_size:
+    #         return log[:max_log_size] + "\n<Truncated>..."
+    #     return str(log)
+    # return json.dumps(llvm_helper.get_first_failed_test(log), indent=2)
     if not isinstance(log, list):
-        if len(log) > max_log_size:
-            return log[:max_log_size] + "\n<Truncated>..."
-        return str(log)
+        text = str(log)
+        matches = re.compile(r"(Check file:.*?>>>>>>)", re.DOTALL).findall(text)
+        if matches:
+            extracted = "\n\n".join(matches)
+            if len(extracted) > max_log_size:
+                return extracted[:max_log_size] + "\n<Truncated>..."
+            return extracted
+        if len(text) > max_log_size:
+            return text[:max_log_size] + "\n<Truncated>..."
+        return text
     return json.dumps(llvm_helper.get_first_failed_test(log), indent=2)
 
 def normalize_feedback_with_build_failure(log) -> str:
