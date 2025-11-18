@@ -49,7 +49,7 @@ fi
 
 # experimental settings
 export LAB_LLM_MAX_SAMPLE_COUNT=4 # 1 or 4
-export LAB_PROMPT_TYPE=direct # cot or direct
+export LAB_PROMPT_TYPE=cot # cot or direct
 export LAB_USE_BISECTION=OFF
 
 # setup envs

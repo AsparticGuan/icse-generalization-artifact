@@ -339,17 +339,42 @@ Please answer with the code directly. Do not include any additional information 
 Please answer with the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.
 """
 
-format_requirement_cot = """
+format_requirement_cot = \
+"""
 ## Instructions for Fixing ##
 
-Your goal is to create a clean, minimal patch that properly implements the missed optimization while maintaining LLVM's code quality standards. \
-Follow these steps:
+Your response is for a formal code review and MUST strictly follow the structure below. Use the exact Markdown headings provided.
 
-1. **Analyze**: Analyze the provided information to fully understand the missed optimization.
-2. **Propose a Patch**: Outline your proposed solution. Explain your reasoning and the specific changes you intend to make.
-3. **Verify**: Analyze your own patch and the provided test program to verify if the patch can really realize the missed optimization.
-4. **Submit**: Provide the final, clean patch for review. The patch should be the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.
+---
+
+### 1. Analyze
+**Content**: Provide a deep analysis of the missed optimization. Explain the "what" (what is the issue), the "why" (why does it happen in the current code), and the "impact" (what is the performance or correctness impact).
+
+### 2. Propose a Patch
+**Content**: Describe your proposed changes at a conceptual level. Explain the logic behind your fix and why it is the correct approach according to LLVM's coding standards.
+
+### 3. Verify
+**Content**: Walk through the execution of the provided test program with your patch applied. Explain how the new code path handles the case correctly and achieves the desired optimization.
+
+### 4. Submit
+**Content**: Provide the complete and final source code for the file that needs to be changed.
+*   The code must be a single, self-contained block.
+*   The code must be the full file content, not a diff or a snippet.
+*   Enclose the code within a ```cpp ... ``` Markdown block.
+
+---
 """
+# """
+# ## Instructions for Fixing ##
+
+# Your goal is to create a clean, minimal patch that properly implements the missed optimization while maintaining LLVM's code quality standards. \
+# Follow these steps:
+
+# 1. **Analyze**: Analyze the provided information to fully understand the missed optimization.
+# 2. **Propose a Patch**: Outline your proposed solution. Explain your reasoning and the specific changes you intend to make.
+# 3. **Verify**: Analyze your own patch and the provided test program to verify if the patch can really realize the missed optimization.
+# 4. **Submit**: Provide the final, clean patch for review. The patch should be the complete code snippet (including the unmodified part) that replaces the original code. Do not answer with a diff.
+# """
 
 if os.getenv("LAB_PROMPT_TYPE") == "direct":
     format_requirement = format_requirement_direct
@@ -414,11 +439,13 @@ def extract_code_from_reply(tgt: str):
         tgt = tgt.strip().removeprefix("```cpp").removeprefix("```").removesuffix("```")
         return tgt
     # Match the last code block
-    re1 = re.compile("```cpp([\s\S]+)```")
+    # re1 = re.compile("```cpp([\s\S]+)```")
+    re1 = re.compile(r"```cpp([\s\S]+?)```")
     matches = re.findall(re1, tgt)
     if len(matches) > 0:
         return matches[-1]
-    re2 = re.compile("```([\s\S]+)```")
+    # re2 = re.compile("```([\s\S]+)```")
+    re2 = re.compile(r"```([\s\S]+?)```")
     matches = re.findall(re2, tgt)
     if len(matches) > 0:
         return matches[-1]
@@ -476,11 +503,17 @@ def normalize_feedback(log) -> str:
 
 def normalize_feedback_with_build_failure(log) -> str:
     if not isinstance(log, list):
-        error_list = re.findall(r"llvm-project/llvm/.* error: .*", str(log))
-        log_str = "\n".join(error_list)
+        # error_list = re.findall(r"llvm-project/llvm/.* error: .*", str(log))
+        # log_str = "\n".join(error_list)
+        # if len(log_str) > max_log_size:
+        #     return log_str[:max_log_size] + "\n..."
+        # return str(log_str)
+        pattern = re.compile(r"(llvm-project/llvm/[^\n]+error:[^\n]+(?:\n[ ]*\d+\s*\|[^\n]*)?)")
+        matches = pattern.findall(str(log))
+        log_str = "\n".join(matches)
         if len(log_str) > max_log_size:
             return log_str[:max_log_size] + "\n..."
-        return str(log_str)
+        return str(log_str) or "No LLVM errors found."
     return json.dumps(llvm_helper.get_first_failed_test(log), indent=2)
 
 def issue_fixing_iter(
@@ -532,6 +565,7 @@ def issue_fixing_iter(
                     else:
                         prompted_test_fail_count += 1
                         feedback += f"The previous test program `@{test_name}` was not successfully optimized.\n"
+                        feedback += f"The previous test program is:\n```llvm\n{test_log['log']['source_program']}\n```\n"
                         feedback += f"The expected optimized program is:\n```llvm\n{test_log['log']['expect_optimized_program']}\n```\nBut the current optimized program is:\n```llvm\n{test_log['log']['current_optimized_program']}\n```\n"
         if prompted_test_fail_count == 0:
             # add new test to the prompt
@@ -667,7 +701,7 @@ def fix_issue(issue_id):
             env, file, hunk, messages, full_messages, context_requirement
         ):
             cert = env.dump(normalize_messages(full_messages))
-            print(cert)
+            # print(cert)
             with open(fix_log_path, "w") as f:
                 f.write(json.dumps(cert, indent=2))
             return
