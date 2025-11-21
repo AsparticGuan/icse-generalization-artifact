@@ -348,7 +348,7 @@ Your response is for a formal code review and MUST strictly follow the structure
 ---
 
 ### 1. Analyze
-**Content**: Provide a deep analysis of the missed optimization. Explain the "what" (what is the issue), the "why" (why does it happen in the current code), and the "impact" (what is the performance or correctness impact).
+**Content**: Provide a deep analysis of the build failure or missed optimization. Explain the "what" (what is the issue), the "why" (why does it happen in the current code), and the "impact" (what is the performance or correctness impact).
 
 ### 2. Propose a Patch
 **Content**: Describe your proposed changes at a conceptual level. Explain the logic behind your fix and why it is the correct approach according to LLVM's coding standards.
@@ -435,9 +435,9 @@ def get_hunk_short(env: Env) -> str:
 
 
 def extract_code_from_reply(tgt: str):
-    if tgt.startswith("```"):
-        tgt = tgt.strip().removeprefix("```cpp").removeprefix("```").removesuffix("```")
-        return tgt
+    # if tgt.startswith("```"):
+    #     tgt = tgt.strip().removeprefix("```cpp").removeprefix("```").removesuffix("```")
+    #     return tgt
     # Match the last code block
     # re1 = re.compile("```cpp([\s\S]+)```")
     re1 = re.compile(r"```cpp([\s\S]+?)```")
@@ -556,6 +556,7 @@ def issue_fixing_iter(
             test = env.prompted_tests[test_name]
             for test_log in log:
                 if test_log["name"] == test_name:
+                    # print("[TEST LOG1]", test_log)   
                     test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
                     test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
                     test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
@@ -567,7 +568,7 @@ def issue_fixing_iter(
             test = env.prompted_tests[test_name]
             for test_log in log:
                 if test_log["name"] == test_name:
-                    print(test_log["log"])
+                    # print("[TEST LOG2]", test_log)
                     test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
                     test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
                     test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
@@ -582,9 +583,9 @@ def issue_fixing_iter(
         if prompted_test_fail_count == 0:
             # add new test to the prompt
             for test_file in env.get_tests():
-                # print(test_file)
+                # print("[TEST FILE]", test_file)
                 for test in test_file["tests"]:
-                    # print(test)
+                    # print("[TEST]", test)
                     if test["test_name"] in env.prompted_tests:
                         continue
                     for test_log in log:
@@ -607,7 +608,6 @@ def issue_fixing_iter(
                             f"The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
-        print("LOGGGGGGG", log)
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
             normalize_feedback(log) + \
             "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
@@ -694,7 +694,8 @@ def fix_issue(issue_id):
         # copy the build directory
         shutil.copytree(llvm_helper.llvm_build_dir, llvm_build_cache_dir)
             
-    assert not res
+    # Some case can pass check fast directly, these test cases are skipped.
+    assert not res, "Could pass check fast directly without fix."
     # desc += "Detailed information:\n"
     # desc += normalize_feedback(log) + "\n"
     file, hunk = get_hunk_short(env)

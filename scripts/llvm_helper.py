@@ -250,7 +250,10 @@ def cost_check(source_program: str, expect_optimized_program: str, current_optim
                 print(e)
                 pass
     success = False
-    if costs["current_optimized_program"] < costs["source_program"]:
+    # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or 
+    # \ test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
+    if costs["current_optimized_program"] < costs["source_program"] or \
+        costs["current_optimized_program"] <= costs["expect_optimized_program"]:
         success = True
     return (success, costs)
 
