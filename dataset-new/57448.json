@@ -1,0 +1,187 @@
+{
+  "bug_id": "57448",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/57448",
+  "bug_type": "missed-optimization",
+  "base_commit": "9d99b482cdc288dabe5ec1924177238d438ef093",
+  "knowledge_cutoff": "2022-08-30T14:56:53Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "b20e34b39f72f2be035dfb7367b6880fd2cf213a",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          1155,
+          1176
+        ],
+        [
+          1189,
+          1236
+        ],
+        [
+          1241,
+          1328
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::FoldOpIntoSelect",
+        "InstCombinerImpl::foldOpIntoPhi",
+        "foldOperationIntoPhiValue"
+      ]
+    }
+  },
+  "patch": "commit b20e34b39f72f2be035dfb7367b6880fd2cf213a\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Fri Sep 30 12:13:40 2022 +0200\n\n    [InstCombine] Switch foldOpIntoPhi() to use InstSimplify\n    \n    foldOpIntoPhi() currently only folds operations into the phi if all\n    but one operands constant-fold. The two exceptions to this are freeze\n    and select, where we allow more general simplification.\n    \n    This patch makes foldOpIntoPhi() generally simplification based and\n    removes all the instruction-specific logic. We just try to simplify\n    the instruction for each operand, and for the (potentially) one\n    non-simplified operand, we move it into the new block with adjusted\n    operands.\n    \n    This fixes https://github.com/llvm/llvm-project/issues/57448, which\n    was my original motivation for the change.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 29fb40be1afb..4e939d9b46e6 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1155,22 +1155,6 @@ Instruction *InstCombinerImpl::FoldOpIntoSelect(Instruction &Op, SelectInst *SI,\n   return SelectInst::Create(SI->getCondition(), NewTV, NewFV, \"\", nullptr, SI);\n }\n \n-static Value *foldOperationIntoPhiValue(BinaryOperator *I, Value *InV,\n-                                        InstCombiner::BuilderTy &Builder) {\n-  bool ConstIsRHS = isa<Constant>(I->getOperand(1));\n-  Constant *C = cast<Constant>(I->getOperand(ConstIsRHS));\n-\n-  Value *Op0 = InV, *Op1 = C;\n-  if (!ConstIsRHS)\n-    std::swap(Op0, Op1);\n-\n-  Value *RI = Builder.CreateBinOp(I->getOpcode(), Op0, Op1, \"phi.bo\");\n-  auto *FPInst = dyn_cast<Instruction>(RI);\n-  if (FPInst && isa<FPMathOperator>(FPInst))\n-    FPInst->copyFastMathFlags(I);\n-  return RI;\n-}\n-\n Instruction *InstCombinerImpl::foldOpIntoPhi(Instruction &I, PHINode *PN) {\n   unsigned NumPHIValues = PN->getNumIncomingValues();\n   if (NumPHIValues == 0)\n@@ -1189,48 +1173,66 @@ Instruction *InstCombinerImpl::foldOpIntoPhi(Instruction &I, PHINode *PN) {\n     // Otherwise, we can replace *all* users with the new PHI we form.\n   }\n \n-  // Check to see if all of the operands of the PHI are simple constants\n-  // (constantint/constantfp/undef).  If there is one non-constant value,\n-  // remember the BB it is in.  If there is more than one or if *it* is a PHI,\n-  // bail out.  We don't do arbitrary constant expressions here because moving\n-  // their computation can be expensive without a cost model.\n-  BasicBlock *NonConstBB = nullptr;\n+  // Check to see whether the instruction can be folded into each phi operand.\n+  // If there is one operand that does not fold, remember the BB it is in.\n+  // If there is more than one or if *it* is a PHI, bail out.\n+  SmallVector<Value *> NewPhiValues;\n+  BasicBlock *NonSimplifiedBB = nullptr;\n+  Value *NonSimplifiedInVal = nullptr;\n   for (unsigned i = 0; i != NumPHIValues; ++i) {\n     Value *InVal = PN->getIncomingValue(i);\n-    // For non-freeze, require constant operand\n-    // For freeze, require non-undef, non-poison operand\n-    if (!isa<FreezeInst>(I) && match(InVal, m_ImmConstant()))\n-      continue;\n-    if (isa<FreezeInst>(I) && isGuaranteedNotToBeUndefOrPoison(InVal))\n+    BasicBlock *InBB = PN->getIncomingBlock(i);\n+\n+    // NB: It is a precondition of this transform that the operands be\n+    // phi translatable! This is usually trivially satisfied by limiting it\n+    // to constant ops, and for selects we do a more sophisticated check.\n+    SmallVector<Value *> Ops;\n+    for (Value *Op : I.operands()) {\n+      if (Op == PN)\n+        Ops.push_back(InVal);\n+      else\n+        Ops.push_back(Op->DoPHITranslation(PN->getParent(), InBB));\n+    }\n+\n+    // Don't consider the simplification successful if we get back a constant\n+    // expression. That's just an instruction in hiding.\n+    Value *NewVal = simplifyInstructionWithOperands(&I, Ops, SQ);\n+    if (NewVal && !match(NewVal, m_ConstantExpr())) {\n+      NewPhiValues.push_back(NewVal);\n       continue;\n+    }\n \n     if (isa<PHINode>(InVal)) return nullptr;  // Itself a phi.\n-    if (NonConstBB) return nullptr;  // More than one non-const value.\n+    if (NonSimplifiedBB) return nullptr;  // More than one non-simplified value.\n \n-    NonConstBB = PN->getIncomingBlock(i);\n+    NonSimplifiedBB = InBB;\n+    NonSimplifiedInVal = InVal;\n+    NewPhiValues.push_back(nullptr);\n \n     // If the InVal is an invoke at the end of the pred block, then we can't\n     // insert a computation after it without breaking the edge.\n     if (isa<InvokeInst>(InVal))\n-      if (cast<Instruction>(InVal)->getParent() == NonConstBB)\n+      if (cast<Instruction>(InVal)->getParent() == NonSimplifiedBB)\n         return nullptr;\n \n     // If the incoming non-constant value is reachable from the phis block,\n     // we'll push the operation across a loop backedge. This could result in\n     // an infinite combine loop, and is generally non-profitable (especially\n     // if the operation was originally outside the loop).\n-    if (isPotentiallyReachable(PN->getParent(), NonConstBB, nullptr, &DT, LI))\n+    if (isPotentiallyReachable(PN->getParent(), NonSimplifiedBB, nullptr, &DT,\n+                               LI))\n       return nullptr;\n   }\n \n-  // If there is exactly one non-constant value, we can insert a copy of the\n+  // If there is exactly one non-simplified value, we can insert a copy of the\n   // operation in that block.  However, if this is a critical edge, we would be\n   // inserting the computation on some other paths (e.g. inside a loop).  Only\n   // do this if the pred block is unconditionally branching into the phi block.\n   // Also, make sure that the pred block is not dead code.\n-  if (NonConstBB != nullptr) {\n-    BranchInst *BI = dyn_cast<BranchInst>(NonConstBB->getTerminator());\n-    if (!BI || !BI->isUnconditional() || !DT.isReachableFromEntry(NonConstBB))\n+  if (NonSimplifiedBB != nullptr) {\n+    BranchInst *BI = dyn_cast<BranchInst>(NonSimplifiedBB->getTerminator());\n+    if (!BI || !BI->isUnconditional() ||\n+        !DT.isReachableFromEntry(NonSimplifiedBB))\n       return nullptr;\n   }\n \n@@ -1241,88 +1243,23 @@ Instruction *InstCombinerImpl::foldOpIntoPhi(Instruction &I, PHINode *PN) {\n \n   // If we are going to have to insert a new computation, do so right before the\n   // predecessor's terminator.\n-  if (NonConstBB)\n-    Builder.SetInsertPoint(NonConstBB->getTerminator());\n-\n-  // Next, add all of the operands to the PHI.\n-  if (SelectInst *SI = dyn_cast<SelectInst>(&I)) {\n-    // We only currently try to fold the condition of a select when it is a phi,\n-    // not the true/false values.\n-    Value *TrueV = SI->getTrueValue();\n-    Value *FalseV = SI->getFalseValue();\n-    BasicBlock *PhiTransBB = PN->getParent();\n-    for (unsigned i = 0; i != NumPHIValues; ++i) {\n-      BasicBlock *ThisBB = PN->getIncomingBlock(i);\n-      Value *TrueVInPred = TrueV->DoPHITranslation(PhiTransBB, ThisBB);\n-      Value *FalseVInPred = FalseV->DoPHITranslation(PhiTransBB, ThisBB);\n-      Value *InV = nullptr;\n-      // Beware of ConstantExpr:  it may eventually evaluate to getNullValue,\n-      // even if currently isNullValue gives false.\n-      Constant *InC = dyn_cast<Constant>(PN->getIncomingValue(i));\n-      // For vector constants, we cannot use isNullValue to fold into\n-      // FalseVInPred versus TrueVInPred. When we have individual nonzero\n-      // elements in the vector, we will incorrectly fold InC to\n-      // `TrueVInPred`.\n-      if (InC && isa<ConstantInt>(InC))\n-        InV = InC->isNullValue() ? FalseVInPred : TrueVInPred;\n-      else {\n-        // Generate the select in the same block as PN's current incoming block.\n-        // Note: ThisBB need not be the NonConstBB because vector constants\n-        // which are constants by definition are handled here.\n-        // FIXME: This can lead to an increase in IR generation because we might\n-        // generate selects for vector constant phi operand, that could not be\n-        // folded to TrueVInPred or FalseVInPred as done for ConstantInt. For\n-        // non-vector phis, this transformation was always profitable because\n-        // the select would be generated exactly once in the NonConstBB.\n-        Builder.SetInsertPoint(ThisBB->getTerminator());\n-        InV = Builder.CreateSelect(PN->getIncomingValue(i), TrueVInPred,\n-                                   FalseVInPred, \"phi.sel\");\n-      }\n-      NewPN->addIncoming(InV, ThisBB);\n-    }\n-  } else if (CmpInst *CI = dyn_cast<CmpInst>(&I)) {\n-    Constant *C = cast<Constant>(I.getOperand(1));\n-    for (unsigned i = 0; i != NumPHIValues; ++i) {\n-      Value *InV = nullptr;\n-      if (auto *InC = dyn_cast<Constant>(PN->getIncomingValue(i)))\n-        InV = ConstantExpr::getCompare(CI->getPredicate(), InC, C);\n-      else\n-        InV = Builder.CreateCmp(CI->getPredicate(), PN->getIncomingValue(i),\n-                                C, \"phi.cmp\");\n-      NewPN->addIncoming(InV, PN->getIncomingBlock(i));\n-    }\n-  } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {\n-    for (unsigned i = 0; i != NumPHIValues; ++i) {\n-      Value *InV = foldOperationIntoPhiValue(BO, PN->getIncomingValue(i),\n-                                             Builder);\n-      NewPN->addIncoming(InV, PN->getIncomingBlock(i));\n-    }\n-  } else if (isa<FreezeInst>(&I)) {\n-    for (unsigned i = 0; i != NumPHIValues; ++i) {\n-      Value *InV;\n-      if (NonConstBB == PN->getIncomingBlock(i))\n-        InV = Builder.CreateFreeze(PN->getIncomingValue(i), \"phi.fr\");\n+  Instruction *Clone = nullptr;\n+  if (NonSimplifiedBB) {\n+    Clone = I.clone();\n+    for (Use &U : Clone->operands()) {\n+      if (U == PN)\n+        U = NonSimplifiedInVal;\n       else\n-        InV = PN->getIncomingValue(i);\n-      NewPN->addIncoming(InV, PN->getIncomingBlock(i));\n-    }\n-  } else if (auto *EV = dyn_cast<ExtractValueInst>(&I)) {\n-    for (unsigned i = 0; i != NumPHIValues; ++i)\n-      NewPN->addIncoming(Builder.CreateExtractValue(PN->getIncomingValue(i),\n-                                                    EV->getIndices(), \"phi.ev\"),\n-                         PN->getIncomingBlock(i));\n-  } else {\n-    CastInst *CI = cast<CastInst>(&I);\n-    Type *RetTy = CI->getType();\n-    for (unsigned i = 0; i != NumPHIValues; ++i) {\n-      Value *InV;\n-      if (Constant *InC = dyn_cast<Constant>(PN->getIncomingValue(i)))\n-        InV = ConstantExpr::getCast(CI->getOpcode(), InC, RetTy);\n-      else\n-        InV = Builder.CreateCast(CI->getOpcode(), PN->getIncomingValue(i),\n-                                 I.getType(), \"phi.cast\");\n-      NewPN->addIncoming(InV, PN->getIncomingBlock(i));\n+        U = U->DoPHITranslation(PN->getParent(), NonSimplifiedBB);\n     }\n+    InsertNewInstBefore(Clone, *NonSimplifiedBB->getTerminator());\n+  }\n+\n+  for (unsigned i = 0; i != NumPHIValues; ++i) {\n+    if (NewPhiValues[i])\n+      NewPN->addIncoming(NewPhiValues[i], PN->getIncomingBlock(i));\n+    else\n+      NewPN->addIncoming(Clone, PN->getIncomingBlock(i));\n   }\n \n   for (User *U : make_early_inc_range(PN->users())) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/intptr1.ll",
+      "commands": [
+        [
+          "opt < %s  -passes=instcombine  -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test1_neg",
+          "test_body": "define void @test1_neg(ptr %a, ptr readnone %a_end, ptr %b.i64) {\n; CHECK-LABEL: @test1_neg(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ult ptr [[A:%.*]], [[A_END:%.*]]\n; CHECK-NEXT:    br i1 [[CMP1]], label [[FOR_BODY_PREHEADER:%.*]], label [[FOR_END:%.*]]\n; CHECK:       for.body.preheader:\n; CHECK-NEXT:    [[B:%.*]] = load i64, ptr [[B_I64:%.*]], align 8\n; CHECK-NEXT:    [[TMP0:%.*]] = inttoptr i64 [[B]] to ptr\n; CHECK-NEXT:    br label [[FOR_BODY:%.*]]\n; CHECK:       for.body:\n; CHECK-NEXT:    [[A_ADDR_03:%.*]] = phi ptr [ [[INCDEC_PTR:%.*]], [[BB:%.*]] ], [ [[A]], [[FOR_BODY_PREHEADER]] ]\n; CHECK-NEXT:    [[B_ADDR_02:%.*]] = phi ptr [ [[ADD:%.*]], [[BB]] ], [ [[TMP0]], [[FOR_BODY_PREHEADER]] ]\n; CHECK-NEXT:    [[PTRCMP:%.*]] = icmp ult ptr [[B_ADDR_02]], [[A_END]]\n; CHECK-NEXT:    br i1 [[PTRCMP]], label [[FOR_END]], label [[BB]]\n; CHECK:       bb:\n; CHECK-NEXT:    [[I1:%.*]] = load float, ptr [[A]], align 4\n; CHECK-NEXT:    [[MUL_I:%.*]] = fmul float [[I1]], 4.200000e+01\n; CHECK-NEXT:    store float [[MUL_I]], ptr [[A_ADDR_03]], align 4\n; CHECK-NEXT:    [[ADD]] = getelementptr inbounds float, ptr [[A]], i64 1\n; CHECK-NEXT:    [[INCDEC_PTR]] = getelementptr inbounds float, ptr [[A_ADDR_03]], i64 1\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ult ptr [[INCDEC_PTR]], [[A_END]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[FOR_BODY]], label [[FOR_END]]\n; CHECK:       for.end:\n; CHECK-NEXT:    ret void\nentry:\n  %cmp1 = icmp ult ptr %a, %a_end\n  br i1 %cmp1, label %for.body.preheader, label %for.end\n\nfor.body.preheader:                               ; preds = %entry\n  %b = load i64, ptr %b.i64, align 8\n  br label %for.body\n\nfor.body:                                         ; preds = %bb, %for.body.preheader\n  %a.addr.03 = phi ptr [ %incdec.ptr, %bb ], [ %a, %for.body.preheader ]\n  %b.addr.02 = phi i64 [ %add.int, %bb ], [ %b, %for.body.preheader ]\n  %tmp = inttoptr i64 %b.addr.02 to ptr\n  %ptrcmp = icmp ult ptr %tmp, %a_end\n  br i1 %ptrcmp, label %for.end, label %bb\n\nbb:                                               ; preds = %for.body\n  %i1 = load float, ptr %a, align 4\n  %mul.i = fmul float %i1, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  %add = getelementptr inbounds float, ptr %a, i64 1\n  %add.int = ptrtoint ptr %add to i64\n  %incdec.ptr = getelementptr inbounds float, ptr %a.addr.03, i64 1\n  %cmp = icmp ult ptr %incdec.ptr, %a_end\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %bb, %for.body, %entry\n  ret void\n}",
+          "source_program": "define void @test1_neg(ptr %a, ptr readnone %a_end, ptr %b.i64) {\nentry:\n  %cmp1 = icmp ult ptr %a, %a_end\n  br i1 %cmp1, label %for.body.preheader, label %for.end\n\nfor.body.preheader:                               ; preds = %entry\n  %b = load i64, ptr %b.i64, align 8\n  br label %for.body\n\nfor.body:                                         ; preds = %bb, %for.body.preheader\n  %a.addr.03 = phi ptr [ %incdec.ptr, %bb ], [ %a, %for.body.preheader ]\n  %b.addr.02 = phi i64 [ %add.int, %bb ], [ %b, %for.body.preheader ]\n  %tmp = inttoptr i64 %b.addr.02 to ptr\n  %ptrcmp = icmp ult ptr %tmp, %a_end\n  br i1 %ptrcmp, label %for.end, label %bb\n\nbb:                                               ; preds = %for.body\n  %i1 = load float, ptr %a, align 4\n  %mul.i = fmul float %i1, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  %add = getelementptr inbounds float, ptr %a, i64 1\n  %add.int = ptrtoint ptr %add to i64\n  %incdec.ptr = getelementptr inbounds float, ptr %a.addr.03, i64 1\n  %cmp = icmp ult ptr %incdec.ptr, %a_end\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %bb, %for.body, %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/intptr4.ll",
+      "commands": [
+        [
+          "opt < %s  -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr %a, ptr readnone %a_end, i64 %b, ptr %bf) unnamed_addr {",
+          "source_program": "define void @test(ptr %a, ptr readnone %a_end, i64 %b, ptr %bf) unnamed_addr {\nentry:\n  %cmp1 = icmp ult ptr %a, %a_end\n  %b.float = inttoptr i64 %b to ptr\n  br i1 %cmp1, label %bb1, label %bb2\n\nbb1:                                              ; preds = %entry\n  br label %for.body.preheader\n\nbb2:                                              ; preds = %entry\n  %bfi = ptrtoint ptr %bf to i64\n  br label %for.body.preheader\n\nfor.body.preheader:                               ; preds = %bb2, %bb1\n  %b.phi = phi i64 [ %b, %bb1 ], [ %bfi, %bb2 ]\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %a.addr.03 = phi ptr [ %incdec.ptr, %for.body ], [ %a, %for.body.preheader ]\n  %b.addr.float = phi ptr [ %b.addr.float.inc, %for.body ], [ %b.float, %for.body.preheader ]\n  %b.addr.i64 = phi i64 [ %b.addr.i64.inc, %for.body ], [ %b.phi, %for.body.preheader ]\n  %l = load float, ptr %b.addr.float, align 4\n  %mul.i = fmul float %l, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  %b.addr.float.2 = inttoptr i64 %b.addr.i64 to ptr\n  %b.addr.float.inc = getelementptr inbounds float, ptr %b.addr.float.2, i64 1\n  %b.addr.i64.inc = ptrtoint ptr %b.addr.float.inc to i64\n  %incdec.ptr = getelementptr inbounds float, ptr %a.addr.03, i64 1\n  %cmp = icmp ult ptr %incdec.ptr, %a_end\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/intptr5.ll",
+      "commands": [
+        [
+          "opt < %s  -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr %a, ptr readnone %a_end, i64 %b, ptr %bf) unnamed_addr {",
+          "source_program": "define void @test(ptr %a, ptr readnone %a_end, i64 %b, ptr %bf) unnamed_addr {\nentry:\n  %cmp1 = icmp ult ptr %a, %a_end\n  %b.float = inttoptr i64 %b to ptr\n  br i1 %cmp1, label %bb1, label %bb2\n\nbb1:                                              ; preds = %entry\n  br label %for.body.preheader\n\nbb2:                                              ; preds = %entry\n  %bfi = ptrtoint ptr %bf to i64\n  br label %for.body.preheader\n\nfor.body.preheader:                               ; preds = %bb2, %bb1\n  %b.phi = phi i64 [ %b, %bb1 ], [ %bfi, %bb2 ]\n  switch i64 %b, label %for.body [\n    i64 1, label %for.body\n  ]\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader, %for.body.preheader\n  %a.addr.03 = phi ptr [ %incdec.ptr, %for.body ], [ %a, %for.body.preheader ], [ %a, %for.body.preheader ]\n  %b.addr.float = phi ptr [ %b.addr.float.inc, %for.body ], [ %b.float, %for.body.preheader ], [ %b.float, %for.body.preheader ]\n  %b.addr.i64 = phi i64 [ %b.addr.i64.inc, %for.body ], [ %b.phi, %for.body.preheader ], [ %b.phi, %for.body.preheader ]\n  %l = load float, ptr %b.addr.float, align 4\n  %mul.i = fmul float %l, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  %b.addr.float.2 = inttoptr i64 %b.addr.i64 to ptr\n  %b.addr.float.inc = getelementptr inbounds float, ptr %b.addr.float.2, i64 1\n  %b.addr.i64.inc = ptrtoint ptr %b.addr.float.inc to i64\n  %incdec.ptr = getelementptr inbounds float, ptr %a.addr.03, i64 1\n  %cmp = icmp ult ptr %incdec.ptr, %a_end\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/intptr7.ll",
+      "commands": [
+        [
+          "opt < %s  -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "no_matching_phi",
+          "test_body": "define void @no_matching_phi(i64 %a, ptr %b, i1 %cond) {\n; CHECK-LABEL: @no_matching_phi(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD_INT:%.*]] = add i64 [[A:%.*]], 1\n; CHECK-NEXT:    [[ADDB:%.*]] = getelementptr inbounds float, ptr [[B:%.*]], i64 2\n; CHECK-NEXT:    br i1 [[COND:%.*]], label [[B:%.*]], label [[A:%.*]]\n; CHECK:       A:\n; CHECK-NEXT:    [[TMP0:%.*]] = inttoptr i64 [[ADD_INT]] to ptr\n; CHECK-NEXT:    br label [[C:%.*]]\n; CHECK:       B:\n; CHECK-NEXT:    [[ADD:%.*]] = inttoptr i64 [[ADD_INT]] to ptr\n; CHECK-NEXT:    store float 1.000000e+01, ptr [[ADD]], align 4\n; CHECK-NEXT:    br label [[C]]\n; CHECK:       C:\n; CHECK-NEXT:    [[A_ADDR_03:%.*]] = phi ptr [ [[ADDB]], [[A]] ], [ [[ADD]], [[B]] ]\n; CHECK-NEXT:    [[B_ADDR_02:%.*]] = phi ptr [ [[TMP0]], [[A]] ], [ [[ADDB]], [[B]] ]\n; CHECK-NEXT:    [[I1:%.*]] = load float, ptr [[B_ADDR_02]], align 4\n; CHECK-NEXT:    [[MUL_I:%.*]] = fmul float [[I1]], 4.200000e+01\n; CHECK-NEXT:    store float [[MUL_I]], ptr [[A_ADDR_03]], align 4\n; CHECK-NEXT:    ret void\nentry:\n  %cmp1 = icmp eq i1 %cond, false\n  %add.int = add i64 %a, 1\n  %add = inttoptr i64 %add.int to ptr\n  %addb = getelementptr inbounds float, ptr %b, i64 2\n  %addb.int = ptrtoint ptr %addb to i64\n  br i1 %cmp1, label %A, label %B\n\nA:                                                ; preds = %entry\n  br label %C\n\nB:                                                ; preds = %entry\n  store float 1.000000e+01, ptr %add, align 4\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %a.addr.03 = phi ptr [ %addb, %A ], [ %add, %B ]\n  %b.addr.02 = phi i64 [ %addb.int, %B ], [ %add.int, %A ]\n  %i0 = inttoptr i64 %b.addr.02 to ptr\n  %i1 = load float, ptr %i0, align 4\n  %mul.i = fmul float %i1, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  ret void\n}",
+          "source_program": "define void @no_matching_phi(i64 %a, ptr %b, i1 %cond) {\nentry:\n  %cmp1 = icmp eq i1 %cond, false\n  %add.int = add i64 %a, 1\n  %add = inttoptr i64 %add.int to ptr\n  %addb = getelementptr inbounds float, ptr %b, i64 2\n  %addb.int = ptrtoint ptr %addb to i64\n  br i1 %cmp1, label %A, label %B\n\nA:                                                ; preds = %entry\n  br label %C\n\nB:                                                ; preds = %entry\n  store float 1.000000e+01, ptr %add, align 4\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %a.addr.03 = phi ptr [ %addb, %A ], [ %add, %B ]\n  %b.addr.02 = phi i64 [ %addb.int, %B ], [ %add.int, %A ]\n  %i0 = inttoptr i64 %b.addr.02 to ptr\n  %i1 = load float, ptr %i0, align 4\n  %mul.i = fmul float %i1, 4.200000e+01\n  store float %mul.i, ptr %a.addr.03, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/phi-select-constant.ll",
+      "commands": [
+        [
+          "opt < %s -S -passes=instcombine",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec3",
+          "test_body": "define <2 x i8> @vec3(i1 %cond1, i1 %cond2, <2 x i1> %x, <2 x i8> %y, <2 x i8> %z) {\n; CHECK-LABEL: @vec3(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    br i1 [[COND1:%.*]], label [[IF1:%.*]], label [[ELSE:%.*]]\n; CHECK:       if1:\n; CHECK-NEXT:    br i1 [[COND2:%.*]], label [[IF2:%.*]], label [[ELSE]]\n; CHECK:       if2:\n; CHECK-NEXT:    br label [[ELSE]]\n; CHECK:       else:\n; CHECK-NEXT:    [[PHI:%.*]] = phi <2 x i1> [ [[X:%.*]], [[IF2]] ], [ <i1 false, i1 true>, [[ENTRY:%.*]] ], [ <i1 true, i1 false>, [[IF1]] ]\n; CHECK-NEXT:    [[SEL:%.*]] = select <2 x i1> [[PHI]], <2 x i8> [[Y:%.*]], <2 x i8> [[Z:%.*]]\n; CHECK-NEXT:    ret <2 x i8> [[SEL]]\nentry:\n  br i1 %cond1, label %if1, label %else\n\nif1:                                              ; preds = %entry\n  br i1 %cond2, label %if2, label %else\n\nif2:                                              ; preds = %if1\n  br label %else\n\nelse:                                             ; preds = %if2, %if1, %entry\n  %phi = phi <2 x i1> [ %x, %if2 ], [ <i1 false, i1 true>, %entry ], [ <i1 true, i1 false>, %if1 ]\n  %sel = select <2 x i1> %phi, <2 x i8> %y, <2 x i8> %z\n  ret <2 x i8> %sel\n}",
+          "source_program": "define <2 x i8> @vec3(i1 %cond1, i1 %cond2, <2 x i1> %x, <2 x i8> %y, <2 x i8> %z) {\nentry:\n  br i1 %cond1, label %if1, label %else\n\nif1:                                              ; preds = %entry\n  br i1 %cond2, label %if2, label %else\n\nif2:                                              ; preds = %if1\n  br label %else\n\nelse:                                             ; preds = %if2, %if1, %entry\n  %phi = phi <2 x i1> [ %x, %if2 ], [ <i1 false, i1 true>, %entry ], [ <i1 true, i1 false>, %if1 ]\n  %sel = select <2 x i1> %phi, <2 x i8> %y, <2 x i8> %z\n  ret <2 x i8> %sel\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/phi.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "pr57488_icmp_of_phi",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128:n8:16:32:64\"\n\ndefine i1 @pr57488_icmp_of_phi(ptr %ptr.base, i64 %len) {\n; CHECK-LABEL: @pr57488_icmp_of_phi(\n; CHECK-NEXT:  start:\n; CHECK-NEXT:    [[END:%.*]] = getelementptr inbounds i64, ptr [[PTR_BASE:%.*]], i64 [[LEN:%.*]]\n; CHECK-NEXT:    [[LEN_ZERO:%.*]] = icmp eq i64 [[LEN]], 0\n; CHECK-NEXT:    br i1 [[LEN_ZERO]], label [[EXIT:%.*]], label [[LOOP:%.*]]\n; CHECK:       loop:\n; CHECK-NEXT:    [[ACCUM:%.*]] = phi i1 [ [[AND:%.*]], [[LOOP]] ], [ true, [[START:%.*]] ]\n; CHECK-NEXT:    [[PTR:%.*]] = phi ptr [ [[PTR_NEXT:%.*]], [[LOOP]] ], [ [[PTR_BASE]], [[START]] ]\n; CHECK-NEXT:    [[PTR_NEXT]] = getelementptr inbounds i64, ptr [[PTR]], i64 1\n; CHECK-NEXT:    [[VAL:%.*]] = load i64, ptr [[PTR]], align 8\n; CHECK-NEXT:    [[VAL_ZERO:%.*]] = icmp eq i64 [[VAL]], 0\n; CHECK-NEXT:    [[AND]] = and i1 [[ACCUM]], [[VAL_ZERO]]\n; CHECK-NEXT:    [[EXIT_COND:%.*]] = icmp eq ptr [[PTR_NEXT]], [[END]]\n; CHECK-NEXT:    br i1 [[EXIT_COND]], label [[EXIT]], label [[LOOP]]\n; CHECK:       exit:\n; CHECK-NEXT:    [[RES:%.*]] = phi i1 [ true, [[START]] ], [ [[AND]], [[LOOP]] ]\n; CHECK-NEXT:    ret i1 [[RES]]\nstart:\n  %end = getelementptr inbounds i64, ptr %ptr.base, i64 %len\n  %len.zero = icmp eq i64 %len, 0\n  br i1 %len.zero, label %exit, label %loop\n\nloop:                                             ; preds = %loop, %start\n  %accum = phi i8 [ %accum.next, %loop ], [ 1, %start ]\n  %ptr = phi ptr [ %ptr.next, %loop ], [ %ptr.base, %start ]\n  %ptr.next = getelementptr inbounds i64, ptr %ptr, i64 1\n  %accum.bool = icmp ne i8 %accum, 0\n  %val = load i64, ptr %ptr, align 8\n  %val.zero = icmp eq i64 %val, 0\n  %and = and i1 %accum.bool, %val.zero\n  %accum.next = zext i1 %and to i8\n  %exit.cond = icmp eq ptr %ptr.next, %end\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop, %start\n  %res = phi i1 [ true, %start ], [ %and, %loop ]\n  ret i1 %res\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128:n8:16:32:64\"\n\ndefine i1 @pr57488_icmp_of_phi(ptr %ptr.base, i64 %len) {\nstart:\n  %end = getelementptr inbounds i64, ptr %ptr.base, i64 %len\n  %len.zero = icmp eq i64 %len, 0\n  br i1 %len.zero, label %exit, label %loop\n\nloop:                                             ; preds = %loop, %start\n  %accum = phi i8 [ %accum.next, %loop ], [ 1, %start ]\n  %ptr = phi ptr [ %ptr.next, %loop ], [ %ptr.base, %start ]\n  %ptr.next = getelementptr inbounds i64, ptr %ptr, i64 1\n  %accum.bool = icmp ne i8 %accum, 0\n  %val = load i64, ptr %ptr, align 8\n  %val.zero = icmp eq i64 %val, 0\n  %and = and i1 %accum.bool, %val.zero\n  %accum.next = zext i1 %and to i8\n  %exit.cond = icmp eq ptr %ptr.next, %end\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop, %start\n  %res = phi i1 [ true, %start ], [ %and, %loop ]\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "test23",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128:n8:16:32:64\"\n\ndefine i32 @test23(i32 %A, i1 %pb, ptr %P) {\n; CHECK-LABEL: @test23(\n; CHECK-NEXT:  BB0:\n; CHECK-NEXT:    [[TMP0:%.*]] = add i32 [[A:%.*]], 19\n; CHECK-NEXT:    br label [[LOOP:%.*]]\n; CHECK:       Loop:\n; CHECK-NEXT:    [[B:%.*]] = phi i32 [ [[TMP0]], [[BB0:%.*]] ], [ 61, [[LOOP]] ]\n; CHECK-NEXT:    store i32 [[B]], ptr [[P:%.*]], align 4\n; CHECK-NEXT:    br i1 [[PB:%.*]], label [[LOOP]], label [[EXIT:%.*]]\n; CHECK:       Exit:\n; CHECK-NEXT:    ret i32 [[B]]\nBB0:\n  br label %Loop\n\nLoop:                                             ; preds = %Loop, %BB0\n  %B = phi i32 [ %A, %BB0 ], [ 42, %Loop ]\n  %D = add i32 %B, 19\n  store i32 %D, ptr %P, align 4\n  br i1 %pb, label %Loop, label %Exit\n\nExit:                                             ; preds = %Loop\n  %E = add i32 %B, 19\n  ret i32 %E\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128:n8:16:32:64\"\n\ndefine i32 @test23(i32 %A, i1 %pb, ptr %P) {\nBB0:\n  br label %Loop\n\nLoop:                                             ; preds = %Loop, %BB0\n  %B = phi i32 [ %A, %BB0 ], [ 42, %Loop ]\n  %D = add i32 %B, 19\n  store i32 %D, ptr %P, align 4\n  br i1 %pb, label %Loop, label %Exit\n\nExit:                                             ; preds = %Loop\n  %E = add i32 %B, 19\n  ret i32 %E\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/recurrence.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -S < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_or",
+          "test_body": "define i64 @test_or(i64 %a) {\n; CHECK-LABEL: @test_or(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = or i64 [[A:%.*]], 15\n; CHECK-NEXT:    br label [[LOOP:%.*]]\n; CHECK:       loop:\n; CHECK-NEXT:    tail call void @use(i64 [[TMP0]])\n; CHECK-NEXT:    br label [[LOOP]]\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = or i64 %iv, 15\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)",
+          "source_program": "define i64 @test_or(i64 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = or i64 %iv, 15\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)\n"
+        },
+        {
+          "test_name": "test_and",
+          "test_body": "define i64 @test_and(i64 %a) {\n; CHECK-LABEL: @test_and(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = and i64 [[A:%.*]], 15\n; CHECK-NEXT:    br label [[LOOP:%.*]]\n; CHECK:       loop:\n; CHECK-NEXT:    tail call void @use(i64 [[TMP0]])\n; CHECK-NEXT:    br label [[LOOP]]\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = and i64 %iv, 15\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)",
+          "source_program": "define i64 @test_and(i64 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = and i64 %iv, 15\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "i8 bool accumulator not converted to i1",
+    "body": "```llvm\r\ndefine zeroext i1 @test(ptr %ptr.base, i64 %len) {\r\nstart:\r\n  %end = getelementptr inbounds i64, ptr %ptr.base, i64 %len\r\n  %len.zero = icmp eq i64 %len, 0\r\n  br i1 %len.zero, label %exit, label %loop\r\n\r\nloop:\r\n  %accum = phi i8 [ %accum.next, %loop ], [ 1, %start ]\r\n  %ptr = phi ptr [ %ptr.next, %loop ], [ %ptr.base, %start ]\r\n  %ptr.next = getelementptr inbounds i64, ptr %ptr, i64 1\r\n  %accum.bool = icmp ne i8 %accum, 0\r\n  %val = load i64, ptr %ptr, align 8\r\n  %val.zero = icmp eq i64 %val, 0\r\n  %and = and i1 %accum.bool, %val.zero\r\n  %accum.next = zext i1 %and to i8\r\n  %exit.cond = icmp eq ptr %ptr.next, %end\r\n  br i1 %exit.cond, label %exit, label %loop\r\n\r\nexit:\r\n  %res = phi i1 [ true, %start ], [ %and, %loop ]\r\n  ret i1 %res\r\n}\r\n```\r\nThis stays invariant under `-O2`. It should be possible to narrow `%accum` to `i1`, resulting in the following IR:\r\n```llvm\r\ndefine zeroext i1 @test(ptr %ptr.base, i64 %len) {\r\nstart:\r\n  %end = getelementptr inbounds i64, ptr %ptr.base, i64 %len\r\n  %len.zero = icmp eq i64 %len, 0\r\n  br i1 %len.zero, label %exit, label %loop\r\n\r\nloop:\r\n  %accum.bool = phi i1 [ %accum.next, %loop ], [ true, %start ]\r\n  %ptr = phi ptr [ %ptr.next, %loop ], [ %ptr.base, %start ]\r\n  %ptr.next = getelementptr inbounds i64, ptr %ptr, i64 1\r\n  %val = load i64, ptr %ptr, align 8\r\n  %val.zero = icmp eq i64 %val, 0\r\n  %accum.next = and i1 %accum.bool, %val.zero\r\n  %exit.cond = icmp eq ptr %ptr.next, %end\r\n  br i1 %exit.cond, label %exit, label %loop\r\n\r\nexit:\r\n  %res = phi i1 [ true, %start ], [ %accum.next, %loop ]\r\n  ret i1 %res\r\n}\r\n```",
+    "author": "nikic",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "We'd want to push the `icmp ne i8 %accum, 0` through the phi here, because that allows it to fold with the zext. But general transforms like foldOpIntoPhi() won't cover this, because we usually don't want to push an op over a loop backedge (easy to infinite loop in that case).\r\n\r\nNot sure what an elegant way to fix this would be cc @rotateright "
+      },
+      {
+        "author": "nikic",
+        "body": "Candidate patch: https://reviews.llvm.org/D134954"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

@@ -23,6 +23,10 @@ elif [[ "$1" == "gpt-4o" ]]; then
     export LAB_LLM_MODEL=gpt-4o
     export http_proxy="" # disable proxy on our cse servers
     export https_proxy="" # disable proxy on our cse servers
+elif [[ "$1" == "gemini-3" ]]; then
+    export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
+    export LAB_LLM_URL=$OPENROUTER_URL
+    export LAB_LLM_MODEL=google/gemini-3-pro-preview
 elif [[ "$1" == "deepseek-v3.1" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
@@ -58,7 +62,7 @@ export LAB_LLVM_BUILD_DIR=$SCRIPT_DIR/build
 export LAB_DATASET_DIR=$SCRIPT_DIR/dataset
 export LAB_FIX_DIR=$SCRIPT_DIR/examples/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_LLM_MAX_SAMPLE_COUNT
 
-# steup LLVM
+# setup LLVM
 export LAB_LLVM_DIR=$SCRIPT_DIR/utils/llvm/llvm-project
 if [[ ! -d "$LAB_LLVM_DIR" ]]; then
     echo "Cloning llvm-project to $LAB_LLVM_DIR"

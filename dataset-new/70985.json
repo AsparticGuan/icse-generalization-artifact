@@ -1,0 +1,211 @@
+{
+  "bug_id": "70985",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/70985",
+  "bug_type": "missed-optimization",
+  "base_commit": "0338350ccb506020529259427ec1c66ca6569749",
+  "knowledge_cutoff": "2023-11-01T21:08:03Z",
+  "lit_test_dir": [
+    "llvm/test/CodeGen",
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/InstSimplify"
+  ],
+  "hints": {
+    "fix_commit": "ca5ece89394f64ab814032d9562b2e4770160523",
+    "components": [
+      "InstructionSimplify",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        [
+          4164,
+          4169
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          39,
+          44
+        ],
+        [
+          9474,
+          9479
+        ],
+        [
+          9529,
+          9543
+        ],
+        [
+          9574,
+          9579
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        "simplifyFCmpInst"
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "isImpliedCondICmps",
+        "llvm::isImpliedCondition"
+      ]
+    }
+  },
+  "patch": "commit ca5ece89394f64ab814032d9562b2e4770160523\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sun Oct 5 16:15:51 2025 +0800\n\n    [InstSimplify] Simplify fcmp implied by dominating fcmp (#161090)\n    \n    This patch simplifies an fcmp into true/false if it is implied by a\n    dominating fcmp.\n    As an initial support, it only handles two cases:\n    + `fcmp pred1, X, Y -> fcmp pred2, X, Y`: use set operations.\n    + `fcmp pred1, X, C1 -> fcmp pred2, X, C2`: use `ConstantFPRange` and\n    set operations.\n    \n    Note: It doesn't fix https://github.com/llvm/llvm-project/issues/70985,\n    as the second fcmp in the motivating case is not dominated by the edge.\n    We may need to adjust JumpThreading to handle this case.\n    \n    Comptime impact (~+0.1%):\n    https://llvm-compile-time-tracker.com/compare.php?from=a728f213c863e4dd19f8969a417148d2951323c0&to=8ca70404fb0d66a824f39d83050ac38e2f1b25b9&stat=instructions:u\n    IR diff: https://github.com/dtcxzyw/llvm-opt-benchmark/pull/2848\n\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex 07f4a8e5c889..0d978d4da125 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -4164,6 +4164,10 @@ static Value *simplifyFCmpInst(CmpPredicate Pred, Value *LHS, Value *RHS,\n       return ConstantInt::get(RetTy, Pred == CmpInst::FCMP_UNO);\n   }\n \n+  if (std::optional<bool> Res =\n+          isImpliedByDomCondition(Pred, LHS, RHS, Q.CxtI, Q.DL))\n+    return ConstantInt::getBool(RetTy, *Res);\n+\n   const APFloat *C = nullptr;\n   match(RHS, m_APFloatAllowPoison(C));\n   std::optional<KnownFPClass> FullKnownClassLHS;\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 1eda7a7c90b0..a42c061d012a 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -39,6 +39,7 @@\n #include \"llvm/IR/Attributes.h\"\n #include \"llvm/IR/BasicBlock.h\"\n #include \"llvm/IR/Constant.h\"\n+#include \"llvm/IR/ConstantFPRange.h\"\n #include \"llvm/IR/ConstantRange.h\"\n #include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DerivedTypes.h\"\n@@ -9474,6 +9475,69 @@ isImpliedCondICmps(CmpPredicate LPred, const Value *L0, const Value *L1,\n   return std::nullopt;\n }\n \n+/// Return true if LHS implies RHS (expanded to its components as \"R0 RPred R1\")\n+/// is true.  Return false if LHS implies RHS is false. Otherwise, return\n+/// std::nullopt if we can't infer anything.\n+static std::optional<bool>\n+isImpliedCondFCmps(FCmpInst::Predicate LPred, const Value *L0, const Value *L1,\n+                   FCmpInst::Predicate RPred, const Value *R0, const Value *R1,\n+                   const DataLayout &DL, bool LHSIsTrue) {\n+  // The rest of the logic assumes the LHS condition is true.  If that's not the\n+  // case, invert the predicate to make it so.\n+  if (!LHSIsTrue)\n+    LPred = FCmpInst::getInversePredicate(LPred);\n+\n+  // We can have non-canonical operands, so try to normalize any common operand\n+  // to L0/R0.\n+  if (L0 == R1) {\n+    std::swap(R0, R1);\n+    RPred = FCmpInst::getSwappedPredicate(RPred);\n+  }\n+  if (R0 == L1) {\n+    std::swap(L0, L1);\n+    LPred = FCmpInst::getSwappedPredicate(LPred);\n+  }\n+  if (L1 == R1) {\n+    // If we have L0 == R0 and L1 == R1, then make L1/R1 the constants.\n+    if (L0 != R0 || match(L0, m_ImmConstant())) {\n+      std::swap(L0, L1);\n+      LPred = ICmpInst::getSwappedCmpPredicate(LPred);\n+      std::swap(R0, R1);\n+      RPred = ICmpInst::getSwappedCmpPredicate(RPred);\n+    }\n+  }\n+\n+  // Can we infer anything when the two compares have matching operands?\n+  if (L0 == R0 && L1 == R1) {\n+    if ((LPred & RPred) == LPred)\n+      return true;\n+    if ((LPred & ~RPred) == LPred)\n+      return false;\n+  }\n+\n+  // See if we can infer anything if operand-0 matches and we have at least one\n+  // constant.\n+  const APFloat *L1C, *R1C;\n+  if (L0 == R0 && match(L1, m_APFloat(L1C)) && match(R1, m_APFloat(R1C))) {\n+    if (std::optional<ConstantFPRange> DomCR =\n+            ConstantFPRange::makeExactFCmpRegion(LPred, *L1C)) {\n+      if (std::optional<ConstantFPRange> ImpliedCR =\n+              ConstantFPRange::makeExactFCmpRegion(RPred, *R1C)) {\n+        if (ImpliedCR->contains(*DomCR))\n+          return true;\n+      }\n+      if (std::optional<ConstantFPRange> ImpliedCR =\n+              ConstantFPRange::makeExactFCmpRegion(\n+                  FCmpInst::getInversePredicate(RPred), *R1C)) {\n+        if (ImpliedCR->contains(*DomCR))\n+          return false;\n+      }\n+    }\n+  }\n+\n+  return std::nullopt;\n+}\n+\n /// Return true if LHS implies RHS is true.  Return false if LHS implies RHS is\n /// false.  Otherwise, return std::nullopt if we can't infer anything.  We\n /// expect the RHS to be an icmp and the LHS to be an 'and', 'or', or a 'select'\n@@ -9529,15 +9593,24 @@ llvm::isImpliedCondition(const Value *LHS, CmpPredicate RHSPred,\n     LHSIsTrue = !LHSIsTrue;\n \n   // Both LHS and RHS are icmps.\n-  if (const auto *LHSCmp = dyn_cast<ICmpInst>(LHS))\n-    return isImpliedCondICmps(LHSCmp->getCmpPredicate(), LHSCmp->getOperand(0),\n-                              LHSCmp->getOperand(1), RHSPred, RHSOp0, RHSOp1,\n-                              DL, LHSIsTrue);\n-  const Value *V;\n-  if (match(LHS, m_NUWTrunc(m_Value(V))))\n-    return isImpliedCondICmps(CmpInst::ICMP_NE, V,\n-                              ConstantInt::get(V->getType(), 0), RHSPred,\n-                              RHSOp0, RHSOp1, DL, LHSIsTrue);\n+  if (RHSOp0->getType()->getScalarType()->isIntOrPtrTy()) {\n+    if (const auto *LHSCmp = dyn_cast<ICmpInst>(LHS))\n+      return isImpliedCondICmps(LHSCmp->getCmpPredicate(),\n+                                LHSCmp->getOperand(0), LHSCmp->getOperand(1),\n+                                RHSPred, RHSOp0, RHSOp1, DL, LHSIsTrue);\n+    const Value *V;\n+    if (match(LHS, m_NUWTrunc(m_Value(V))))\n+      return isImpliedCondICmps(CmpInst::ICMP_NE, V,\n+                                ConstantInt::get(V->getType(), 0), RHSPred,\n+                                RHSOp0, RHSOp1, DL, LHSIsTrue);\n+  } else {\n+    assert(RHSOp0->getType()->isFPOrFPVectorTy() &&\n+           \"Expected floating point type only!\");\n+    if (const auto *LHSCmp = dyn_cast<FCmpInst>(LHS))\n+      return isImpliedCondFCmps(LHSCmp->getPredicate(), LHSCmp->getOperand(0),\n+                                LHSCmp->getOperand(1), RHSPred, RHSOp0, RHSOp1,\n+                                DL, LHSIsTrue);\n+  }\n \n   /// The LHS should be an 'or', 'and', or a 'select' instruction.  We expect\n   /// the RHS to be an icmp.\n@@ -9574,6 +9647,13 @@ std::optional<bool> llvm::isImpliedCondition(const Value *LHS, const Value *RHS,\n       return InvertRHS ? !*Implied : *Implied;\n     return std::nullopt;\n   }\n+  if (const FCmpInst *RHSCmp = dyn_cast<FCmpInst>(RHS)) {\n+    if (auto Implied = isImpliedCondition(\n+            LHS, RHSCmp->getPredicate(), RHSCmp->getOperand(0),\n+            RHSCmp->getOperand(1), DL, LHSIsTrue, Depth))\n+      return InvertRHS ? !*Implied : *Implied;\n+    return std::nullopt;\n+  }\n \n   const Value *V;\n   if (match(RHS, m_NUWTrunc(m_Value(V)))) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/CodeGen/AMDGPU/sgpr-copy.ll",
+      "commands": [
+        [
+          "llc -amdgpu-scalarize-global-loads=false  -mtriple=amdgcn -mcpu=tahiti < %s",
+          "FileCheck %s"
+        ],
+        [
+          "llc -amdgpu-scalarize-global-loads=false  -mtriple=amdgcn -mcpu=tonga -mattr=-flat-for-global < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "copy1",
+          "test_body": "define amdgpu_kernel void @copy1(ptr addrspace(1) %out, ptr addrspace(1) %in0) {\nentry:\n  %tmp = load float, ptr addrspace(1) %in0, align 4\n  %tmp1 = fcmp one float %tmp, 0.000000e+00\n  br i1 %tmp1, label %if0, label %endif\n\nif0:                                              ; preds = %entry\n  %tmp2 = bitcast float %tmp to i32\n  %tmp3 = fcmp olt float %tmp, 0.000000e+00\n  br i1 %tmp3, label %if1, label %endif\n\nif1:                                              ; preds = %if0\n  %tmp4 = add i32 %tmp2, 1\n  br label %endif\n\nendif:                                            ; preds = %if1, %if0, %entry\n  %tmp5 = phi i32 [ 0, %entry ], [ %tmp2, %if0 ], [ %tmp4, %if1 ]\n  %tmp6 = bitcast i32 %tmp5 to float\n  store float %tmp6, ptr addrspace(1) %out, align 4\n  ret void\n}",
+          "source_program": "define amdgpu_kernel void @copy1(ptr addrspace(1) %out, ptr addrspace(1) %in0) {\nentry:\n  %tmp = load float, ptr addrspace(1) %in0, align 4\n  %tmp1 = fcmp one float %tmp, 0.000000e+00\n  br i1 %tmp1, label %if0, label %endif\n\nif0:                                              ; preds = %entry\n  %tmp2 = bitcast float %tmp to i32\n  %tmp3 = fcmp olt float %tmp, 0.000000e+00\n  br i1 %tmp3, label %if1, label %endif\n\nif1:                                              ; preds = %if0\n  %tmp4 = add i32 %tmp2, 1\n  br label %endif\n\nendif:                                            ; preds = %if1, %if0, %entry\n  %tmp5 = phi i32 [ 0, %entry ], [ %tmp2, %if0 ], [ %tmp4, %if1 ]\n  %tmp6 = bitcast i32 %tmp5 to float\n  store float %tmp6, ptr addrspace(1) %out, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/clamp-to-minmax.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        [
+          "opt < %s -passes=instcombine -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "clamp_negative_wrong_const",
+          "test_body": "define float @clamp_negative_wrong_const(float %x) {\n; CHECK-LABEL: @clamp_negative_wrong_const(\n; CHECK-NEXT:    [[INNER_CMP_INV:%.*]] = fcmp fast oge float [[X:%.*]], 2.550000e+02\n; CHECK-NEXT:    [[INNER_SEL:%.*]] = select nnan ninf i1 [[INNER_CMP_INV]], float 2.550000e+02, float [[X]]\n; CHECK-NEXT:    [[OUTER_CMP:%.*]] = fcmp fast ugt float [[X]], 5.120000e+02\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[OUTER_CMP]], float [[INNER_SEL]], float 5.120000e+02\n; CHECK-NEXT:    ret float [[R]]\n  %inner_cmp = fcmp fast ult float %x, 2.550000e+02\n  %inner_sel = select i1 %inner_cmp, float %x, float 2.550000e+02\n  %outer_cmp = fcmp fast ugt float %x, 5.120000e+02\n  %r = select i1 %outer_cmp, float %inner_sel, float 5.120000e+02\n  ret float %r\n}",
+          "source_program": "define float @clamp_negative_wrong_const(float %x) {\n  %inner_cmp = fcmp fast ult float %x, 2.550000e+02\n  %inner_sel = select i1 %inner_cmp, float %x, float 2.550000e+02\n  %outer_cmp = fcmp fast ugt float %x, 5.120000e+02\n  %r = select i1 %outer_cmp, float %inner_sel, float 5.120000e+02\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_negative_same_op",
+          "test_body": "define float @clamp_negative_same_op(float %x) {\n; CHECK-LABEL: @clamp_negative_same_op(\n; CHECK-NEXT:    [[OUTER_CMP_INV:%.*]] = fcmp fast oge float [[X:%.*]], 1.000000e+00\n; CHECK-NEXT:    [[R:%.*]] = select nnan ninf i1 [[OUTER_CMP_INV]], float 1.000000e+00, float [[X]]\n; CHECK-NEXT:    ret float [[R]]\n  %inner_cmp = fcmp fast ult float %x, 2.550000e+02\n  %inner_sel = select i1 %inner_cmp, float %x, float 2.550000e+02\n  %outer_cmp = fcmp fast ult float %x, 1.000000e+00\n  %r = select i1 %outer_cmp, float %inner_sel, float 1.000000e+00\n  ret float %r\n}",
+          "source_program": "define float @clamp_negative_same_op(float %x) {\n  %inner_cmp = fcmp fast ult float %x, 2.550000e+02\n  %inner_sel = select i1 %inner_cmp, float %x, float 2.550000e+02\n  %outer_cmp = fcmp fast ult float %x, 1.000000e+00\n  %r = select i1 %outer_cmp, float %inner_sel, float 1.000000e+00\n  ret float %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstSimplify/domcondition.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instsimplify -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_pred_true",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_true(float %x, float %y) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_pred_true(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 true\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ole float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_true(float %x, float %y) {\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ole float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_pred_commuted",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_commuted(float %x, float %y) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_pred_commuted(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 true\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp oge float %y, %x\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_commuted(float %x, float %y) {\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp oge float %y, %x\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_pred_false",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_false(float %x, float %y) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_pred_false(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 false\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ogt float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_false(float %x, float %y) {\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ogt float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_pred_mismatched_operand",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_mismatched_operand(float %x, float %y, float %z) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_pred_mismatched_operand(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[CMP2:%.*]] = fcmp ole float [[X]], [[Z:%.*]]\n; CHECK-NEXT:    ret i1 [[CMP2]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ole float %x, %z\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_pred_mismatched_operand(float %x, float %y, float %z) {\n  %cmp = fcmp olt float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ole float %x, %z\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_range_false",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_range_false(float %x) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_range_false(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 false\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ogt float %x, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_range_false(float %x) {\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp ogt float %x, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_range_true",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_range_true(float %x) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_range_true(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 true\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_range_true(float %x) {\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_range_mismatched_operand",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_range_mismatched_operand(float %x, float %y) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_range_mismatched_operand(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[CMP2:%.*]] = fcmp olt float [[Y:%.*]], 1.000000e+00\n; CHECK-NEXT:    ret i1 [[CMP2]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %y, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_range_mismatched_operand(float %x, float %y) {\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %y, 1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_wrong_pred",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_wrong_pred(float %x, float %y) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_wrong_pred(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp ole float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[CMP2:%.*]] = fcmp olt float [[X]], [[Y]]\n; CHECK-NEXT:    ret i1 [[CMP2]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp ole float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_wrong_pred(float %x, float %y) {\n  %cmp = fcmp ole float %x, %y\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, %y\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_implied_by_dom_cond_wrong_range",
+          "test_body": "define i1 @simplify_fcmp_implied_by_dom_cond_wrong_range(float %x) {\n; CHECK-LABEL: @simplify_fcmp_implied_by_dom_cond_wrong_range(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[CMP2:%.*]] = fcmp olt float [[X]], -1.000000e+00\n; CHECK-NEXT:    ret i1 [[CMP2]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 false\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, -1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}",
+          "source_program": "define i1 @simplify_fcmp_implied_by_dom_cond_wrong_range(float %x) {\n  %cmp = fcmp olt float %x, 0.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %cmp2 = fcmp olt float %x, -1.000000e+00\n  ret i1 %cmp2\n\nif.else:                                          ; preds = %0\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "simplify_fcmp_in_else_implied_by_dom_cond_range_true",
+          "test_body": "define i1 @simplify_fcmp_in_else_implied_by_dom_cond_range_true(float %x) {\n; CHECK-LABEL: @simplify_fcmp_in_else_implied_by_dom_cond_range_true(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 1.000000e+00\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    ret i1 true\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i1 true\n  %cmp = fcmp olt float %x, 1.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  ret i1 true\n\nif.else:                                          ; preds = %0\n  %cmp2 = fcmp uge float %x, 5.000000e-01\n  ret i1 %cmp2\n}",
+          "source_program": "define i1 @simplify_fcmp_in_else_implied_by_dom_cond_range_true(float %x) {\n  %cmp = fcmp olt float %x, 1.000000e+00\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  ret i1 true\n\nif.else:                                          ; preds = %0\n  %cmp2 = fcmp uge float %x, 5.000000e-01\n  ret i1 %cmp2\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Missed optimization: inadequate float range propagation",
+    "body": "At 604eff60abfce09f956c3b0b1414f8d0d04b5d47, `clang++ -target x86_64-linux-gnu -O3` compiles\r\n```c++\r\n// Copyright 2023 Google LLC\r\n// SPDX-License-Identifier: Apache-2.0\r\nint ga, gb;\r\nvoid F(double x) {\r\n  if (x > 5) ++ga;\r\n  if (x > 10) ++gb;\r\n}\r\n```\r\nto\r\n```asm\r\n.LCPI0_0:\r\n        .quad   0x4014000000000000              # double 5\r\n.LCPI0_1:\r\n        .quad   0x4024000000000000              # double 10\r\n_Z1Fd:  ucomisd xmm0, qword ptr [rip + .LCPI0_0]\r\n        ja      .LBB0_1\r\n        ucomisd xmm0, qword ptr [rip + .LCPI0_1]  # ***\r\n        ja      .LBB0_3                           # ***\r\n.LBB0_4:\r\n        ret\r\n.LBB0_1:\r\n        inc     dword ptr [rip + ga]\r\n        ucomisd xmm0, qword ptr [rip + .LCPI0_1]\r\n        jbe     .LBB0_4\r\n.LBB0_3:\r\n        inc     dword ptr [rip + gb]\r\n        ret\r\nga:     .long   0\r\ngb:     .long   0\r\n```\r\nThe conditional branch marked with `# ***` will never be taken \u2013 in the domain of `double`s, `!(x > 5)` always implies `!(x > 10)`. Telling the compiler this explicitly \u2013\r\n```c++\r\n// Copyright 2023 Google LLC\r\n// SPDX-License-Identifier: Apache-2.0\r\nint ga, gb;\r\nvoid F(double x) {\r\n  if (x > 5) {\r\n    ++ga;\r\n    if (x > 10) ++gb;\r\n  }\r\n}\r\n```\r\n\u2013 produces\r\n```asm\r\n.LCPI0_0:\r\n        .quad   0x4014000000000000              # double 5\r\n.LCPI0_1:\r\n        .quad   0x4024000000000000              # double 10\r\n_Z1Fd:  ucomisd xmm0, qword ptr [rip + .LCPI0_0]\r\n        jbe     .LBB0_3\r\n        inc     dword ptr [rip + ga]\r\n        ucomisd xmm0, qword ptr [rip + .LCPI0_1]\r\n        jbe     .LBB0_3\r\n        inc     dword ptr [rip + gb]\r\n.LBB0_3:\r\n        ret\r\nga:     .long   0\r\ngb:     .long   0\r\n```\r\nThe tautological comparison gets emitted at `-O1` through `-O3` and `-Og`, though not at `-Os` or `-Oz`. `-ffast-math` doesn\u2019t change the behavior.\r\n\r\nGCC tip-of-tree emits assembly close to the second case in both cases.\r\n\r\n[Compiler Explorer](https://godbolt.org/#g:!((g:!((g:!((h:codeEditor,i:(filename:'1',fontScale:14,fontUsePx:'0',j:1,lang:c%2B%2B,selection:(endColumn:29,endLineNumber:1,positionColumn:29,positionLineNumber:1,selectionStartColumn:29,selectionStartLineNumber:1,startColumn:29,startLineNumber:1),source:'//+Copyright+2023+Google+LLC%0A//+SPDX-License-Identifier:+Apache-2.0%0A%0Aint+ga,+gb%3B%0A%0Avoid+F(double+x)+%7B%0A++if+(x+%3E+5)+%2B%2Bga%3B%0A++if+(x+%3E+10)+%2B%2Bgb%3B%0A%7D%0A%0Avoid+G(double+x)+%7B%0A++if+(x+%3E+5)+%7B%0A++++%2B%2Bga%3B%0A++++if+(x+%3E+10)+%2B%2Bgb%3B%0A++%7D%0A%7D'),l:'5',n:'0',o:'C%2B%2B+source+%231',t:'0')),k:50,l:'4',n:'0',o:'',s:0,t:'0'),(g:!((h:compiler,i:(compiler:clang_trunk,deviceViewOpen:'1',filters:(b:'0',binary:'1',binaryObject:'1',commentOnly:'0',debugCalls:'1',demangle:'1',directives:'0',execute:'1',intel:'0',libraryCode:'0',trim:'1'),flagsViewOpen:'1',fontScale:14,fontUsePx:'0',j:1,lang:c%2B%2B,libs:!(),options:'-O3',overrides:!(),selection:(endColumn:1,endLineNumber:1,positionColumn:1,positionLineNumber:1,selectionStartColumn:1,selectionStartLineNumber:1,startColumn:1,startLineNumber:1),source:1),l:'5',n:'0',o:'+x86-64+clang+(trunk)+(Editor+%231)',t:'0')),k:50,l:'4',n:'0',o:'',s:0,t:'0')),l:'2',n:'0',o:'',t:'0')),version:4) for experimentation.",
+    "author": "bbarenblat",
+    "labels": [
+      "missed-optimization",
+      "floating-point",
+      "llvm:analysis"
+    ],
+    "comments": [
+      {
+        "author": "arsenm",
+        "body": "I believe ConstraintElimination could be taught about floating point compares cc @fhahn "
+      },
+      {
+        "author": "alexander-shaposhnikov",
+        "body": "ConstraintSystem (see e.g. https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/Analysis/ConstraintSystem.h#L57) was designed to work with integers, perhaps, it's nontrivial to make it work with floating point types.  Not sure, it looks like for simple cases it's not hard to teach llvm::isImpliedByDomCondition & InstructionSimplify to handle them. cc: @nikic "
+      },
+      {
+        "author": "nikic",
+        "body": "I believe the *proper* place to handle this case would be in LVI/CVP. However, this would involve a substantial amount of effort, the first part of which would be to implement ConstantRangeFP, which can then be supported in ValueLattice and from there supported in LVI and SCCP.\r\n\r\nWhether supporting this is actually worthwhile is a different question. I'd appreciate some real-world motivating examples that go beyond \"GCC does this\"."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "Related issue: https://github.com/llvm/llvm-project/issues/68301\r\n\r\n> I'd appreciate some real-world motivating examples that go beyond \"GCC does this\".\r\n\r\n+1 :)"
+      },
+      {
+        "author": "fhahn",
+        "body": "> I believe ConstraintElimination could be taught about floating point compares cc @fhahn\r\n\r\nFor cases where it is safe to transfer to the integer domain it should be, but I am not sure what exactly the transfer conditions would have to be and how useful it would be in practice "
+      },
+      {
+        "author": "bbarenblat",
+        "body": "> I'd appreciate some real-world motivating examples that go beyond \"GCC does this\".\r\n\r\nOh, absolutely. I wasn\u2019t trying to say \u201cGCC does this so Clang should do it too\u201d. This is definitely low-priority; I mostly wanted to bring it up in case it indicated a bug. :) It\u2019s good to know that it\u2019s not a bug and that it simply hasn\u2019t been implemented. Thank you for looking into this!\r\n\r\nAs a motivating example, we do see code like this inside Google. The global variables are usually counters tracking how many requests have taken longer than certain time thresholds, and the floating-point value is usually the number of seconds a request took. (In an ideal world, nobody at Google would be tracking time using `double`s, but a Google-sized codebase is far from ideal.)\r\n\r\nThat said, though, I am fully in favor of designating this a wish-list item. I discovered it during the course of debugging a different issue, thought, \u201cHmm, that\u2019s weird,\u201d and filed a bug. I\u2019ve never seen this show up on a profile, nor do I expect to (the extraneous branch will never be taken, so it will be predicted very well). And I don\u2019t think the extra ten bytes of binary is going to make a meaningful difference to anybody\u2019s RAM requirements."
+      },
+      {
+        "author": "jcranmer-intel",
+        "body": "> Whether supporting this is actually worthwhile is a different question. I'd appreciate some real-world motivating examples that go beyond \"GCC does this\".\r\n\r\nA non-contrived example I can think of is eliminating range reduction checks (or domain checks in general) from math functions. Although I am dubious that it would provide much benefit, especially since such checks are likely to be extremely predictable."
+      },
+      {
+        "author": "arsenm",
+        "body": "> A non-contrived example I can think of is eliminating range reduction checks (or domain checks in general) from math functions. Although I am dubious that it would provide much benefit, especially since such checks are likely to be extremely predictable.\r\n\r\nWhat about GPUs where there is no prediction? I would like to eliminate range checks from the builtin math library functions"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

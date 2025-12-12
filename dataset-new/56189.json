@@ -1,0 +1,121 @@
+{
+  "bug_id": "56189",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/56189",
+  "bug_type": "missed-optimization",
+  "base_commit": "1a65d09dcf9b9bed89f8c4fd848a056ebb507597",
+  "knowledge_cutoff": "2022-06-23T18:33:58Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SimplifyCFG"
+  ],
+  "hints": {
+    "fix_commit": "c9168405396d9a536743d2bbc1fb9892954b4c03",
+    "components": [
+      "SimplifyCFG"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+        [
+          6115,
+          6120
+        ],
+        [
+          6270,
+          6278
+        ],
+        [
+          6281,
+          6286
+        ],
+        [
+          6290,
+          6301
+        ],
+        [
+          6309,
+          6319
+        ],
+        [
+          6365,
+          6371
+        ],
+        [
+          6404,
+          6411
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+        "ShouldBuildLookupTable",
+        "SwitchToLookupTable"
+      ]
+    }
+  },
+  "patch": "commit c9168405396d9a536743d2bbc1fb9892954b4c03\nAuthor: Alexander Shaposhnikov <ashaposhnikov@google.com>\nDate:   Wed Jul 13 23:21:45 2022 +0000\n\n    [SimplifyCFG] Improve SwitchToLookupTable optimization\n    \n    Try to use the original value as an index (in the lookup table)\n    in more cases (to avoid one subtraction and shorten the dependency chain)\n    (https://github.com/llvm/llvm-project/issues/56189).\n    \n    Test plan:\n    1/ ninja check-all\n    2/ bootstrapped LLVM + Clang pass tests\n    \n    Differential revision: https://reviews.llvm.org/D128897\n\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\nindex c1d9de197a6b..4b5ade99767b 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n@@ -6115,6 +6115,23 @@ ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,\n   return isSwitchDense(SI->getNumCases(), TableSize);\n }\n \n+static bool ShouldUseSwitchConditionAsTableIndex(\n+    ConstantInt &MinCaseVal, const ConstantInt &MaxCaseVal,\n+    bool HasDefaultResults, const SmallDenseMap<PHINode *, Type *> &ResultTypes,\n+    const DataLayout &DL, const TargetTransformInfo &TTI) {\n+  if (MinCaseVal.isNullValue())\n+    return true;\n+  if (MinCaseVal.isNegative() ||\n+      MaxCaseVal.getLimitedValue() == std::numeric_limits<uint64_t>::max() ||\n+      !HasDefaultResults)\n+    return false;\n+  return all_of(ResultTypes, [&](const auto &KV) {\n+    return SwitchLookupTable::WouldFitInRegister(\n+        DL, MaxCaseVal.getLimitedValue() + 1 /* TableSize */,\n+        KV.second /* ResultType */);\n+  });\n+}\n+\n /// Try to reuse the switch table index compare. Following pattern:\n /// \\code\n ///     if (idx < tablesize)\n@@ -6270,9 +6287,6 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n   }\n \n   uint64_t NumResults = ResultLists[PHIs[0]].size();\n-  APInt RangeSpread = MaxCaseVal->getValue() - MinCaseVal->getValue();\n-  uint64_t TableSize = RangeSpread.getLimitedValue() + 1;\n-  bool TableHasHoles = (NumResults < TableSize);\n \n   // If the table has holes, we need a constant result for the default case\n   // or a bitmask that fits in a register.\n@@ -6281,6 +6295,22 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n       getCaseResults(SI, nullptr, SI->getDefaultDest(), &CommonDest,\n                      DefaultResultsList, DL, TTI);\n \n+  for (const auto &I : DefaultResultsList) {\n+    PHINode *PHI = I.first;\n+    Constant *Result = I.second;\n+    DefaultResults[PHI] = Result;\n+  }\n+\n+  bool UseSwitchConditionAsTableIndex = ShouldUseSwitchConditionAsTableIndex(\n+      *MinCaseVal, *MaxCaseVal, HasDefaultResults, ResultTypes, DL, TTI);\n+  uint64_t TableSize;\n+  if (UseSwitchConditionAsTableIndex)\n+    TableSize = MaxCaseVal->getLimitedValue() + 1;\n+  else\n+    TableSize =\n+        (MaxCaseVal->getValue() - MinCaseVal->getValue()).getLimitedValue() + 1;\n+\n+  bool TableHasHoles = (NumResults < TableSize);\n   bool NeedMask = (TableHasHoles && !HasDefaultResults);\n   if (NeedMask) {\n     // As an extra penalty for the validity test we require more cases.\n@@ -6290,12 +6320,6 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n       return false;\n   }\n \n-  for (const auto &I : DefaultResultsList) {\n-    PHINode *PHI = I.first;\n-    Constant *Result = I.second;\n-    DefaultResults[PHI] = Result;\n-  }\n-\n   if (!ShouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes))\n     return false;\n \n@@ -6309,11 +6333,15 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n   // Compute the table index value.\n   Builder.SetInsertPoint(SI);\n   Value *TableIndex;\n-  if (MinCaseVal->isNullValue())\n+  ConstantInt *TableIndexOffset;\n+  if (UseSwitchConditionAsTableIndex) {\n+    TableIndexOffset = ConstantInt::get(MaxCaseVal->getType(), 0);\n     TableIndex = SI->getCondition();\n-  else\n-    TableIndex = Builder.CreateSub(SI->getCondition(), MinCaseVal,\n-                                   \"switch.tableidx\");\n+  } else {\n+    TableIndexOffset = MinCaseVal;\n+    TableIndex =\n+        Builder.CreateSub(SI->getCondition(), TableIndexOffset, \"switch.tableidx\");\n+  }\n \n   // Compute the maximum table size representable by the integer type we are\n   // switching upon.\n@@ -6365,7 +6393,7 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n     // Build bitmask; fill in a 1 bit for every case.\n     const ResultListTy &ResultList = ResultLists[PHIs[0]];\n     for (size_t I = 0, E = ResultList.size(); I != E; ++I) {\n-      uint64_t Idx = (ResultList[I].first->getValue() - MinCaseVal->getValue())\n+      uint64_t Idx = (ResultList[I].first->getValue() - TableIndexOffset->getValue())\n                          .getLimitedValue();\n       MaskInt |= One << Idx;\n     }\n@@ -6404,8 +6432,8 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,\n     // If using a bitmask, use any value to fill the lookup table holes.\n     Constant *DV = NeedMask ? ResultLists[PHI][0].second : DefaultResults[PHI];\n     StringRef FuncName = Fn->getName();\n-    SwitchLookupTable Table(Mod, TableSize, MinCaseVal, ResultList, DV, DL,\n-                            FuncName);\n+    SwitchLookupTable Table(Mod, TableSize, TableIndexOffset, ResultList, DV,\n+                            DL, FuncName);\n \n     Value *Result = Table.BuildLookup(TableIndex, Builder);\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/X86/switch_to_lookup_table.ll",
+      "commands": [
+        [
+          "opt < %s -simplifycfg -switch-to-lookup=true -keep-loops=false -S -mtriple=x86_64-unknown-linux-gnu",
+          "FileCheck %s"
+        ],
+        [
+          "opt < %s -passes='simplifycfg<no-keep-loops;switch-to-lookup>' -S -mtriple=x86_64-unknown-linux-gnu",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "use_x_as_index",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i1 @use_x_as_index(i32 %x) {\n; CHECK-LABEL: @use_x_as_index(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i32 [[X:%.*]], 9\n; CHECK-NEXT:    [[SWITCH_CAST:%.*]] = trunc i32 [[X]] to i9\n; CHECK-NEXT:    [[SWITCH_SHIFTAMT:%.*]] = mul i9 [[SWITCH_CAST]], 1\n; CHECK-NEXT:    [[SWITCH_DOWNSHIFT:%.*]] = lshr i9 -234, [[SWITCH_SHIFTAMT]]\n; CHECK-NEXT:    [[SWITCH_MASKED:%.*]] = trunc i9 [[SWITCH_DOWNSHIFT]] to i1\n; CHECK-NEXT:    [[STOREMERGE:%.*]] = select i1 [[TMP0]], i1 [[SWITCH_MASKED]], i1 false\n; CHECK-NEXT:    ret i1 [[STOREMERGE]]\nentry:\n  switch i32 %x, label %sw.default [\n    i32 1, label %sw.bb\n    i32 2, label %sw.bb\n    i32 4, label %sw.bb\n    i32 8, label %sw.bb\n  ]\n\nsw.bb:                                            ; preds = %entry, %entry, %entry, %entry\n  br label %return\n\nsw.default:                                       ; preds = %entry\n  br label %return\n\nreturn:                                           ; preds = %sw.default, %sw.bb\n  %storemerge = phi i1 [ true, %sw.bb ], [ false, %sw.default ]\n  ret i1 %storemerge\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i1 @use_x_as_index(i32 %x) {\nentry:\n  switch i32 %x, label %sw.default [\n    i32 1, label %sw.bb\n    i32 2, label %sw.bb\n    i32 4, label %sw.bb\n    i32 8, label %sw.bb\n  ]\n\nsw.bb:                                            ; preds = %entry, %entry, %entry, %entry\n  br label %return\n\nsw.default:                                       ; preds = %entry\n  br label %return\n\nreturn:                                           ; preds = %sw.default, %sw.bb\n  %storemerge = phi i1 [ true, %sw.bb ], [ false, %sw.default ]\n  ret i1 %storemerge\n}\n",
+          "current_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i1 @use_x_as_index(i32 %x) {\nentry:\n  %switch.tableidx = sub i32 %x, 1\n  %0 = icmp ult i32 %switch.tableidx, 8\n  %switch.cast = trunc i32 %switch.tableidx to i8\n  %switch.shiftamt = mul i8 %switch.cast, 1\n  %switch.downshift = lshr i8 -117, %switch.shiftamt\n  %switch.masked = trunc i8 %switch.downshift to i1\n  %storemerge = select i1 %0, i1 %switch.masked, i1 false\n  ret i1 %storemerge\n}\n",
+          "expect_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i1 @use_x_as_index(i32 %x) {\nentry:\n  %0 = icmp ult i32 %x, 9\n  %switch.cast = trunc i32 %x to i9\n  %switch.shiftamt = mul i9 %switch.cast, 1\n  %switch.downshift = lshr i9 -234, %switch.shiftamt\n  %switch.masked = trunc i9 %switch.downshift to i1\n  %storemerge = select i1 %0, i1 %switch.masked, i1 false\n  ret i1 %storemerge\n}\n"
+        },
+        {
+          "test_name": "no_reuse_cmp",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @no_reuse_cmp(i32 %x) {\n; CHECK-LABEL: @no_reuse_cmp(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i32 [[X:%.*]], 4\n; CHECK-NEXT:    [[SWITCH_OFFSET:%.*]] = add i32 [[X]], 10\n; CHECK-NEXT:    [[R_0:%.*]] = select i1 [[TMP0]], i32 [[SWITCH_OFFSET]], i32 12\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i32 [[R_0]], 0\n; CHECK-NEXT:    [[RETVAL_0:%.*]] = select i1 [[CMP]], i32 [[R_0]], i32 100\n; CHECK-NEXT:    ret i32 [[RETVAL_0]]\nentry:\n  switch i32 %x, label %sw.default [\n    i32 0, label %sw.bb\n    i32 1, label %sw.bb1\n    i32 2, label %sw.bb2\n    i32 3, label %sw.bb3\n  ]\n\nsw.bb:                                            ; preds = %entry\n  br label %sw.epilog\n\nsw.bb1:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb2:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb3:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.default:                                       ; preds = %entry\n  br label %sw.epilog\n\nsw.epilog:                                        ; preds = %sw.default, %sw.bb3, %sw.bb2, %sw.bb1, %sw.bb\n  %r.0 = phi i32 [ 12, %sw.default ], [ 13, %sw.bb3 ], [ 12, %sw.bb2 ], [ 11, %sw.bb1 ], [ 10, %sw.bb ]\n  %cmp = icmp ne i32 %r.0, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %sw.epilog\n  br label %return\n\nif.end:                                           ; preds = %sw.epilog\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi i32 [ %r.0, %if.then ], [ 100, %if.end ]\n  ret i32 %retval.0\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @no_reuse_cmp(i32 %x) {\nentry:\n  switch i32 %x, label %sw.default [\n    i32 0, label %sw.bb\n    i32 1, label %sw.bb1\n    i32 2, label %sw.bb2\n    i32 3, label %sw.bb3\n  ]\n\nsw.bb:                                            ; preds = %entry\n  br label %sw.epilog\n\nsw.bb1:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb2:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb3:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.default:                                       ; preds = %entry\n  br label %sw.epilog\n\nsw.epilog:                                        ; preds = %sw.default, %sw.bb3, %sw.bb2, %sw.bb1, %sw.bb\n  %r.0 = phi i32 [ 12, %sw.default ], [ 13, %sw.bb3 ], [ 12, %sw.bb2 ], [ 11, %sw.bb1 ], [ 10, %sw.bb ]\n  %cmp = icmp ne i32 %r.0, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %sw.epilog\n  br label %return\n\nif.end:                                           ; preds = %sw.epilog\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi i32 [ %r.0, %if.then ], [ 100, %if.end ]\n  ret i32 %retval.0\n}\n",
+          "current_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @no_reuse_cmp(i32 %x) {\nentry:\n  %0 = icmp ult i32 %x, 4\n  %switch.offset = add i32 %x, 10\n  %r.0 = select i1 %0, i32 %switch.offset, i32 12\n  %cmp = icmp ne i32 %r.0, 0\n  %retval.0 = select i1 %cmp, i32 %r.0, i32 100\n  ret i32 %retval.0\n}\n",
+          "expect_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @no_reuse_cmp(i32 %x) {\nentry:\n  %0 = icmp ult i32 %x, 4\n  %switch.offset = add i32 %x, 10\n  %r.0 = select i1 %0, i32 %switch.offset, i32 12\n  %cmp = icmp ne i32 %r.0, 0\n  %retval.0 = select i1 %cmp, i32 %r.0, i32 100\n  ret i32 %retval.0\n}\n"
+        },
+        {
+          "test_name": "reuse_cmp1",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @reuse_cmp1(i32 %x) {\n; CHECK-LABEL: @reuse_cmp1(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i32 [[X:%.*]], 4\n; CHECK-NEXT:    [[INVERTED_CMP:%.*]] = xor i1 [[TMP0]], true\n; CHECK-NEXT:    [[SWITCH_OFFSET:%.*]] = add i32 [[X]], 10\n; CHECK-NEXT:    [[R_0:%.*]] = select i1 [[TMP0]], i32 [[SWITCH_OFFSET]], i32 0\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[R_0]], 0\n; CHECK-NEXT:    [[RETVAL_0:%.*]] = select i1 [[INVERTED_CMP]], i32 100, i32 [[R_0]]\n; CHECK-NEXT:    ret i32 [[RETVAL_0]]\nentry:\n  switch i32 %x, label %sw.default [\n    i32 0, label %sw.bb\n    i32 1, label %sw.bb1\n    i32 2, label %sw.bb2\n    i32 3, label %sw.bb3\n  ]\n\nsw.bb:                                            ; preds = %entry\n  br label %sw.epilog\n\nsw.bb1:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb2:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb3:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.default:                                       ; preds = %entry\n  br label %sw.epilog\n\nsw.epilog:                                        ; preds = %sw.default, %sw.bb3, %sw.bb2, %sw.bb1, %sw.bb\n  %r.0 = phi i32 [ 0, %sw.default ], [ 13, %sw.bb3 ], [ 12, %sw.bb2 ], [ 11, %sw.bb1 ], [ 10, %sw.bb ]\n  %cmp = icmp eq i32 %r.0, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %sw.epilog\n  br label %return\n\nif.end:                                           ; preds = %sw.epilog\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi i32 [ 100, %if.then ], [ %r.0, %if.end ]\n  ret i32 %retval.0\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @reuse_cmp1(i32 %x) {\nentry:\n  switch i32 %x, label %sw.default [\n    i32 0, label %sw.bb\n    i32 1, label %sw.bb1\n    i32 2, label %sw.bb2\n    i32 3, label %sw.bb3\n  ]\n\nsw.bb:                                            ; preds = %entry\n  br label %sw.epilog\n\nsw.bb1:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb2:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.bb3:                                           ; preds = %entry\n  br label %sw.epilog\n\nsw.default:                                       ; preds = %entry\n  br label %sw.epilog\n\nsw.epilog:                                        ; preds = %sw.default, %sw.bb3, %sw.bb2, %sw.bb1, %sw.bb\n  %r.0 = phi i32 [ 0, %sw.default ], [ 13, %sw.bb3 ], [ 12, %sw.bb2 ], [ 11, %sw.bb1 ], [ 10, %sw.bb ]\n  %cmp = icmp eq i32 %r.0, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %sw.epilog\n  br label %return\n\nif.end:                                           ; preds = %sw.epilog\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi i32 [ 100, %if.then ], [ %r.0, %if.end ]\n  ret i32 %retval.0\n}\n",
+          "current_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @reuse_cmp1(i32 %x) {\nentry:\n  %0 = icmp ult i32 %x, 4\n  %inverted.cmp = xor i1 %0, true\n  %switch.offset = add i32 %x, 10\n  %r.0 = select i1 %0, i32 %switch.offset, i32 0\n  %cmp = icmp eq i32 %r.0, 0\n  %retval.0 = select i1 %inverted.cmp, i32 100, i32 %r.0\n  ret i32 %retval.0\n}\n",
+          "expect_optimized_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @reuse_cmp1(i32 %x) {\nentry:\n  %0 = icmp ult i32 %x, 4\n  %inverted.cmp = xor i1 %0, true\n  %switch.offset = add i32 %x, 10\n  %r.0 = select i1 %0, i32 %switch.offset, i32 0\n  %cmp = icmp eq i32 %r.0, 0\n  %retval.0 = select i1 %inverted.cmp, i32 100, i32 %r.0\n  ret i32 %retval.0\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Missing optimization for switch from int to bool",
+    "body": "Consider a function like:\r\n```c\r\nextern \"C\" bool src(int x) {\r\n    switch (x) {\r\n        case 1:\r\n        case 2:\r\n        case 4:\r\n        case 8:\r\n            return true;\r\n        default:\r\n            return false;\r\n    }\r\n}\r\n```\r\n\r\nMy clang/LLVM build gives back:\r\n```llvm\r\ndefine dso_local zeroext i1 @src(i32 noundef %0) local_unnamed_addr #0 {\r\n  %2 = add i32 %0, -1\r\n  %3 = icmp ult i32 %2, 8\r\n  %4 = trunc i32 %2 to i8\r\n  %5 = lshr i8 -117, %4\r\n  %6 = and i8 %5, 1\r\n  %7 = icmp ne i8 %6, 0\r\n  %8 = select i1 %3, i1 %7, i1 false\r\n  ret i1 %8\r\n}\r\n```\r\n\r\nThis is sort-of like writing:\r\n```c\r\nextern \"C\" bool src(int x) {\r\n    --x;\r\n    return x < 8u & ((((1 << 0) | (1 << 1) | (1 << 3) | (1 << 7)) >> x) & 1) == 1;\r\n}\r\n```\r\n\r\nI think this could be simplified further to:\r\n```llvm\r\ndefine dso_local zeroext i1 @tgt(i32 noundef %0) local_unnamed_addr #0 {\r\n  %2 = icmp ult i32 %0, 9\r\n  %3 = lshr i32 278, %0\r\n  %4 = and i32 %3, 1\r\n  %5 = icmp ne i32 %4, 0\r\n  %6 = select i1 %2, i1 %5, i1 false\r\n  ret i1 %6\r\n}\r\n```\r\n\r\nFor clarity, this is as-if we wrote the code initially as:\r\n```c\r\nextern \"C\" bool tgt(int x) {\r\n    return x < 9u && ((((1 << 1) | (1 << 2) | (1 << 4) | (1 << 8)) >> x) & 1) == 1;\r\n}\r\n```",
+    "author": "majnemer",
+    "labels": [
+      "llvm:optimizations",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "erikdesjardins",
+        "body": "Alive2 link for convenience: https://alive2.llvm.org/ce/z/3m384E (for this specific case, not a general proof)"
+      },
+      {
+        "author": "alexander-shaposhnikov",
+        "body": "https://reviews.llvm.org/D128897 "
+      },
+      {
+        "author": "zmodem",
+        "body": "Thanks for the bug report!\r\n\r\nOne way to think about this is as a special case of:\r\n\r\n```\r\n int f(int x) {\r\n    switch (x) {\r\n        case 1: return 1;\r\n        case 2: return 5;\r\n        case 3: return 7;\r\n        case 4: return 18;\r\n    }\r\n    return 0;\r\n}\r\n```\r\n\r\nLLVM will essentially generate\r\n\r\n`return (x - 1) < 4 ? table[x - 1] : 0;`\r\n\r\nbut we could avoid the subtraction if we grew the table by synthesizing a `case 0`. In your example, growing the table has zero cost since it would still fit in a register."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

@@ -1,0 +1,101 @@
+{
+  "bug_id": "63472",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/63472",
+  "bug_type": "missed-optimization",
+  "base_commit": "940c94e1c1b99511630b6f61890ac54161b5829c",
+  "knowledge_cutoff": "2023-06-23T13:27:16Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "8762f4c7489cf4711bdffb34fad66d2b9324f066",
+    "components": [
+      "InstCombine",
+      "MemoryBuiltins"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/MemoryBuiltins.h": [
+        [
+          182,
+          190
+        ]
+      ],
+      "llvm/lib/Analysis/MemoryBuiltins.cpp": [
+        [
+          602,
+          611
+        ],
+        [
+          640,
+          646
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          1488,
+          1497
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          2397,
+          2404
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/MemoryBuiltins.cpp": [
+        "llvm::lowerObjectSizeCall"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitCallInst"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::visitAllocSite"
+      ]
+    }
+  },
+  "patch": "commit 8762f4c7489cf4711bdffb34fad66d2b9324f066\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Fri Jun 23 15:09:11 2023 +0200\n\n    [InstCombine] Track inserted instructions when lowering objectsize\n    \n    The inserted instructions can usually be simplified. Make sure this\n    happens in the same InstCombine iteration by adding them to the\n    worklist.\n    \n    We happen to get some better optimization in two cases, but this is\n    just a lucky accident. https://github.com/llvm/llvm-project/issues/63472\n    tracks implementing a fold for that case.\n    \n    This doesn't track all inserted instructions yet, for that we would\n    also have to include those created by ObjectSizeOffsetEvaluator.\n\ndiff --git a/llvm/include/llvm/Analysis/MemoryBuiltins.h b/llvm/include/llvm/Analysis/MemoryBuiltins.h\nindex 146781515aba..711bbf6a0afe 100644\n--- a/llvm/include/llvm/Analysis/MemoryBuiltins.h\n+++ b/llvm/include/llvm/Analysis/MemoryBuiltins.h\n@@ -182,9 +182,10 @@ bool getObjectSize(const Value *Ptr, uint64_t &Size, const DataLayout &DL,\n /// argument of the call to objectsize.\n Value *lowerObjectSizeCall(IntrinsicInst *ObjectSize, const DataLayout &DL,\n                            const TargetLibraryInfo *TLI, bool MustSucceed);\n-Value *lowerObjectSizeCall(IntrinsicInst *ObjectSize, const DataLayout &DL,\n-                           const TargetLibraryInfo *TLI, AAResults *AA,\n-                           bool MustSucceed);\n+Value *lowerObjectSizeCall(\n+    IntrinsicInst *ObjectSize, const DataLayout &DL,\n+    const TargetLibraryInfo *TLI, AAResults *AA, bool MustSucceed,\n+    SmallVectorImpl<Instruction *> *InsertedInstructions = nullptr);\n \n using SizeOffsetType = std::pair<APInt, APInt>;\n \ndiff --git a/llvm/lib/Analysis/MemoryBuiltins.cpp b/llvm/lib/Analysis/MemoryBuiltins.cpp\nindex 6ff7aed0288a..6b2e4425ade0 100644\n--- a/llvm/lib/Analysis/MemoryBuiltins.cpp\n+++ b/llvm/lib/Analysis/MemoryBuiltins.cpp\n@@ -602,10 +602,10 @@ Value *llvm::lowerObjectSizeCall(IntrinsicInst *ObjectSize,\n                              MustSucceed);\n }\n \n-Value *llvm::lowerObjectSizeCall(IntrinsicInst *ObjectSize,\n-                                 const DataLayout &DL,\n-                                 const TargetLibraryInfo *TLI, AAResults *AA,\n-                                 bool MustSucceed) {\n+Value *llvm::lowerObjectSizeCall(\n+    IntrinsicInst *ObjectSize, const DataLayout &DL,\n+    const TargetLibraryInfo *TLI, AAResults *AA, bool MustSucceed,\n+    SmallVectorImpl<Instruction *> *InsertedInstructions) {\n   assert(ObjectSize->getIntrinsicID() == Intrinsic::objectsize &&\n          \"ObjectSize must be a call to llvm.objectsize!\");\n \n@@ -640,7 +640,11 @@ Value *llvm::lowerObjectSizeCall(IntrinsicInst *ObjectSize,\n         Eval.compute(ObjectSize->getArgOperand(0));\n \n     if (SizeOffsetPair != ObjectSizeOffsetEvaluator::unknown()) {\n-      IRBuilder<TargetFolder> Builder(Ctx, TargetFolder(DL));\n+      IRBuilder<TargetFolder, IRBuilderCallbackInserter> Builder(\n+          Ctx, TargetFolder(DL), IRBuilderCallbackInserter([&](Instruction *I) {\n+            if (InsertedInstructions)\n+              InsertedInstructions->push_back(I);\n+          }));\n       Builder.SetInsertPoint(ObjectSize);\n \n       // If we've outside the end of the object, then we can always access\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex ea35e7934f01..7aa4855f2231 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1488,10 +1488,16 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n \n   Intrinsic::ID IID = II->getIntrinsicID();\n   switch (IID) {\n-  case Intrinsic::objectsize:\n-    if (Value *V = lowerObjectSizeCall(II, DL, &TLI, AA, /*MustSucceed=*/false))\n+  case Intrinsic::objectsize: {\n+    SmallVector<Instruction *> InsertedInstructions;\n+    if (Value *V = lowerObjectSizeCall(II, DL, &TLI, AA, /*MustSucceed=*/false,\n+                                       &InsertedInstructions)) {\n+      for (Instruction *Inserted : InsertedInstructions)\n+        Worklist.add(Inserted);\n       return replaceInstUsesWith(CI, V);\n+    }\n     return nullptr;\n+  }\n   case Intrinsic::abs: {\n     Value *IIOperand = II->getArgOperand(0);\n     bool IntMinIsPoison = cast<Constant>(II->getArgOperand(1))->isOneValue();\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex ad44cfdf358b..0fde841a0e97 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2397,8 +2397,11 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {\n \n       if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {\n         if (II->getIntrinsicID() == Intrinsic::objectsize) {\n-          Value *Result =\n-              lowerObjectSizeCall(II, DL, &TLI, AA, /*MustSucceed=*/true);\n+          SmallVector<Instruction *> InsertedInstructions;\n+          Value *Result = lowerObjectSizeCall(\n+              II, DL, &TLI, AA, /*MustSucceed=*/true, &InsertedInstructions);\n+          for (Instruction *Inserted : InsertedInstructions)\n+            Worklist.add(Inserted);\n           replaceInstUsesWith(*I, Result);\n           eraseInstFromFunction(*I);\n           Users[i] = nullptr; // Skip examining in the next loop.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/builtin-dynamic-object-size.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -instcombine-infinite-loop-threshold=2 -S < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "as_cast",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128-p7:32:32\"\ntarget triple = \"x86_64-apple-macosx10.14.0\"\n\n@p7 = external hidden addrspace(7) global i8\n\ndefine i64 @as_cast(i1 %c) {\n; CHECK-LABEL: define i64 @as_cast\n; CHECK-SAME: (i1 [[C:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[C]], i64 64, i64 0\n; CHECK-NEXT:    ret i64 [[TMP0]]\nentry:\n  %p0 = tail call ptr @malloc(i64 64)\n  %gep = getelementptr i8, ptr addrspace(7) @p7, i32 1\n  %as = addrspacecast ptr addrspace(7) %gep to ptr\n  %select = select i1 %c, ptr %p0, ptr %as\n  %calc_size = tail call i64 @llvm.objectsize.i64.p0(ptr %select, i1 false, i1 true, i1 true)\n  ret i64 %calc_size\n}\n\n; Function Attrs: nounwind allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare ptr @malloc(i64) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.objectsize.i64.p0(ptr, i1 immarg, i1 immarg, i1 immarg) #1\n\nattributes #0 = { nounwind allockind(\"alloc,uninitialized\") allocsize(0) \"alloc-family\"=\"malloc\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128-p7:32:32\"\ntarget triple = \"x86_64-apple-macosx10.14.0\"\n\n@p7 = external hidden addrspace(7) global i8\n\ndefine i64 @as_cast(i1 %c) {\nentry:\n  %p0 = tail call ptr @malloc(i64 64)\n  %gep = getelementptr i8, ptr addrspace(7) @p7, i32 1\n  %as = addrspacecast ptr addrspace(7) %gep to ptr\n  %select = select i1 %c, ptr %p0, ptr %as\n  %calc_size = tail call i64 @llvm.objectsize.i64.p0(ptr %select, i1 false, i1 true, i1 true)\n  ret i64 %calc_size\n}\n\n; Function Attrs: nounwind allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare ptr @malloc(i64) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.objectsize.i64.p0(ptr, i1 immarg, i1 immarg, i1 immarg) #1\n\nattributes #0 = { nounwind allockind(\"alloc,uninitialized\") allocsize(0) \"alloc-family\"=\"malloc\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constexpr_as_cast",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128-p7:32:32\"\ntarget triple = \"x86_64-apple-macosx10.14.0\"\n\n@p7 = external hidden addrspace(7) global i8\n\ndefine i64 @constexpr_as_cast(i1 %c) {\n; CHECK-LABEL: define i64 @constexpr_as_cast\n; CHECK-SAME: (i1 [[C:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[C]], i64 64, i64 0\n; CHECK-NEXT:    ret i64 [[TMP0]]\nentry:\n  %p0 = tail call ptr @malloc(i64 64)\n  %select = select i1 %c, ptr %p0, ptr addrspacecast (ptr addrspace(7) getelementptr inbounds (i8, ptr addrspace(7) @p7, i32 1) to ptr)\n  %calc_size = tail call i64 @llvm.objectsize.i64.p0(ptr %select, i1 false, i1 true, i1 true)\n  ret i64 %calc_size\n}\n\n; Function Attrs: nounwind allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare ptr @malloc(i64) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.objectsize.i64.p0(ptr, i1 immarg, i1 immarg, i1 immarg) #1\n\nattributes #0 = { nounwind allockind(\"alloc,uninitialized\") allocsize(0) \"alloc-family\"=\"malloc\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128-p7:32:32\"\ntarget triple = \"x86_64-apple-macosx10.14.0\"\n\n@p7 = external hidden addrspace(7) global i8\n\ndefine i64 @constexpr_as_cast(i1 %c) {\nentry:\n  %p0 = tail call ptr @malloc(i64 64)\n  %select = select i1 %c, ptr %p0, ptr addrspacecast (ptr addrspace(7) getelementptr inbounds (i8, ptr addrspace(7) @p7, i32 1) to ptr)\n  %calc_size = tail call i64 @llvm.objectsize.i64.p0(ptr %select, i1 false, i1 true, i1 true)\n  ret i64 %calc_size\n}\n\n; Function Attrs: nounwind allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare ptr @malloc(i64) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.objectsize.i64.p0(ptr, i1 immarg, i1 immarg, i1 immarg) #1\n\nattributes #0 = { nounwind allockind(\"alloc,uninitialized\") allocsize(0) \"alloc-family\"=\"malloc\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] Add of select and zext/sext of the select condition not simplified",
+    "body": "```llvm\r\ndefine i64 @src0(i1 %c) {\r\n  %tmp0 = select i1 %c, i64 64, i64 1\r\n  %ext = zext i1 %c to i64\r\n  %tmp1 = add i64 %tmp0, %ext\r\n  ret i64 %tmp1\r\n}\r\n\r\ndefine i64 @tgt0(i1 %c) {\r\n  %tmp0 = select i1 %c, i64 65, i64 1\r\n  ret i64 %tmp0\r\n}\r\n```\r\n\r\nSome more variants: https://alive2.llvm.org/ce/z/bmtPuH",
+    "author": "nikic",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "dc03",
+        "body": "Fix in progress at: https://reviews.llvm.org/D153963"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

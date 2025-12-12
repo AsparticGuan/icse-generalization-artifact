@@ -33,8 +33,8 @@ session.headers.update(
     }
 )
 
-issue_id_begin = 76663  # Since 2024-01-01
-issue_id_end = 164436
+issue_id_begin = 10000  # 76663 Since 2024-01-01
+issue_id_end = 76662
 
 
 def wait(progress):
@@ -124,8 +124,10 @@ def fetch(issue_id):
         ).decode()
         if "This issue is marked as invalid" in out:
             return False
+        print(f"{issue_id}: {out}")
         return True
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        print(f"{issue_id}: {e}")
         return True
 
 

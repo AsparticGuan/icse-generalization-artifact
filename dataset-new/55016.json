@@ -1,0 +1,112 @@
+{
+  "bug_id": "55016",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/55016",
+  "bug_type": "missed-optimization",
+  "base_commit": "c2614b31d955f799179c34215b1225d0131da378",
+  "knowledge_cutoff": "2022-04-21T15:53:38Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "f8a574bf4de48547a8d4f7f0b9c884e9e5be8d32",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+        [
+          373,
+          383
+        ],
+        [
+          409,
+          414
+        ],
+        [
+          416,
+          422
+        ],
+        [
+          988,
+          1010
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+        "InstCombinerImpl::commonShiftTransforms",
+        "InstCombinerImpl::visitLShr",
+        "InstCombinerImpl::visitShl"
+      ]
+    }
+  },
+  "patch": "commit f8a574bf4de48547a8d4f7f0b9c884e9e5be8d32\nAuthor: Nicolas Abram Lujan <abramlujan@gmail.com>\nDate:   Wed Apr 27 13:41:25 2022 -0400\n\n    [InstCombine] C0 >> (X - C1) --> (C0 << C1) >> X\n    \n    With the right pre-conditions, we can fold the offset\n    into the shifted constant:\n    https://alive2.llvm.org/ce/z/drMRBU\n    https://alive2.llvm.org/ce/z/cUQv-_\n    \n    Fixes #55016\n    \n    Differential Revision: https://reviews.llvm.org/D124369\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\nindex 0bd3ac2bf28a..a0a35147ba33 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n@@ -373,11 +373,12 @@ Instruction *InstCombinerImpl::commonShiftTransforms(BinaryOperator &I) {\n \n   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);\n   assert(Op0->getType() == Op1->getType());\n+  Type *Ty = I.getType();\n \n   // If the shift amount is a one-use `sext`, we can demote it to `zext`.\n   Value *Y;\n   if (match(Op1, m_OneUse(m_SExt(m_Value(Y))))) {\n-    Value *NewExt = Builder.CreateZExt(Y, I.getType(), Op1->getName());\n+    Value *NewExt = Builder.CreateZExt(Y, Ty, Op1->getName());\n     return BinaryOperator::Create(I.getOpcode(), Op0, NewExt);\n   }\n \n@@ -409,6 +410,47 @@ Instruction *InstCombinerImpl::commonShiftTransforms(BinaryOperator &I) {\n     return BinaryOperator::Create(I.getOpcode(), NewC, A);\n   }\n \n+  unsigned BitWidth = Ty->getScalarSizeInBits();\n+\n+  const APInt *AC, *AddC;\n+  // Try to pre-shift a constant shifted by a variable amount added with a\n+  // negative number:\n+  // C << (X - AddC) --> (C >> AddC) << X\n+  // and\n+  // C >> (X - AddC) --> (C << AddC) >> X\n+  if (match(Op0, m_APInt(AC)) && match(Op1, m_Add(m_Value(A), m_APInt(AddC))) &&\n+      AddC->isNegative() && (-*AddC).ult(BitWidth)) {\n+    assert(!AC->isZero() && \"Expected simplify of shifted zero\");\n+    unsigned PosOffset = (-*AddC).getZExtValue();\n+\n+    auto isSuitableForPreShift = [PosOffset, &I, AC]() {\n+      switch (I.getOpcode()) {\n+      default:\n+        return false;\n+      case Instruction::Shl:\n+        return (I.hasNoSignedWrap() || I.hasNoUnsignedWrap()) &&\n+               AC->eq(AC->lshr(PosOffset).shl(PosOffset));\n+      case Instruction::LShr:\n+        return I.isExact() && AC->eq(AC->shl(PosOffset).lshr(PosOffset));\n+      case Instruction::AShr:\n+        return I.isExact() && AC->eq(AC->shl(PosOffset).ashr(PosOffset));\n+      }\n+    };\n+    if (isSuitableForPreShift()) {\n+      Constant *NewC = ConstantInt::get(Ty, I.getOpcode() == Instruction::Shl\n+                                                ? AC->lshr(PosOffset)\n+                                                : AC->shl(PosOffset));\n+      BinaryOperator *NewShiftOp =\n+          BinaryOperator::Create(I.getOpcode(), NewC, A);\n+      if (I.getOpcode() == Instruction::Shl) {\n+        NewShiftOp->setHasNoUnsignedWrap(I.hasNoUnsignedWrap());\n+      } else {\n+        NewShiftOp->setIsExact();\n+      }\n+      return NewShiftOp;\n+    }\n+  }\n+\n   // X shift (A srem C) -> X shift (A and (C - 1)) iff C is a power of 2.\n   // Because shifts by negative values (which could occur if A were negative)\n   // are undefined.\n@@ -416,7 +458,7 @@ Instruction *InstCombinerImpl::commonShiftTransforms(BinaryOperator &I) {\n       match(C, m_Power2())) {\n     // FIXME: Should this get moved into SimplifyDemandedBits by saying we don't\n     // demand the sign bit (and many others) here??\n-    Constant *Mask = ConstantExpr::getSub(C, ConstantInt::get(I.getType(), 1));\n+    Constant *Mask = ConstantExpr::getSub(C, ConstantInt::get(Ty, 1));\n     Value *Rem = Builder.CreateAnd(A, Mask, Op1->getName());\n     return replaceOperand(I, 1, Rem);\n   }\n@@ -988,23 +1030,6 @@ Instruction *InstCombinerImpl::visitShl(BinaryOperator &I) {\n     return BinaryOperator::CreateLShr(\n         ConstantInt::get(Ty, APInt::getSignMask(BitWidth)), X);\n \n-  // Try to pre-shift a constant shifted by a variable amount:\n-  // C << (X + AddC) --> (C >> -AddC) << X\n-  // This requires a no-wrap flag and negative offset constant.\n-  const APInt *AddC;\n-  if ((I.hasNoSignedWrap() || I.hasNoUnsignedWrap()) &&\n-      match(Op0, m_APInt(C)) && match(Op1, m_Add(m_Value(X), m_APInt(AddC))) &&\n-      AddC->isNegative() && (-*AddC).ult(BitWidth)) {\n-    assert(!C->isZero() && \"Expected simplify of shifted zero\");\n-    unsigned PosOffset = (-*AddC).getZExtValue();\n-    if (C->eq(C->lshr(PosOffset).shl(PosOffset))) {\n-      Constant *NewC = ConstantInt::get(Ty, C->lshr(PosOffset));\n-      Instruction *NewShl = BinaryOperator::CreateShl(NewC, X);\n-      NewShl->setHasNoUnsignedWrap(I.hasNoUnsignedWrap());\n-      return NewShl;\n-    }\n-  }\n-\n   return nullptr;\n }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/shift-add.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "lshr_exact_add_negative_shift_positive_vec",
+          "test_body": "define <2 x i9> @lshr_exact_add_negative_shift_positive_vec(<2 x i9> %x) {\n; CHECK-LABEL: @lshr_exact_add_negative_shift_positive_vec(\n; CHECK-NEXT:    [[R:%.*]] = lshr exact <2 x i9> <i9 -256, i9 -256>, [[X:%.*]]\n; CHECK-NEXT:    ret <2 x i9> [[R]]\n  %a = add <2 x i9> %x, <i9 -7, i9 -7>\n  %r = lshr exact <2 x i9> <i9 2, i9 2>, %a\n  ret <2 x i9> %r\n}",
+          "source_program": "define <2 x i9> @lshr_exact_add_negative_shift_positive_vec(<2 x i9> %x) {\n  %a = add <2 x i9> %x, <i9 -7, i9 -7>\n  %r = lshr exact <2 x i9> <i9 2, i9 2>, %a\n  ret <2 x i9> %r\n}\n"
+        },
+        {
+          "test_name": "lshr_add_negative_shift_no_exact",
+          "test_body": "define i32 @lshr_add_negative_shift_no_exact(i32 %x) {\n; CHECK-LABEL: @lshr_add_negative_shift_no_exact(\n; CHECK-NEXT:    [[A:%.*]] = add i32 [[X:%.*]], -1\n; CHECK-NEXT:    [[R:%.*]] = lshr i32 2, [[A]]\n; CHECK-NEXT:    ret i32 [[R]]\n  %a = add i32 %x, -1\n  %r = lshr i32 2, %a\n  ret i32 %r\n}",
+          "source_program": "define i32 @lshr_add_negative_shift_no_exact(i32 %x) {\n  %a = add i32 %x, -1\n  %r = lshr i32 2, %a\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "ashr_add_negative_shift_no_exact",
+          "test_body": "define i32 @ashr_add_negative_shift_no_exact(i32 %x) {\n; CHECK-LABEL: @ashr_add_negative_shift_no_exact(\n; CHECK-NEXT:    [[A:%.*]] = add i32 [[X:%.*]], -1\n; CHECK-NEXT:    [[R:%.*]] = ashr i32 -2, [[A]]\n; CHECK-NEXT:    ret i32 [[R]]\n  %a = add i32 %x, -1\n  %r = ashr i32 -2, %a\n  ret i32 %r\n}",
+          "source_program": "define i32 @ashr_add_negative_shift_no_exact(i32 %x) {\n  %a = add i32 %x, -1\n  %r = ashr i32 -2, %a\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "ashr_exact_add_negative_shift_negative_extra_use",
+          "test_body": "declare void @use(i8)\n\ndefine i8 @ashr_exact_add_negative_shift_negative_extra_use(i8 %x) {\n; CHECK-LABEL: @ashr_exact_add_negative_shift_negative_extra_use(\n; CHECK-NEXT:    [[A:%.*]] = add i8 [[X:%.*]], -2\n; CHECK-NEXT:    call void @use(i8 [[A]])\n; CHECK-NEXT:    [[R:%.*]] = ashr exact i8 -128, [[X]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %a = add i8 %x, -2\n  call void @use(i8 %a)\n  %r = ashr exact i8 -32, %a\n  ret i8 %r\n}",
+          "source_program": "declare void @use(i8)\n\ndefine i8 @ashr_exact_add_negative_shift_negative_extra_use(i8 %x) {\n  %a = add i8 %x, -2\n  call void @use(i8 %a)\n  %r = ashr exact i8 -32, %a\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "ashr_exact_add_negative_shift_negative",
+          "test_body": "define i32 @ashr_exact_add_negative_shift_negative(i32 %x) {\n; CHECK-LABEL: @ashr_exact_add_negative_shift_negative(\n; CHECK-NEXT:    [[R:%.*]] = ashr exact i32 -4, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[R]]\n  %a = add i32 %x, -1\n  %r = ashr exact i32 -2, %a\n  ret i32 %r\n}",
+          "source_program": "define i32 @ashr_exact_add_negative_shift_negative(i32 %x) {\n  %a = add i32 %x, -1\n  %r = ashr exact i32 -2, %a\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "lshr_exact_add_negative_shift_positive",
+          "test_body": "define i32 @lshr_exact_add_negative_shift_positive(i32 %x) {\n; CHECK-LABEL: @lshr_exact_add_negative_shift_positive(\n; CHECK-NEXT:    [[R:%.*]] = lshr exact i32 4, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[R]]\n  %a = add i32 %x, -1\n  %r = lshr exact i32 2, %a\n  ret i32 %r\n}",
+          "source_program": "define i32 @lshr_exact_add_negative_shift_positive(i32 %x) {\n  %a = add i32 %x, -1\n  %r = lshr exact i32 2, %a\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "ashr_exact_add_negative_shift_negative_vec",
+          "test_body": "define <2 x i7> @ashr_exact_add_negative_shift_negative_vec(<2 x i7> %x) {\n; CHECK-LABEL: @ashr_exact_add_negative_shift_negative_vec(\n; CHECK-NEXT:    [[R:%.*]] = ashr exact <2 x i7> <i7 -64, i7 -64>, [[X:%.*]]\n; CHECK-NEXT:    ret <2 x i7> [[R]]\n  %a = add <2 x i7> %x, <i7 -5, i7 -5>\n  %r = ashr exact <2 x i7> <i7 -2, i7 -2>, %a\n  ret <2 x i7> %r\n}",
+          "source_program": "define <2 x i7> @ashr_exact_add_negative_shift_negative_vec(<2 x i7> %x) {\n  %a = add <2 x i7> %x, <i7 -5, i7 -5>\n  %r = ashr exact <2 x i7> <i7 -2, i7 -2>, %a\n  ret <2 x i7> %r\n}\n"
+        },
+        {
+          "test_name": "lshr_exact_add_negative_shift_positive_extra_use",
+          "test_body": "declare void @use(i8)\n\ndefine i8 @lshr_exact_add_negative_shift_positive_extra_use(i8 %x) {\n; CHECK-LABEL: @lshr_exact_add_negative_shift_positive_extra_use(\n; CHECK-NEXT:    [[A:%.*]] = add i8 [[X:%.*]], -1\n; CHECK-NEXT:    call void @use(i8 [[A]])\n; CHECK-NEXT:    [[R:%.*]] = lshr exact i8 -128, [[X]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %a = add i8 %x, -1\n  call void @use(i8 %a)\n  %r = lshr exact i8 64, %a\n  ret i8 %r\n}",
+          "source_program": "declare void @use(i8)\n\ndefine i8 @lshr_exact_add_negative_shift_positive_extra_use(i8 %x) {\n  %a = add i8 %x, -1\n  call void @use(i8 %a)\n  %r = lshr exact i8 64, %a\n  ret i8 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "failed to fold shift amount offset into shift of a constant, part 2",
+    "body": "Forking this off from #54890 - that handled a shift-left variant, but there's a similar shift-right fold that could be added: \r\nhttps://alive2.llvm.org/ce/z/qzh4oK\r\n\r\n```llvm\r\ndefine i32 @src(i32 %x, i32 %c, i32 %addc) {\r\n  %a = add i32 %x, -1\r\n  %r = ashr exact i32 -2, %a\r\n  ret i32 %r\r\n}\r\n\r\ndefine i32 @tgt(i32 %x, i32 %c, i32 %addc) {\r\n  %r = ashr i32 -4, %x\r\n  ret i32 %r\r\n}\r\n\r\n```\r\nThis should be generalized for other constant values, and it should also work in the more common case of a positive shift constant with \"lshr\".",
+    "author": "rotateright",
+    "labels": [
+      "good first issue",
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "bug_id": "76043",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/76043",
+  "bug_type": "missed-optimization",
+  "base_commit": "61999b18c407b9f5c07577e63057d41c65240e61",
+  "knowledge_cutoff": "2023-12-20T12:23:26Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/Reassociate"
+  ],
+  "hints": {
+    "fix_commit": "b23f59a646d93c43602b010b997c0b7fc20eef5e",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          3794,
+          3798
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::visitSelectInst"
+      ]
+    }
+  },
+  "patch": "commit b23f59a646d93c43602b010b997c0b7fc20eef5e\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sun Dec 31 18:28:48 2023 +0800\n\n    [InstCombine] Fold `select (A &/| B), T, F` if `select B, T, F` is foldable (#76621)\n    \n    This patch does the following folds:\n    ```\n    (select A && B, T, F) -> (select A, (select B, T, F), F)\n    (select A || B, T, F) -> (select A, T, (select B, T, F))\n    ```\n    if `(select B, T, F)` can be folded into a value or a canonicalized SPF.\n    Alive2: https://alive2.llvm.org/ce/z/4Bdrbu\n    \n    The original motivation of this patch is to simplify the following\n    pattern:\n    ```\n    %.sroa.speculated.i = tail call i64 @llvm.umax.i64(i64 %sub.ptr.div.i.i, i64 1)\n    %add.i = add i64 %.sroa.speculated.i, %sub.ptr.div.i.i\n    %cmp7.i = icmp ult i64 %add.i, %sub.ptr.div.i.i\n    %cmp9.i = icmp ugt i64 %add.i, 1152921504606846975\n    %or.cond.i = or i1 %cmp7.i, %cmp9.i\n    %cond.i = select i1 %or.cond.i, i64 1152921504606846975, i64 %add.i\n    ->\n    %.sroa.speculated.i = tail call i64 @llvm.umax.i64(i64 %sub.ptr.div.i.i, i64 1)\n    %add.i = add i64 %.sroa.speculated.i, %sub.ptr.div.i.i\n    %cmp7.i = icmp ult i64 %add.i, %sub.ptr.div.i.i\n    %max = call i64 @llvm.umax.i64(i64 %add.i, 1152921504606846975)\n    %cond.i = select i1 %cmp7.i, i64 1152921504606846975, i64 %max\n    ```\n    The later form has a better codegen for some backends. It is also more\n    analysis-friendly than the original one.\n    Godbolt: https://godbolt.org/z/eK6eb5jf1\n    Alive2: https://alive2.llvm.org/ce/z/VHlxL2\n    \n    Compile-time impact:\n    http://llvm-compile-time-tracker.com/compare.php?from=7c71d3996a72b9b024622f23bf556539b961c88c&to=638ce8666fadaca1ab2639a3c2bc52a4a8508f40&stat=instructions:u\n    \n    |stage1-O3|stage1-ReleaseThinLTO|stage1-ReleaseLTO-g|stage1-O0-g|stage2-O3|stage2-O0-g|stage2-clang|\n    |--|--|--|--|--|--|--|\n    |+0.02%|-0.00%|+0.02%|-0.03%|-0.00%|-0.05%|-0.00%|\n    \n    It is an alternative to #76203 and #76363 because we can simplify\n    `select (icmp eq/ne a, b), a, b` into `b` or `a`.\n    Fixes #75784.\n    Fixes #76043.\n    \n    Thank @XChy for providing additional tests.\n    Co-authored-by: XChy <xxs_chy@outlook.com>\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex aa3397d086be..cf66f5be2d40 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3794,5 +3794,51 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n   if (Instruction *I = foldBitCeil(SI, Builder))\n     return I;\n \n+  // Fold:\n+  // (select A && B, T, F) -> (select A, (select B, T, F), F)\n+  // (select A || B, T, F) -> (select A, T, (select B, T, F))\n+  // if (select B, T, F) is foldable.\n+  // TODO: preserve FMF flags\n+  auto FoldSelectWithAndOrCond = [&](bool IsAnd, Value *A,\n+                                     Value *B) -> Instruction * {\n+    if (Value *V = simplifySelectInst(B, TrueVal, FalseVal,\n+                                      SQ.getWithInstruction(&SI)))\n+      return SelectInst::Create(A, IsAnd ? V : TrueVal, IsAnd ? FalseVal : V);\n+\n+    // Is (select B, T, F) a SPF?\n+    if (CondVal->hasOneUse() && SelType->isIntOrIntVectorTy()) {\n+      Value *LHS, *RHS;\n+      if (ICmpInst *Cmp = dyn_cast<ICmpInst>(B))\n+        if (Value *V = canonicalizeSPF(*Cmp, TrueVal, FalseVal, *this))\n+          return SelectInst::Create(A, IsAnd ? V : TrueVal,\n+                                    IsAnd ? FalseVal : V);\n+    }\n+\n+    return nullptr;\n+  };\n+\n+  Value *LHS, *RHS;\n+  if (match(CondVal, m_And(m_Value(LHS), m_Value(RHS)))) {\n+    if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ true, LHS, RHS))\n+      return I;\n+    if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ true, RHS, LHS))\n+      return I;\n+  } else if (match(CondVal, m_Or(m_Value(LHS), m_Value(RHS)))) {\n+    if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ false, LHS, RHS))\n+      return I;\n+    if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ false, RHS, LHS))\n+      return I;\n+  } else {\n+    // We cannot swap the operands of logical and/or.\n+    // TODO: Can we swap the operands by inserting a freeze?\n+    if (match(CondVal, m_LogicalAnd(m_Value(LHS), m_Value(RHS)))) {\n+      if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ true, LHS, RHS))\n+        return I;\n+    } else if (match(CondVal, m_LogicalOr(m_Value(LHS), m_Value(RHS)))) {\n+      if (Instruction *I = FoldSelectWithAndOrCond(/*IsAnd*/ false, LHS, RHS))\n+        return I;\n+    }\n+  }\n+\n   return nullptr;\n }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-and-or.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_or_umax_invalid_logical",
+          "test_body": "define i8 @test_or_umax_invalid_logical(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_or_umax_invalid_logical(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i8 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[CMP]], i1 true, i1 [[COND:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[OR]], i8 [[X]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cmp, i1 true, i1 %cond\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_umax_invalid_logical(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cmp, i1 true, i1 %cond\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_and_umax_invalid_logical",
+          "test_body": "define i8 @test_and_umax_invalid_logical(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_and_umax_invalid_logical(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i8 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = select i1 [[CMP]], i1 [[COND:%.*]], i1 false\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[AND]], i8 [[X]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cmp, i1 %cond, i1 false\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_and_umax_invalid_logical(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cmp, i1 %cond, i1 false\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "or_and3_multiuse",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @or_and3_multiuse(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @or_and3_multiuse(\n; CHECK-NEXT:    [[C:%.*]] = icmp eq i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[COND:%.*]] = or i1 [[C]], [[A:%.*]]\n; CHECK-NEXT:    call void @use(i1 [[COND]])\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[COND]], i1 [[A]], i1 [[B:%.*]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  call void @use(i1 %cond)\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @or_and3_multiuse(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  call void @use(i1 %cond)\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_or_umax_multiuse_cond",
+          "test_body": "declare void @use(i1)\n\ndefine i8 @test_or_umax_multiuse_cond(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_or_umax_multiuse_cond(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i8 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[COND:%.*]], i1 true, i1 [[CMP]]\n; CHECK-NEXT:    call void @use(i1 [[OR]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[OR]], i8 [[X]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  call void @use(i1 %or)\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i8 @test_or_umax_multiuse_cond(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  call void @use(i1 %or)\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "and_or3_commuted",
+          "test_body": "define i1 @and_or3_commuted(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @and_or3_commuted(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select i1 [[TMP1]], i1 true, i1 [[A:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[B:%.*]], i1 [[TMP2]], i1 false\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %c, %b\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "define i1 @and_or3_commuted(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %c, %b\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_logical_and_ne_a_b",
+          "test_body": "define i8 @test_logical_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_logical_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp ne i8 %a, %b\n  %or.cond = select i1 %other_cond, i1 %cmp, i1 false\n  %select = select i1 %or.cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_or_fmaxnum",
+          "test_body": "define float @test_or_fmaxnum(float %x, float %y, i1 %cond) {\n; CHECK-LABEL: @test_or_fmaxnum(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp nnan ogt float [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[COND:%.*]], i1 true, i1 [[CMP]]\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[OR]], float [[X]], float [[Y]]\n; CHECK-NEXT:    ret float [[RET]]\n  %cmp = fcmp nnan ogt float %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, float %x, float %y\n  ret float %ret\n}",
+          "source_program": "define float @test_or_fmaxnum(float %x, float %y, i1 %cond) {\n  %cmp = fcmp nnan ogt float %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, float %x, float %y\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "and_or2_wrong_operand",
+          "test_body": "define i1 @and_or2_wrong_operand(i1 %a, i1 %b, i1 %c, i1 %d) {\n; CHECK-LABEL: @and_or2_wrong_operand(\n; CHECK-NEXT:    [[NOTC:%.*]] = xor i1 [[C:%.*]], true\n; CHECK-NEXT:    [[COND:%.*]] = and i1 [[NOTC]], [[B:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[COND]], i1 [[A:%.*]], i1 [[D:%.*]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %notc = xor i1 %c, true\n  %cond = and i1 %notc, %b\n  %r = select i1 %cond, i1 %a, i1 %d\n  ret i1 %r\n}",
+          "source_program": "define i1 @and_or2_wrong_operand(i1 %a, i1 %b, i1 %c, i1 %d) {\n  %notc = xor i1 %c, true\n  %cond = and i1 %notc, %b\n  %r = select i1 %cond, i1 %a, i1 %d\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_or_eq_a_b_commuted",
+          "test_body": "define i8 @test_or_eq_a_b_commuted(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_or_eq_a_b_commuted(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp eq i8 %a, %b\n  %cond = or i1 %other_cond, %cmp\n  %select = select i1 %cond, i8 %b, i8 %a\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_and_umax",
+          "test_body": "define i8 @test_and_umax(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_and_umax(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[TMP1]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cond, i1 %cmp, i1 false\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_and_umax(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cond, i1 %cmp, i1 false\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "and_or3_multiuse",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @and_or3_multiuse(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @and_or3_multiuse(\n; CHECK-NEXT:    [[C:%.*]] = icmp eq i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[COND:%.*]] = and i1 [[C]], [[B:%.*]]\n; CHECK-NEXT:    call void @use(i1 [[COND]])\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[COND]], i1 [[A:%.*]], i1 [[B]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %b, %c\n  call void @use(i1 %cond)\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @and_or3_multiuse(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %b, %c\n  call void @use(i1 %cond)\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "or_and3_commuted",
+          "test_body": "define i1 @or_and3_commuted(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @or_and3_commuted(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select i1 [[TMP1]], i1 [[B:%.*]], i1 false\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[A:%.*]], i1 true, i1 [[TMP2]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %c, %a\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "define i1 @or_and3_commuted(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %c, %a\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "or_and3_vec",
+          "test_body": "define <2 x i1> @or_and3_vec(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n; CHECK-LABEL: @or_and3_vec(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne <2 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select <2 x i1> [[TMP1]], <2 x i1> [[B:%.*]], <2 x i1> zeroinitializer\n; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[A:%.*]], <2 x i1> <i1 true, i1 true>, <2 x i1> [[TMP2]]\n; CHECK-NEXT:    ret <2 x i1> [[R]]\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = or <2 x i1> %a, %c\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}",
+          "source_program": "define <2 x i1> @or_and3_vec(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = or <2 x i1> %a, %c\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "test_and_umax_bitwise2",
+          "test_body": "define i8 @test_and_umax_bitwise2(i8 %x, i8 %y, i8 %val) {\n; CHECK-LABEL: @test_and_umax_bitwise2(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i8 [[VAL:%.*]], 0\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND]], i8 [[TMP1]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %and = and i1 %cmp, %cond\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_and_umax_bitwise2(i8 %x, i8 %y, i8 %val) {\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %and = and i1 %cmp, %cond\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "or_and3",
+          "test_body": "define i1 @or_and3(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @or_and3(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select i1 [[TMP1]], i1 [[B:%.*]], i1 false\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[A:%.*]], i1 true, i1 [[TMP2]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "define i1 @or_and3(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_logical_commuted_or_eq_a_b",
+          "test_body": "define i8 @test_logical_commuted_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_logical_commuted_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp eq i8 %a, %b\n  %or.cond = select i1 %cmp, i1 true, i1 %other_cond\n  %select = select i1 %or.cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_or_smax",
+          "test_body": "define i8 @test_or_smax(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_or_smax(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.smax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[X]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp sgt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_smax(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp sgt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_logical_commuted_and_ne_a_b",
+          "test_body": "define i8 @test_logical_commuted_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_logical_commuted_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp ne i8 %a, %b\n  %or.cond = select i1 %cmp, i1 %other_cond, i1 false\n  %select = select i1 %or.cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_and_ne_a_b",
+          "test_body": "define i8 @test_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_and_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp ne i8 %a, %b\n  %cond = and i1 %other_cond, %cmp\n  %select = select i1 %cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_or_umax_bitwise1",
+          "test_body": "define i8 @test_or_umax_bitwise1(i8 %x, i8 %y, i8 %val) {\n; CHECK-LABEL: @test_or_umax_bitwise1(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i8 [[VAL:%.*]], 0\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND]], i8 [[X]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %or = or i1 %cond, %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_umax_bitwise1(i8 %x, i8 %y, i8 %val) {\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %or = or i1 %cond, %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or_eq_a_b_vec",
+          "test_body": "define <2 x i8> @test_or_eq_a_b_vec(<2 x i1> %other_cond, <2 x i8> %a, <2 x i8> %b) {",
+          "source_program": "define <2 x i8> @test_or_eq_a_b_vec(<2 x i1> %other_cond, <2 x i8> %a, <2 x i8> %b) {\n  %cmp = icmp eq <2 x i8> %a, %b\n  %cond = or <2 x i1> %other_cond, %cmp\n  %select = select <2 x i1> %cond, <2 x i8> %a, <2 x i8> %b\n  ret <2 x i8> %select\n}\n"
+        },
+        {
+          "test_name": "or_and3_vec_commuted",
+          "test_body": "define <2 x i1> @or_and3_vec_commuted(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n; CHECK-LABEL: @or_and3_vec_commuted(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne <2 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select <2 x i1> [[TMP1]], <2 x i1> [[B:%.*]], <2 x i1> zeroinitializer\n; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[A:%.*]], <2 x i1> <i1 true, i1 true>, <2 x i1> [[TMP2]]\n; CHECK-NEXT:    ret <2 x i1> [[R]]\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = or <2 x i1> %c, %a\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}",
+          "source_program": "define <2 x i1> @or_and3_vec_commuted(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = or <2 x i1> %c, %a\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "and_or3_vec_commuted",
+          "test_body": "define <2 x i1> @and_or3_vec_commuted(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n; CHECK-LABEL: @and_or3_vec_commuted(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne <2 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select <2 x i1> [[TMP1]], <2 x i1> <i1 true, i1 true>, <2 x i1> [[A:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[B:%.*]], <2 x i1> [[TMP2]], <2 x i1> zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[R]]\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = and <2 x i1> %c, %b\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}",
+          "source_program": "define <2 x i1> @and_or3_vec_commuted(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = and <2 x i1> %c, %b\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "test_or_abs",
+          "test_body": "define i8 @test_or_abs(i8 %x, i1 %cond) {\n; CHECK-LABEL: @test_or_abs(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.abs.i8(i8 [[X:%.*]], i1 true)\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[X]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp sgt i8 %x, -1\n  %neg = sub nsw i8 0, %x\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %neg\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_abs(i8 %x, i1 %cond) {\n  %cmp = icmp sgt i8 %x, -1\n  %neg = sub nsw i8 0, %x\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %neg\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "and_or3_vec",
+          "test_body": "define <2 x i1> @and_or3_vec(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n; CHECK-LABEL: @and_or3_vec(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne <2 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select <2 x i1> [[TMP1]], <2 x i1> <i1 true, i1 true>, <2 x i1> [[A:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[B:%.*]], <2 x i1> [[TMP2]], <2 x i1> zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[R]]\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = and <2 x i1> %b, %c\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}",
+          "source_program": "define <2 x i1> @and_or3_vec(<2 x i1> %a, <2 x i1> %b, <2 x i32> %x, <2 x i32> %y) {\n  %c = icmp eq <2 x i32> %x, %y\n  %cond = and <2 x i1> %b, %c\n  %r = select <2 x i1> %cond, <2 x i1> %a, <2 x i1> %b\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "test_or_eq_different_operands",
+          "test_body": "define i8 @test_or_eq_different_operands(i8 %a, i8 %b, i8 %c) {",
+          "source_program": "define i8 @test_or_eq_different_operands(i8 %a, i8 %b, i8 %c) {\n  %cmp = icmp eq i8 %a, %c\n  %cmp1 = icmp eq i8 %b, %a\n  %cond = or i1 %cmp, %cmp1\n  %select = select i1 %cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "or_and3_wrong_operand",
+          "test_body": "define i1 @or_and3_wrong_operand(i1 %a, i1 %b, i32 %x, i32 %y, i1 %d) {\n; CHECK-LABEL: @or_and3_wrong_operand(\n; CHECK-NEXT:    [[C:%.*]] = icmp eq i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[COND:%.*]] = or i1 [[C]], [[A:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[COND]], i1 [[D:%.*]], i1 [[B:%.*]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  %r = select i1 %cond, i1 %d, i1 %b\n  ret i1 %r\n}",
+          "source_program": "define i1 @or_and3_wrong_operand(i1 %a, i1 %b, i32 %x, i32 %y, i1 %d) {\n  %c = icmp eq i32 %x, %y\n  %cond = or i1 %a, %c\n  %r = select i1 %cond, i1 %d, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_and_ne_a_b_commuted",
+          "test_body": "define i8 @test_and_ne_a_b_commuted(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_and_ne_a_b_commuted(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp ne i8 %a, %b\n  %cond = and i1 %other_cond, %cmp\n  %select = select i1 %cond, i8 %b, i8 %a\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "and_or3",
+          "test_body": "define i1 @and_or3(i1 %a, i1 %b, i32 %x, i32 %y) {\n; CHECK-LABEL: @and_or3(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ne i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TMP2:%.*]] = select i1 [[TMP1]], i1 true, i1 [[A:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[B:%.*]], i1 [[TMP2]], i1 false\n; CHECK-NEXT:    ret i1 [[R]]\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %b, %c\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}",
+          "source_program": "define i1 @and_or3(i1 %a, i1 %b, i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %cond = and i1 %b, %c\n  %r = select i1 %cond, i1 %a, i1 %b\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "test_or_umax_bitwise2",
+          "test_body": "define i8 @test_or_umax_bitwise2(i8 %x, i8 %y, i8 %val) {\n; CHECK-LABEL: @test_or_umax_bitwise2(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i8 [[VAL:%.*]], 0\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND]], i8 [[X]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %or = or i1 %cmp, %cond\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_umax_bitwise2(i8 %x, i8 %y, i8 %val) {\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %or = or i1 %cmp, %cond\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or_umax",
+          "test_body": "define i8 @test_or_umax(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_or_umax(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[X]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_umax(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or_umin",
+          "test_body": "define i8 @test_or_umin(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_or_umin(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[Y]], i8 [[TMP1]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %y, i8 %x\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_or_umin(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %or = select i1 %cond, i1 true, i1 %cmp\n  %ret = select i1 %or, i8 %y, i8 %x\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_and_umax_bitwise1",
+          "test_body": "define i8 @test_and_umax_bitwise1(i8 %x, i8 %y, i8 %val) {\n; CHECK-LABEL: @test_and_umax_bitwise1(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i8 [[VAL:%.*]], 0\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND]], i8 [[TMP1]], i8 [[Y]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %and = and i1 %cond, %cmp\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_and_umax_bitwise1(i8 %x, i8 %y, i8 %val) {\n  %cond = icmp eq i8 %val, 0\n  %cmp = icmp ugt i8 %x, %y\n  %and = and i1 %cond, %cmp\n  %ret = select i1 %and, i8 %x, i8 %y\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or_ne_a_b",
+          "test_body": "define i8 @test_or_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_or_ne_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp ne i8 %a, %b\n  %cond = or i1 %other_cond, %cmp\n  %select = select i1 %cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_and_ne_different_operands_fail",
+          "test_body": "define i8 @test_and_ne_different_operands_fail(i8 %a, i8 %b, i8 %c) {",
+          "source_program": "define i8 @test_and_ne_different_operands_fail(i8 %a, i8 %b, i8 %c) {\n  %cmp = icmp ne i8 %a, %c\n  %cmp1 = icmp ne i8 %b, %c\n  %cond = and i1 %cmp, %cmp1\n  %select = select i1 %cond, i8 %b, i8 %a\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_and_umin",
+          "test_body": "define i8 @test_and_umin(i8 %x, i8 %y, i1 %cond) {\n; CHECK-LABEL: @test_and_umin(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n; CHECK-NEXT:    [[RET:%.*]] = select i1 [[COND:%.*]], i8 [[TMP1]], i8 [[X]]\n; CHECK-NEXT:    ret i8 [[RET]]\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cond, i1 %cmp, i1 false\n  %ret = select i1 %and, i8 %y, i8 %x\n  ret i8 %ret\n}",
+          "source_program": "define i8 @test_and_umin(i8 %x, i8 %y, i1 %cond) {\n  %cmp = icmp ugt i8 %x, %y\n  %and = select i1 %cond, i1 %cmp, i1 false\n  %ret = select i1 %and, i8 %y, i8 %x\n  ret i8 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or_eq_a_b_multi_use",
+          "test_body": "declare void @use(i1)\n\ndefine i8 @test_or_eq_a_b_multi_use(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "declare void @use(i1)\n\ndefine i8 @test_or_eq_a_b_multi_use(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp eq i8 %a, %b\n  %cond = or i1 %other_cond, %cmp\n  call void @use(i1 %cmp)\n  call void @use(i1 %cond)\n  %select = select i1 %cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_logical_or_eq_a_b",
+          "test_body": "define i8 @test_logical_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_logical_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp eq i8 %a, %b\n  %or.cond = select i1 %other_cond, i1 true, i1 %cmp\n  %select = select i1 %or.cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        },
+        {
+          "test_name": "test_or_eq_a_b",
+          "test_body": "define i8 @test_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {",
+          "source_program": "define i8 @test_or_eq_a_b(i1 %other_cond, i8 %a, i8 %b) {\n  %cmp = icmp eq i8 %a, %b\n  %cond = or i1 %other_cond, %cmp\n  %select = select i1 %cond, i8 %a, i8 %b\n  ret i8 %select\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-factorize.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -S < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "and_and_logic_or_not_one_use",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @and_and_logic_or_not_one_use(i1 %c, i1 %a, i1 %b) {\n; CHECK-LABEL: @and_and_logic_or_not_one_use(\n; CHECK-NEXT:    [[AC:%.*]] = and i1 [[A:%.*]], [[C:%.*]]\n; CHECK-NEXT:    [[BC:%.*]] = and i1 [[C]], [[B:%.*]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[B]], i1 [[C]], i1 [[AC]]\n; CHECK-NEXT:    call void @use(i1 [[AC]])\n; CHECK-NEXT:    call void @use(i1 [[BC]])\n; CHECK-NEXT:    ret i1 [[OR]]\n  %ac = and i1 %a, %c\n  %bc = and i1 %c, %b\n  %or = select i1 %bc, i1 true, i1 %ac\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @and_and_logic_or_not_one_use(i1 %c, i1 %a, i1 %b) {\n  %ac = and i1 %a, %c\n  %bc = and i1 %c, %b\n  %or = select i1 %bc, i1 true, i1 %ac\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}\n"
+        },
+        {
+          "test_name": "logic_or_logic_and_not_one_use",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @logic_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n; CHECK-LABEL: @logic_or_logic_and_not_one_use(\n; CHECK-NEXT:    [[AC:%.*]] = select i1 [[C:%.*]], i1 true, i1 [[A:%.*]]\n; CHECK-NEXT:    [[BC:%.*]] = select i1 [[B:%.*]], i1 true, i1 [[C]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[B]], i1 [[AC]], i1 [[C]]\n; CHECK-NEXT:    call void @use(i1 [[AC]])\n; CHECK-NEXT:    call void @use(i1 [[BC]])\n; CHECK-NEXT:    ret i1 [[OR]]\n  %ac = select i1 %c, i1 true, i1 %a\n  %bc = select i1 %b, i1 true, i1 %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @logic_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n  %ac = select i1 %c, i1 true, i1 %a\n  %bc = select i1 %b, i1 true, i1 %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}\n"
+        },
+        {
+          "test_name": "and_logic_and_logic_or_not_one_use",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @and_logic_and_logic_or_not_one_use(i1 %c, i1 %a, i1 %b) {\n; CHECK-LABEL: @and_logic_and_logic_or_not_one_use(\n; CHECK-NEXT:    [[AC:%.*]] = and i1 [[A:%.*]], [[C:%.*]]\n; CHECK-NEXT:    [[BC:%.*]] = select i1 [[B:%.*]], i1 [[C]], i1 false\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[B]], i1 [[C]], i1 [[AC]]\n; CHECK-NEXT:    call void @use(i1 [[AC]])\n; CHECK-NEXT:    call void @use(i1 [[BC]])\n; CHECK-NEXT:    ret i1 [[OR]]\n  %ac = and i1 %a, %c\n  %bc = select i1 %b, i1 %c, i1 false\n  %or = select i1 %bc, i1 true, i1 %ac\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @and_logic_and_logic_or_not_one_use(i1 %c, i1 %a, i1 %b) {\n  %ac = and i1 %a, %c\n  %bc = select i1 %b, i1 %c, i1 false\n  %or = select i1 %bc, i1 true, i1 %ac\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}\n"
+        },
+        {
+          "test_name": "or_logic_or_logic_and_not_one_use",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @or_logic_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n; CHECK-LABEL: @or_logic_or_logic_and_not_one_use(\n; CHECK-NEXT:    [[AC:%.*]] = or i1 [[C:%.*]], [[A:%.*]]\n; CHECK-NEXT:    [[BC:%.*]] = select i1 [[B:%.*]], i1 true, i1 [[C]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[B]], i1 [[AC]], i1 [[C]]\n; CHECK-NEXT:    call void @use(i1 [[AC]])\n; CHECK-NEXT:    call void @use(i1 [[BC]])\n; CHECK-NEXT:    ret i1 [[OR]]\n  %ac = or i1 %c, %a\n  %bc = select i1 %b, i1 true, i1 %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @or_logic_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n  %ac = or i1 %c, %a\n  %bc = select i1 %b, i1 true, i1 %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}\n"
+        },
+        {
+          "test_name": "or_or_logic_and_not_one_use",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @or_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n; CHECK-LABEL: @or_or_logic_and_not_one_use(\n; CHECK-NEXT:    [[AC:%.*]] = or i1 [[C:%.*]], [[A:%.*]]\n; CHECK-NEXT:    [[BC:%.*]] = or i1 [[B:%.*]], [[C]]\n; CHECK-NEXT:    [[OR:%.*]] = select i1 [[B]], i1 [[AC]], i1 [[C]]\n; CHECK-NEXT:    call void @use(i1 [[AC]])\n; CHECK-NEXT:    call void @use(i1 [[BC]])\n; CHECK-NEXT:    ret i1 [[OR]]\n  %ac = or i1 %c, %a\n  %bc = or i1 %b, %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @or_or_logic_and_not_one_use(i1 %c, i1 %a, i1 %b) {\n  %ac = or i1 %c, %a\n  %bc = or i1 %b, %c\n  %or = select i1 %bc, i1 %ac, i1 false\n  call void @use(i1 %ac)\n  call void @use(i1 %bc)\n  ret i1 %or\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/zext-or-icmp.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "PR49475_infloop",
+          "test_body": "define i8 @PR49475_infloop(i32 %t0, i16 %insert, i64 %e, i8 %i162) {\n; CHECK-LABEL: @PR49475_infloop(\n; CHECK-NEXT:    [[B2:%.*]] = icmp eq i16 [[INSERT:%.*]], 0\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[T0:%.*]], 1\n; CHECK-NEXT:    [[TMP2:%.*]] = or disjoint i32 [[TMP1]], 140\n; CHECK-NEXT:    [[TMP3:%.*]] = zext nneg i32 [[TMP2]] to i64\n; CHECK-NEXT:    [[XOR:%.*]] = select i1 [[B2]], i64 [[TMP3]], i64 140\n; CHECK-NEXT:    [[CONV16:%.*]] = sext i8 [[I162:%.*]] to i64\n; CHECK-NEXT:    [[SUB17:%.*]] = sub i64 [[CONV16]], [[E:%.*]]\n; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[SUB17]], 32\n; CHECK-NEXT:    [[CONV18:%.*]] = ashr exact i64 [[SEXT]], 32\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sge i64 [[XOR]], [[CONV18]]\n; CHECK-NEXT:    [[CONV19:%.*]] = zext i1 [[CMP]] to i16\n; CHECK-NEXT:    [[OR21:%.*]] = or i16 [[CONV19]], [[INSERT]]\n; CHECK-NEXT:    [[TOBOOL23_NOT:%.*]] = icmp eq i16 [[OR21]], 0\n; CHECK-NEXT:    call void @llvm.assume(i1 [[TOBOOL23_NOT]])\n; CHECK-NEXT:    ret i8 [[I162]]\n  %b = icmp eq i32 %t0, 0\n  %b2 = icmp eq i16 %insert, 0\n  %t1 = or i1 %b, %b2\n  %ext = zext i1 %t1 to i32\n  %and = and i32 %t0, %ext\n  %conv13 = zext i32 %and to i64\n  %xor = xor i64 %conv13, 140\n  %conv16 = sext i8 %i162 to i64\n  %sub17 = sub i64 %conv16, %e\n  %sext = shl i64 %sub17, 32\n  %conv18 = ashr exact i64 %sext, 32\n  %cmp = icmp sge i64 %xor, %conv18\n  %conv19 = zext i1 %cmp to i16\n  %or21 = or i16 %insert, %conv19\n  %trunc44 = trunc i16 %or21 to i8\n  %inc = add i8 %i162, %trunc44\n  %tobool23.not = icmp eq i16 %or21, 0\n  call void @llvm.assume(i1 %tobool23.not)\n  ret i8 %inc\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }",
+          "source_program": "define i8 @PR49475_infloop(i32 %t0, i16 %insert, i64 %e, i8 %i162) {\n  %b = icmp eq i32 %t0, 0\n  %b2 = icmp eq i16 %insert, 0\n  %t1 = or i1 %b, %b2\n  %ext = zext i1 %t1 to i32\n  %and = and i32 %t0, %ext\n  %conv13 = zext i32 %and to i64\n  %xor = xor i64 %conv13, 140\n  %conv16 = sext i8 %i162 to i64\n  %sub17 = sub i64 %conv16, %e\n  %sext = shl i64 %sub17, 32\n  %conv18 = ashr exact i64 %sext, 32\n  %cmp = icmp sge i64 %xor, %conv18\n  %conv19 = zext i1 %cmp to i16\n  %or21 = or i16 %insert, %conv19\n  %trunc44 = trunc i16 %or21 to i8\n  %inc = add i8 %i162, %trunc44\n  %tobool23.not = icmp eq i16 %or21, 0\n  call void @llvm.assume(i1 %tobool23.not)\n  ret i8 %inc\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "PR49475",
+          "test_body": "define i32 @PR49475(i32 %x, i16 %y) {\n; CHECK-LABEL: @PR49475(\n; CHECK-NEXT:    [[M:%.*]] = and i16 [[Y:%.*]], 1\n; CHECK-NEXT:    [[B1:%.*]] = icmp eq i32 [[X:%.*]], 0\n; CHECK-NEXT:    [[B2:%.*]] = icmp eq i16 [[M]], 0\n; CHECK-NEXT:    [[T1:%.*]] = or i1 [[B1]], [[B2]]\n; CHECK-NEXT:    [[Z:%.*]] = zext i1 [[T1]] to i32\n; CHECK-NEXT:    ret i32 [[Z]]\n  %m = and i16 %y, 1\n  %b1 = icmp eq i32 %x, 0\n  %b2 = icmp eq i16 %m, 0\n  %t1 = or i1 %b1, %b2\n  %z = zext i1 %t1 to i32\n  ret i32 %z\n}",
+          "source_program": "define i32 @PR49475(i32 %x, i16 %y) {\n  %m = and i16 %y, 1\n  %b1 = icmp eq i32 %x, 0\n  %b2 = icmp eq i16 %m, 0\n  %t1 = or i1 %b1, %b2\n  %z = zext i1 %t1 to i32\n  ret i32 %z\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Reassociate/basictest.ll",
+      "commands": [
+        [
+          "opt < %s -passes=reassociate,gvn,instcombine -S",
+          "FileCheck %s"
+        ],
+        [
+          "opt < %s -passes='reassociate,gvn,instcombine' -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test14",
+          "test_body": "define i32 @test14(i32 %X1, i32 %X2) {\n; CHECK-LABEL: @test14(\n; CHECK-NEXT:    [[REASS_ADD:%.*]] = sub i32 [[X1:%.*]], [[X2:%.*]]\n; CHECK-NEXT:    [[REASS_MUL:%.*]] = mul i32 [[REASS_ADD]], 47\n; CHECK-NEXT:    ret i32 [[REASS_MUL]]\n  %B = mul i32 %X1, 47\n  %C = mul i32 %X2, -47\n  %D = add i32 %B, %C\n  ret i32 %D\n}",
+          "source_program": "define i32 @test14(i32 %X1, i32 %X2) {\n  %B = mul i32 %X1, 47\n  %C = mul i32 %X2, -47\n  %D = add i32 %B, %C\n  ret i32 %D\n}\n"
+        },
+        {
+          "test_name": "test15",
+          "test_body": "define i32 @test15(i32 %X1, i32 %X2, i32 %X3) {\n; CHECK-LABEL: @test15(\n; CHECK-NEXT:    [[B:%.*]] = icmp slt i32 [[X2:%.*]], [[X3:%.*]]\n; CHECK-NEXT:    [[D:%.*]] = select i1 [[B]], i32 [[X1:%.*]], i32 0\n; CHECK-NEXT:    ret i32 [[D]]\n  %A = icmp ne i32 %X1, 0\n  %B = icmp slt i32 %X2, %X3\n  %C = and i1 %A, %B\n  %D = select i1 %C, i32 %X1, i32 0\n  ret i32 %D\n}",
+          "source_program": "define i32 @test15(i32 %X1, i32 %X2, i32 %X3) {\n  %A = icmp ne i32 %X1, 0\n  %B = icmp slt i32 %X2, %X3\n  %C = and i1 %A, %B\n  %D = select i1 %C, i32 %X1, i32 0\n  ret i32 %D\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "missed optimization: Optimization based on the first of the two conditions",
+    "body": "Test case from gcc testsuite:\r\nhttps://github.com/gcc-mirror/gcc/blob/master/gcc/testsuite/gcc.dg/tree-ssa/phi-opt-11.c\r\n```cpp\r\nint f(int a, int b, int c)\r\n{\r\n  if (a == 0 && b > c)\r\n   return 0;\r\n return a;\r\n}\r\n\r\nint g(int a, int b, int c)\r\n{\r\n  if (a == 42 && b > c)\r\n   return 42;\r\n return a;\r\n}\r\n\r\nint h(int a, int b, int c, int d)\r\n{\r\n  if (a == d && b > c)\r\n   return d;\r\n return a;\r\n}\r\n```\r\nhttps://godbolt.org/z/hd8Pb116n\r\n\r\nAny of these functions can be optimized to a function which returns `a`. I feel like there may be a duplicate of this issue.",
+    "author": "k-arrows",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Can probably be solved by supporting and/or of conditions for the simplifySelectWithICmpEq() fold."
+      },
+      {
+        "author": "sun-jacobi",
+        "body": "Hi @nikic @k-arrows  Can I work on this issue ?"
+      },
+      {
+        "author": "sun-jacobi",
+        "body": "Alive2 proof:  https://alive2.llvm.org/ce/z/JeADtD"
+      },
+      {
+        "author": "k-arrows",
+        "body": "> Can I work on this issue ?\r\n\r\nOf course you can. There\u2019s no need to rush."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}
