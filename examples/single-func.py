@@ -20,6 +20,7 @@ import re
 import string
 from unidiff import PatchSet
 import tarfile
+from pathlib import Path
 
 sys.path.append(os.path.join(os.path.dirname(os.environ["LAB_DATASET_DIR"]), "scripts"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -28,6 +29,17 @@ import llvm_helper
 from lab_env import Environment as Env
 from openai import OpenAI
 from openai import NOT_GIVEN
+
+# Import tree-sitter for C++ function extraction
+try:
+    import tree_sitter_cpp
+    from tree_sitter import Language, Parser, Tree
+    CXX_LANGUAGE = Language(tree_sitter_cpp.language())
+    cxx_parser = Parser(CXX_LANGUAGE)
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    cxx_parser = None
 
 # DEBUG
 DEBUG = 0
@@ -410,7 +422,224 @@ def get_hunk(env: Env) -> str:
     hunk = "\n".join(source_code[min_lineno - 1 : max_lineno])
     return bug_file, hunk
 
-def get_hunk_short(env: Env) -> str:
+def traverse_tree(tree: Tree):
+    """Traverse all nodes in the syntax tree"""
+    cursor = tree.walk()
+    reached_root = False
+    while reached_root == False:
+        yield cursor.node
+        if cursor.goto_first_child():
+            continue
+        if cursor.goto_next_sibling():
+            continue
+        retracing = True
+        while retracing:
+            if not cursor.goto_parent():
+                retracing = False
+                reached_root = True
+            if cursor.goto_next_sibling():
+                retracing = False
+
+
+def extract_function_name(func_def_node):
+    """Extract function name from function definition node"""
+    try:
+        declarators = func_def_node.children_by_field_name("declarator")
+        if len(declarators) == 0:
+            return None
+        func_name_node = declarators[0]
+        while True:
+            decl = func_name_node.children_by_field_name("declarator")
+            if len(decl) == 0:
+                if func_name_node.type == "reference_declarator":
+                    if func_name_node.child_count > 1:
+                        func_name_node = func_name_node.child(1)
+                        continue
+                break
+            func_name_node = decl[0]
+        func_name = func_name_node.text.decode("utf-8")
+        return func_name
+    except Exception:
+        return None
+
+
+def get_full_path_from_filename(filename: str, llvm_root: str = None) -> str | None:
+    """Find the full path from filename (relative to llvm_root)"""
+    if llvm_root is None:
+        llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    basename = os.path.basename(filename)
+    llvm_path = Path(llvm_root)
+    for cpp_file in llvm_path.rglob(basename):
+        if cpp_file.is_file():
+            rel_path = cpp_file.relative_to(llvm_path)
+            return str(rel_path).replace("\\", "/")
+    return None
+
+
+def match_function_name(pred_func: str, gold_func: str) -> bool:
+    """Check if predicted function name matches gold function name"""
+    # Handle cases like "InstCombinerImpl::visitMul" vs "visitMul"
+    if pred_func == gold_func:
+        return True
+    # Check if pred_func is a suffix of gold_func (e.g., "visitMul" in "InstCombinerImpl::visitMul")
+    if gold_func.endswith("::" + pred_func):
+        return True
+    # Check if pred_func contains gold_func (e.g., "InstCombinerImpl::visitMul" contains "visitMul")
+    if pred_func in gold_func or gold_func in pred_func:
+        return True
+    return False
+
+
+def extract_function_content(file_path: str, func_name: str, source_code: str) -> str | None:
+    """Extract function content from source code using tree-sitter"""
+    if not TREE_SITTER_AVAILABLE:
+        return None
+    
+    try:
+        tree = cxx_parser.parse(bytes(source_code, "utf-8"))
+        for node in traverse_tree(tree):
+            if node.type == "function_definition":
+                extracted_name = extract_function_name(node)
+                if extracted_name and match_function_name(extracted_name, func_name):
+                    # Extract function content
+                    start_byte = node.start_byte
+                    end_byte = node.end_byte
+                    func_content = source_code[start_byte:end_byte]
+                    return func_content
+    except Exception as e:
+        print(f"Error extracting function {func_name} from {file_path}: {e}")
+        return None
+    return None
+
+
+def load_func_info_from_json(issue_id: str, json_path: str = None) -> tuple[dict, list, str | None]:
+    """Load pred_funcs, gold_funcs, and gold_file from test-func-filecontent.json"""
+    if json_path is None:
+        json_path = os.path.join(os.path.dirname(__file__), "..", "test-func-filecontent.json")
+    
+    if not os.path.exists(json_path):
+        return {}, [], None
+    
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}, [], None
+    
+    issue_data = data.get(issue_id, {})
+    pred_funcs = issue_data.get("pred_funcs", {})
+    gold_funcs = issue_data.get("gold_funcs", [])
+    gold_file = issue_data.get("gold_file", None)
+    
+    return pred_funcs, gold_funcs, gold_file
+
+
+def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, str] | None:
+    """Extract function content as hunk from specified file and function name"""
+    base_commit = env.get_base_commit()
+    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    
+    # Read file content from git
+    try:
+        if file_path.startswith("llvm/"):
+            source_code = str(llvm_helper.git_execute(["show", f"{base_commit}:{file_path}"]))
+        else:
+            # Try to find the file
+            full_path = get_full_path_from_filename(os.path.basename(file_path), llvm_root)
+            if full_path:
+                source_code = str(llvm_helper.git_execute(["show", f"{base_commit}:{full_path}"]))
+                file_path = full_path
+            else:
+                print(f"Warning: Cannot find file {file_path}, skipping")
+                return None
+    except Exception as e:
+        print(f"Warning: Cannot read file {file_path}: {e}, skipping")
+        return None
+    
+    # Extract function content using tree-sitter
+    func_content = extract_function_content(file_path, func_name, source_code)
+    if func_content:
+        return file_path, func_content
+    
+    # Fallback: try to find function by name using regex (less accurate)
+    lines = source_code.splitlines()
+    for i, line in enumerate(lines):
+        # Simple heuristic: look for function definition
+        if func_name in line and ("{" in line or (i + 1 < len(lines) and "{" in lines[i + 1])):
+            # Extract function with some context
+            start = max(0, i - 2)
+            # Find the end of function (next closing brace at same indentation)
+            end = i + 1
+            brace_count = 0
+            for j in range(i, len(lines)):
+                brace_count += lines[j].count("{") - lines[j].count("}")
+                if brace_count == 0 and j > i:
+                    end = j + 1
+                    break
+            if end > i + 1:
+                func_content = "\n".join(lines[start:end])
+                return file_path, func_content
+    
+    return None
+
+
+def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
+    """Get list of (file_path, func_name) tuples to try from test-func-filecontent.json"""
+    # Load function information from JSON
+    pred_funcs, gold_funcs, gold_file = load_func_info_from_json(issue_id)
+    
+    # If no pred_funcs found, return empty list (will fall back to original method)
+    if not pred_funcs:
+        return []
+    
+    functions_to_try = []
+    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    
+    # If gold_funcs exist, try to match with pred_funcs
+    # pred_funcs is a dict: {"filename.cpp": ["func1", "func2", ...], ...}
+    if gold_funcs and gold_file:
+        # Find matching functions
+        for pred_file, pred_func_list in pred_funcs.items():
+            # pred_func_list is the list of function names for this file
+            if not pred_func_list:
+                continue
+            # Get full path for pred_file
+            full_path = get_full_path_from_filename(pred_file, llvm_root)
+            # Check if this file matches gold_file (compare basename or full path)
+            file_matches = False
+            if full_path:
+                file_matches = full_path == gold_file
+            if not file_matches:
+                file_matches = os.path.basename(pred_file) == os.path.basename(gold_file)
+            
+            if file_matches:
+                # Found matching file, check for matching functions
+                for pred_func in pred_func_list:
+                    for gold_func in gold_funcs:
+                        if match_function_name(pred_func, gold_func):
+                            # Use gold_file path if available, otherwise use full_path
+                            target_path = gold_file if gold_file.startswith("llvm/") else (full_path or gold_file)
+                            functions_to_try.append((target_path, pred_func))
+                            break
+                # If we found matching functions, only use those
+                if functions_to_try:
+                    return functions_to_try
+    
+    # If no matches found or no gold_funcs, use all pred_funcs
+    # pred_funcs is a dict: {"filename.cpp": ["func1", "func2", ...], ...}
+    for pred_file, pred_func_list in pred_funcs.items():
+        # pred_func_list is the list of function names for this file
+        if not pred_func_list:
+            continue
+        full_path = get_full_path_from_filename(pred_file, llvm_root)
+        for pred_func in pred_func_list:
+            functions_to_try.append((full_path or pred_file, pred_func))
+    
+    return functions_to_try
+
+
+def get_hunk_short(env: Env) -> tuple[str, str]:
+    """Get hunk using original method (fallback)"""
     lineno = env.get_hint_line_level_bug_locations()
     bug_file = next(iter(lineno.keys()))
     bug_hunks = next(iter(lineno.values()))
@@ -423,7 +652,7 @@ def get_hunk_short(env: Env) -> str:
             min_lineno = range[0]
             max_lineno = range[1]
             max_range = range[1] - range[0]
-    margin = 10 # before 11.04, margin is 30
+    margin = 10  # before 11.04, margin is 30
     base_commit = env.get_base_commit()
     source_code = str(
         llvm_helper.git_execute(["show", f"{base_commit}:{bug_file}"])
@@ -696,35 +925,97 @@ def fix_issue(issue_id):
             
     # Some case can pass check fast directly, these test cases are skipped.
     assert not res, "Could pass check fast directly without fix."
-    # desc += "Detailed information:\n"
-    # desc += normalize_feedback(log) + "\n"
-    file, hunk = get_hunk_short(env)
-    desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
-    # desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
-    #     \n```cpp\n{hunk}\n```\n"
-    prefix = "\n".join(hunk.splitlines()[:5])
-    suffix = "\n".join(hunk.splitlines()[-5:])
-    context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
-    desc += format_requirement + context_requirement
-    append_message(messages, full_messages, {"role": "user", "content": desc})
-    # try:
-    for idx in range(max_sample_count):
-        print(f"Round {idx + 1}")
-        if issue_fixing_iter(
-            env, file, hunk, messages, full_messages, context_requirement
-        ):
-            cert = env.dump(normalize_messages(full_messages))
-            # print(cert)
-            with open(fix_log_path, "w") as f:
-                f.write(json.dumps(cert, indent=2))
-            return
-    print(messages)
-    # except Exception as e:
-    #     # import traceback
-    #     # print("⚠️ An exception occurred:")
-    #     # traceback.print_exc()  
-    #     pass
+    
+    # Get functions to try from JSON
+    functions_to_try = get_functions_to_try(issue_id)
+    
+    # If no functions found in JSON, fall back to original method
+    if not functions_to_try:
+        # desc += "Detailed information:\n"
+        # desc += normalize_feedback(log) + "\n"
+        file, hunk = get_hunk_short(env)
+        desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+        # desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
+        #     \n```cpp\n{hunk}\n```\n"
+        prefix = "\n".join(hunk.splitlines()[:5])
+        suffix = "\n".join(hunk.splitlines()[-5:])
+        context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
+        desc += format_requirement + context_requirement
+        append_message(messages, full_messages, {"role": "user", "content": desc})
+        # try:
+        for idx in range(max_sample_count):
+            print(f"Round {idx + 1}")
+            if issue_fixing_iter(
+                env, file, hunk, messages, full_messages, context_requirement
+            ):
+                cert = env.dump(normalize_messages(full_messages))
+                # print(cert)
+                with open(fix_log_path, "w") as f:
+                    f.write(json.dumps(cert, indent=2))
+                return
+        print(messages)
+        # except Exception as e:
+        #     # import traceback
+        #     # print("⚠️ An exception occurred:")
+        #     # traceback.print_exc()  
+        #     pass
 
+        cert = env.dump(normalize_messages(full_messages))
+        with open(fix_log_path, "w") as f:
+            f.write(json.dumps(cert, indent=2))
+        return
+    
+    # Try each function separately
+    for func_idx, (file_path, func_name) in enumerate(functions_to_try):
+        print(f"\nTrying function {func_idx + 1}/{len(functions_to_try)}: {func_name} in {file_path}")
+        
+        # Reset environment and messages for each function
+        env.reset()
+        # Restore build cache for each function attempt
+        if os.path.exists(llvm_build_cache_dir):
+            shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
+            shutil.copytree(llvm_build_cache_dir, llvm_helper.llvm_build_dir)
+        
+        messages = []
+        full_messages = []
+        append_message(
+            messages, full_messages, {"role": "system", "content": get_system_prompt()}
+        )
+        
+        # Get function hunk
+        result = get_hunk_from_func(env, file_path, func_name)
+        if not result:
+            print(f"Warning: Cannot extract function {func_name} from {file_path}, skipping")
+            continue
+        
+        file, hunk = result
+        
+        # Build description for this function
+        func_desc = f"This is a {bug_type} in {component}.\n"
+        func_desc += issue_desc
+        func_desc += f"Please modify the following code in {file}:{func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+        prefix = "\n".join(hunk.splitlines()[:5])
+        suffix = "\n".join(hunk.splitlines()[-5:])
+        context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
+        func_desc += format_requirement + context_requirement
+        append_message(messages, full_messages, {"role": "user", "content": func_desc})
+        
+        # Try to fix with this function
+        for idx in range(max_sample_count):
+            print(f"Round {idx + 1}")
+            if issue_fixing_iter(
+                env, file, hunk, messages, full_messages, context_requirement
+            ):
+                # Check if the fix passes both fast_check and full_check
+                cert = env.dump(normalize_messages(full_messages))
+                with open(fix_log_path, "w") as f:
+                    f.write(json.dumps(cert, indent=2))
+                print(f"Successfully fixed with function {func_name} in {file_path}")
+                return
+        
+        print(f"Failed to fix with function {func_name} in {file_path}")
+    
+    # If all functions failed, save the last attempt
     cert = env.dump(normalize_messages(full_messages))
     with open(fix_log_path, "w") as f:
         f.write(json.dumps(cert, indent=2))

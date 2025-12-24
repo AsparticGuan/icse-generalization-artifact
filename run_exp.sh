@@ -8,8 +8,14 @@
 #     ./examples/baseline.py "$id" > "log/output-qwen3-cot-iter4-${id}.log" 2>&1
 # done
 
-for f in dataset/*.json; do
-    id=$(basename "$f" .json)
+# for f in dataset/*.json; do
+#     id=$(basename "$f" .json)
+#     echo "Running task $id ..."
+#     ./examples/baseline.py "$id" > "log/output-qwen3-cot-iter4-${id}.log" 2>&1
+# done
+
+
+for id in 84608 86417 121775 121771 94170 121773 142711 108052 143529 118211 118155 104567; do
     echo "Running task $id ..."
-    ./examples/baseline.py "$id" > "log/output-gemini-3-cot-iter4-${id}.log" 2>&1
+    ./examples/single-func.py "$id" > "log/output-qwen3-cot-iter4-${id}.log" 2>&1
 done

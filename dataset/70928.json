@@ -1,0 +1,179 @@
+{
+  "bug_id": "70928",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/70928",
+  "bug_type": "missed-optimization",
+  "base_commit": "422b67aaab1a49cc42f2186069a1e7c548d57858",
+  "knowledge_cutoff": "2023-11-01T12:09:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "0d454d6e591a579f450093c4ba8c49675e1643ad",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        [
+          3956,
+          3990
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        "InstCombinerImpl::foldXorOfICmps"
+      ]
+    }
+  },
+  "patch": "commit 0d454d6e591a579f450093c4ba8c49675e1643ad\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Dec 25 07:14:31 2023 +0800\n\n    [InstCombine] Fold xor of icmps using range information (#76334)\n    \n    This patch folds xor of icmps into a single comparison using range-based reasoning as `foldAndOrOfICmpsUsingRanges` does.\n    Fixes #70928.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 5e362f4117d0..63b1e0f64a88 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -3956,35 +3956,50 @@ Value *InstCombinerImpl::foldXorOfICmps(ICmpInst *LHS, ICmpInst *RHS,\n   const APInt *LC, *RC;\n   if (match(LHS1, m_APInt(LC)) && match(RHS1, m_APInt(RC)) &&\n       LHS0->getType() == RHS0->getType() &&\n-      LHS0->getType()->isIntOrIntVectorTy() &&\n-      (LHS->hasOneUse() || RHS->hasOneUse())) {\n+      LHS0->getType()->isIntOrIntVectorTy()) {\n     // Convert xor of signbit tests to signbit test of xor'd values:\n     // (X > -1) ^ (Y > -1) --> (X ^ Y) < 0\n     // (X <  0) ^ (Y <  0) --> (X ^ Y) < 0\n     // (X > -1) ^ (Y <  0) --> (X ^ Y) > -1\n     // (X <  0) ^ (Y > -1) --> (X ^ Y) > -1\n     bool TrueIfSignedL, TrueIfSignedR;\n-    if (isSignBitCheck(PredL, *LC, TrueIfSignedL) &&\n+    if ((LHS->hasOneUse() || RHS->hasOneUse()) &&\n+        isSignBitCheck(PredL, *LC, TrueIfSignedL) &&\n         isSignBitCheck(PredR, *RC, TrueIfSignedR)) {\n       Value *XorLR = Builder.CreateXor(LHS0, RHS0);\n       return TrueIfSignedL == TrueIfSignedR ? Builder.CreateIsNeg(XorLR) :\n                                               Builder.CreateIsNotNeg(XorLR);\n     }\n \n-    // (X > C) ^ (X < C + 2) --> X != C + 1\n-    // (X < C + 2) ^ (X > C) --> X != C + 1\n-    // Considering the correctness of this pattern, we should avoid that C is\n-    // non-negative and C + 2 is negative, although it will be matched by other\n-    // patterns.\n-    const APInt *C1, *C2;\n-    if ((PredL == CmpInst::ICMP_SGT && match(LHS1, m_APInt(C1)) &&\n-         PredR == CmpInst::ICMP_SLT && match(RHS1, m_APInt(C2))) ||\n-        (PredL == CmpInst::ICMP_SLT && match(LHS1, m_APInt(C2)) &&\n-         PredR == CmpInst::ICMP_SGT && match(RHS1, m_APInt(C1))))\n-      if (LHS0 == RHS0 && *C1 + 2 == *C2 &&\n-          (C1->isNegative() || C2->isNonNegative()))\n-        return Builder.CreateICmpNE(LHS0,\n-                                    ConstantInt::get(LHS0->getType(), *C1 + 1));\n+    // Fold (icmp pred1 X, C1) ^ (icmp pred2 X, C2)\n+    // into a single comparison using range-based reasoning.\n+    if (LHS0 == RHS0) {\n+      ConstantRange CR1 = ConstantRange::makeExactICmpRegion(PredL, *LC);\n+      ConstantRange CR2 = ConstantRange::makeExactICmpRegion(PredR, *RC);\n+      auto CRUnion = CR1.exactUnionWith(CR2);\n+      auto CRIntersect = CR1.exactIntersectWith(CR2);\n+      if (CRUnion && CRIntersect)\n+        if (auto CR = CRUnion->exactIntersectWith(CRIntersect->inverse())) {\n+          if (CR->isFullSet())\n+            return ConstantInt::getTrue(I.getType());\n+          if (CR->isEmptySet())\n+            return ConstantInt::getFalse(I.getType());\n+\n+          CmpInst::Predicate NewPred;\n+          APInt NewC, Offset;\n+          CR->getEquivalentICmp(NewPred, NewC, Offset);\n+\n+          if ((Offset.isZero() && (LHS->hasOneUse() || RHS->hasOneUse())) ||\n+              (LHS->hasOneUse() && RHS->hasOneUse())) {\n+            Value *NewV = LHS0;\n+            Type *Ty = LHS0->getType();\n+            if (!Offset.isZero())\n+              NewV = Builder.CreateAdd(NewV, ConstantInt::get(Ty, Offset));\n+            return Builder.CreateICmp(NewPred, NewV,\n+                                      ConstantInt::get(Ty, NewC));\n+          }\n+        }\n+    }\n   }\n \n   // Instead of trying to imitate the folds for and/or, decompose this 'xor'\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_slt_0_xor_icmp_sge_neg2_i32_fail",
+          "test_body": "define i32 @icmp_slt_0_xor_icmp_sge_neg2_i32_fail(i32 %x) {\n; CHECK-LABEL: @icmp_slt_0_xor_icmp_sge_neg2_i32_fail(\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp ult i32 [[X:%.*]], -2\n; CHECK-NEXT:    [[D:%.*]] = zext i1 [[TMP1]] to i32\n; CHECK-NEXT:    ret i32 [[D]]\n  %A = icmp sge i32 %x, -2\n  %B = zext i1 %A to i32\n  %C = lshr i32 %x, 31\n  %D = xor i32 %C, %B\n  ret i32 %D\n}",
+          "source_program": "define i32 @icmp_slt_0_xor_icmp_sge_neg2_i32_fail(i32 %x) {\n  %A = icmp sge i32 %x, -2\n  %B = zext i1 %A to i32\n  %C = lshr i32 %x, 31\n  %D = xor i32 %C, %B\n  ret i32 %D\n}\n",
+          "current_optimized_program": "define i32 @icmp_slt_0_xor_icmp_sge_neg2_i32_fail(i32 %x) {\n  %A = icmp sgt i32 %x, -3\n  %1 = icmp slt i32 %x, 0\n  %2 = xor i1 %1, %A\n  %D = zext i1 %2 to i32\n  ret i32 %D\n}\n",
+          "expect_optimized_program": "define i32 @icmp_slt_0_xor_icmp_sge_neg2_i32_fail(i32 %x) {\n  %1 = icmp ult i32 %x, -2\n  %D = zext i1 %1 to i32\n  ret i32 %D\n}\n"
+        },
+        {
+          "test_name": "icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail",
+          "test_body": "define i32 @icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail(i32 %x, i32 %y) {\n; CHECK-LABEL: @icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail(\n; CHECK-NEXT:    [[A:%.*]] = icmp sgt i32 [[X:%.*]], -1\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp slt i32 [[Y:%.*]], 0\n; CHECK-NEXT:    [[TMP2:%.*]] = and i1 [[TMP1]], [[A]]\n; CHECK-NEXT:    [[D:%.*]] = zext i1 [[TMP2]] to i32\n; CHECK-NEXT:    ret i32 [[D]]\n  %A = icmp sgt i32 %x, -1\n  %B = zext i1 %A to i32\n  %C = lshr i32 %y, 31\n  %D = and i32 %C, %B\n  ret i32 %D\n}",
+          "source_program": "define i32 @icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail(i32 %x, i32 %y) {\n  %A = icmp sgt i32 %x, -1\n  %B = zext i1 %A to i32\n  %C = lshr i32 %y, 31\n  %D = and i32 %C, %B\n  ret i32 %D\n}\n",
+          "current_optimized_program": "define i32 @icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail(i32 %x, i32 %y) {\n  %A = icmp sgt i32 %x, -1\n  %1 = icmp slt i32 %y, 0\n  %2 = and i1 %1, %A\n  %D = zext i1 %2 to i32\n  ret i32 %D\n}\n",
+          "expect_optimized_program": "define i32 @icmp_x_slt_0_and_icmp_y_sgt_neg1_i32_fail(i32 %x, i32 %y) {\n  %A = icmp sgt i32 %x, -1\n  %1 = icmp slt i32 %y, 0\n  %2 = and i1 %1, %A\n  %D = zext i1 %2 to i32\n  ret i32 %D\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/xor-icmps.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "xor_icmp_true_signed",
+          "test_body": "define i1 @xor_icmp_true_signed(i32 %a) {\n; CHECK-LABEL: @xor_icmp_true_signed(\n; CHECK-NEXT:    ret i1 true\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "define i1 @xor_icmp_true_signed(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_true_signed(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_true_signed(i32 %a) {\n  ret i1 true\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_icmp_add",
+          "test_body": "define i1 @xor_icmp_to_icmp_add(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_icmp_add(\n; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[A:%.*]], -6\n; CHECK-NEXT:    [[CMP3:%.*]] = icmp ult i32 [[TMP1]], -2\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 3\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "define i1 @xor_icmp_to_icmp_add(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_to_icmp_add(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_to_icmp_add(i32 %a) {\n  %1 = add i32 %a, -6\n  %cmp3 = icmp ult i32 %1, -2\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_ne_multiuse2",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse2(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_ne_multiuse2(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 4\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i32 [[A]], 6\n; CHECK-NEXT:    call void @use(i1 [[CMP1]])\n; CHECK-NEXT:    [[CMP3:%.*]] = xor i1 [[CMP]], [[CMP1]]\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_true_signed_multiuse1",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse1(i32 %a) {\n; CHECK-LABEL: @xor_icmp_true_signed_multiuse1(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 5\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    ret i1 true\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  ret i1 true\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_true_signed_commuted",
+          "test_body": "define i1 @xor_icmp_true_signed_commuted(i32 %a) {\n; CHECK-LABEL: @xor_icmp_true_signed_commuted(\n; CHECK-NEXT:    ret i1 true\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp1, %cmp\n  ret i1 %cmp3\n}",
+          "source_program": "define i1 @xor_icmp_true_signed_commuted(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp1, %cmp\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_true_signed_commuted(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp1, %cmp\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_true_signed_commuted(i32 %a) {\n  ret i1 true\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_ptr",
+          "test_body": "define i1 @xor_icmp_ptr(ptr %c, ptr %d) {\n; CHECK-LABEL: @xor_icmp_ptr(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt ptr [[C:%.*]], null\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt ptr [[D:%.*]], null\n; CHECK-NEXT:    [[XOR:%.*]] = xor i1 [[CMP]], [[CMP1]]\n; CHECK-NEXT:    ret i1 [[XOR]]\n  %cmp = icmp slt ptr %c, null\n  %cmp1 = icmp slt ptr %d, null\n  %xor = xor i1 %cmp, %cmp1\n  ret i1 %xor\n}",
+          "source_program": "define i1 @xor_icmp_ptr(ptr %c, ptr %d) {\n  %cmp = icmp slt ptr %c, null\n  %cmp1 = icmp slt ptr %d, null\n  %xor = xor i1 %cmp, %cmp1\n  ret i1 %xor\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_ptr(ptr %c, ptr %d) {\n  %cmp = icmp slt ptr %c, null\n  %cmp1 = icmp slt ptr %d, null\n  %xor = xor i1 %cmp, %cmp1\n  ret i1 %xor\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_ptr(ptr %c, ptr %d) {\n  %cmp = icmp slt ptr %c, null\n  %cmp1 = icmp slt ptr %d, null\n  %xor = xor i1 %cmp, %cmp1\n  ret i1 %xor\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_true_unsigned",
+          "test_body": "define i1 @xor_icmp_true_unsigned(i32 %a) {\n; CHECK-LABEL: @xor_icmp_true_unsigned(\n; CHECK-NEXT:    ret i1 true\n  %cmp = icmp ugt i32 %a, 5\n  %cmp1 = icmp ult i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "define i1 @xor_icmp_true_unsigned(i32 %a) {\n  %cmp = icmp ugt i32 %a, 5\n  %cmp1 = icmp ult i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_true_unsigned(i32 %a) {\n  %cmp = icmp ugt i32 %a, 5\n  %cmp1 = icmp ult i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_true_unsigned(i32 %a) {\n  ret i1 true\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_ne_multiuse1",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse1(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_ne_multiuse1(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 4\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    [[CMP3:%.*]] = icmp ne i32 [[A]], 5\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp3 = icmp ne i32 %a, 5\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_ne_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  call void @use(i1 %cmp)\n  %cmp3 = icmp ne i32 %a, 5\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_ne",
+          "test_body": "define i1 @xor_icmp_to_ne(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_ne(\n; CHECK-NEXT:    [[CMP3:%.*]] = icmp ne i32 [[A:%.*]], 5\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 4\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "define i1 @xor_icmp_to_ne(i32 %a) {\n  %cmp = icmp sgt i32 %a, 4\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_to_ne(i32 %a) {\n  %cmp3 = icmp ne i32 %a, 5\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_to_ne(i32 %a) {\n  %cmp3 = icmp ne i32 %a, 5\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_icmp_add_multiuse1",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse1(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_icmp_add_multiuse1(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 3\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i32 [[A]], 6\n; CHECK-NEXT:    [[CMP3:%.*]] = xor i1 [[CMP]], [[CMP1]]\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse1(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_to_icmp_add_multiuse2",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse2(i32 %a) {\n; CHECK-LABEL: @xor_icmp_to_icmp_add_multiuse2(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 3\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i32 [[A]], 6\n; CHECK-NEXT:    call void @use(i1 [[CMP1]])\n; CHECK-NEXT:    [[CMP3:%.*]] = xor i1 [[CMP]], [[CMP1]]\n; CHECK-NEXT:    ret i1 [[CMP3]]\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_to_icmp_add_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 3\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_true_signed_multiuse2",
+          "test_body": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse2(i32 %a) {\n; CHECK-LABEL: @xor_icmp_true_signed_multiuse2(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A:%.*]], 5\n; CHECK-NEXT:    call void @use(i1 [[CMP]])\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i32 [[A]], 6\n; CHECK-NEXT:    call void @use(i1 [[CMP1]])\n; CHECK-NEXT:    ret i1 true\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}",
+          "source_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "current_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  %cmp3 = xor i1 %cmp, %cmp1\n  ret i1 %cmp3\n}\n",
+          "expect_optimized_program": "declare void @use(i1)\n\ndefine i1 @xor_icmp_true_signed_multiuse2(i32 %a) {\n  %cmp = icmp sgt i32 %a, 5\n  call void @use(i1 %cmp)\n  %cmp1 = icmp slt i32 %a, 6\n  call void @use(i1 %cmp1)\n  ret i1 true\n}\n"
+        },
+        {
+          "test_name": "xor_icmp_invalid_range",
+          "test_body": "define i1 @xor_icmp_invalid_range(i8 %x0) {\n; CHECK-LABEL: @xor_icmp_invalid_range(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[X0:%.*]], -5\n; CHECK-NEXT:    [[OR_COND:%.*]] = icmp ne i8 [[TMP1]], 0\n; CHECK-NEXT:    ret i1 [[OR_COND]]\n  %cmp = icmp eq i8 %x0, 0\n  %cmp4 = icmp ne i8 %x0, 4\n  %or.cond = xor i1 %cmp, %cmp4\n  ret i1 %or.cond\n}",
+          "source_program": "define i1 @xor_icmp_invalid_range(i8 %x0) {\n  %cmp = icmp eq i8 %x0, 0\n  %cmp4 = icmp ne i8 %x0, 4\n  %or.cond = xor i1 %cmp, %cmp4\n  ret i1 %or.cond\n}\n",
+          "current_optimized_program": "define i1 @xor_icmp_invalid_range(i8 %x0) {\n  %1 = and i8 %x0, -5\n  %or.cond = icmp ne i8 %1, 0\n  ret i1 %or.cond\n}\n",
+          "expect_optimized_program": "define i1 @xor_icmp_invalid_range(i8 %x0) {\n  %1 = and i8 %x0, -5\n  %or.cond = icmp ne i8 %1, 0\n  ret i1 %or.cond\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "clang cannot simplify `(a gt/lt b) != (a le/ge b)` where b is a specific constant",
+    "body": "Example:\r\nhttps://godbolt.org/z/7PMr8vc98\r\n```cpp\r\nbool foo(int a)\r\n{\r\n   return (a > 5) != (a <= 5);\r\n}\r\n\r\nbool bar(int a)\r\n{\r\n   return (a < 5) != (a >= 5);\r\n}\r\n```\r\n\r\n\r\nWhen checking this simplification with alive2, is it okay to try to represent an integer that is 1 greater than or 1 less than a certain integer using `add` or `sub` as follows?\r\nhttps://alive2.llvm.org/ce/z/iddeDw",
+    "author": "k-arrows",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "I guess https://github.com/llvm/llvm-project/pull/69840 may help. I will take a look later."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}
