@@ -348,9 +348,10 @@ for file in test_patchset:
     for test_name in test_names:
         try:
             test_body_extract = subprocess.check_output(
-                ["llvm-extract", f"--func={test_name}", "-S", "-"],
+                ["llvm-extract-18", f"--func={test_name}", "-S", "-"],
                 input=test_file.encode(),
             ).decode()
+            print(test_body_extract)
             test_body_extract = test_body_extract.removeprefix(
                 "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n"
             ).removeprefix("\n")

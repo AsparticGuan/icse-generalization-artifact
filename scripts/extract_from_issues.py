@@ -33,8 +33,8 @@ session.headers.update(
     }
 )
 
-issue_id_begin = 10000  # 76663 Since 2024-01-01
-issue_id_end = 76662
+issue_id_begin = 55739  # 76663 Since 2024-01-01
+issue_id_end = 55739
 
 
 def wait(progress):
