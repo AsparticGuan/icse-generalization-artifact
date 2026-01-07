@@ -38,7 +38,7 @@ if DEBUG:
 token = os.environ["LAB_LLM_TOKEN"]
 url = os.environ.get("LAB_LLM_URL", "https://api.deepseek.com")
 model = os.environ.get("LAB_LLM_MODEL", "deepseek-reasoner")
-basemodel_cutoff = os.environ.get("LAB_LLM_BASEMODEL_CUTOFF", "2023-12-31Z")
+basemodel_cutoff = os.environ.get("LAB_LLM_BASEMODEL_CUTOFF", "1970-12-31Z")
 client = OpenAI(api_key=token, base_url=url)
 temperature = float(os.environ.get("LAB_LLM_TEMP", "0.8"))
 # Seems not working, sad :(

@@ -1,32 +1,18 @@
 #!/usr/bin/env python3
-# Copyright 2025 Yingwei Zheng
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import sys
 import os
 import json
 import re
 import string
-from unidiff import PatchSet
 import tarfile
 from pathlib import Path
 
 sys.path.append(os.path.join(os.path.dirname(os.environ["LAB_DATASET_DIR"]), "scripts"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import shutil
-import llvm_helper
-from lab_env import Environment as Env
+import llvm_helper # pyright: ignore[reportMissingImports]  # noqa: E402
+from lab_env import Environment as Env # pyright: ignore[reportMissingImports]  # noqa: E402
 from openai import OpenAI
 from openai import NOT_GIVEN
 
@@ -50,7 +36,7 @@ if DEBUG:
 token = os.environ["LAB_LLM_TOKEN"]
 url = os.environ.get("LAB_LLM_URL", "https://api.deepseek.com")
 model = os.environ.get("LAB_LLM_MODEL", "deepseek-reasoner")
-basemodel_cutoff = os.environ.get("LAB_LLM_BASEMODEL_CUTOFF", "2023-12-31Z")
+basemodel_cutoff = os.environ.get("LAB_LLM_BASEMODEL_CUTOFF", "1970-12-31Z")
 client = OpenAI(api_key=token, base_url=url)
 temperature = float(os.environ.get("LAB_LLM_TEMP", "0.8"))
 # Seems not working, sad :(
@@ -59,7 +45,6 @@ enable_streaming = os.environ.get("LAB_LLM_ENABLE_STREAMING", "OFF") == "ON"
 max_log_size = int(os.environ.get("LAB_LLM_MAX_LOG_SIZE", 1000000000))
 max_sample_count = int(os.environ.get("LAB_LLM_MAX_SAMPLE_COUNT", 4))
 omit_issue_body = os.environ.get("LAB_LLM_OMIT_ISSUE_BODY", "ON") == "ON"
-use_bisection = os.environ.get("LAB_USE_BISECTION", "ON") == "ON"
 max_build_jobs = int(os.environ.get("LAB_MAX_BUILD_JOBS", os.cpu_count()))
 fix_dir = os.environ["LAB_FIX_DIR"]
 os.makedirs(fix_dir, exist_ok=True)
@@ -402,26 +387,6 @@ You are adding new code or modifying existing code to implement the missing opti
         + get_tooling_prompt()
     )
 
-
-def get_hunk(env: Env) -> str:
-    lineno = env.get_hint_line_level_bug_locations()
-    bug_file = next(iter(lineno.keys()))
-    bug_hunks = next(iter(lineno.values()))
-    min_lineno = 1e9
-    max_lineno = 0
-    for range in bug_hunks:
-        min_lineno = min(min_lineno, range[0])
-        max_lineno = max(max_lineno, range[1])
-    margin = 30
-    base_commit = env.get_base_commit()
-    source_code = str(
-        llvm_helper.git_execute(["show", f"{base_commit}:{bug_file}"])
-    ).splitlines()
-    min_lineno = max(min_lineno - margin, 1)
-    max_lineno = min(max_lineno + margin, len(source_code))
-    hunk = "\n".join(source_code[min_lineno - 1 : max_lineno])
-    return bug_file, hunk
-
 def traverse_tree(tree: Tree):
     """Traverse all nodes in the syntax tree"""
     cursor = tree.walk()
@@ -512,10 +477,151 @@ def extract_function_content(file_path: str, func_name: str, source_code: str) -
     return None
 
 
+def _extract_json_obj(text: str) -> dict | None:
+    """Best-effort: extract the first JSON object from LLM output."""
+    if not isinstance(text, str):
+        return None
+    # Try strict parse first.
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Fallback: find the first {...} region.
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _fallback_truncate_hunk(hunk: str, *, keep_last_lines: int = 200) -> str:
+    if not isinstance(hunk, str):
+        return hunk
+    lines = hunk.splitlines()
+    keep_last_lines = min(max(1, keep_last_lines), len(lines))
+    return "\n".join(lines[-keep_last_lines:])
+
+
+def _strip_optional_lineno_prefix(line: str) -> str:
+    # Accept formats like "  123: code" or "123:code"
+    m = re.match(r"^\s*\d+\s*:\s?(.*)$", line)
+    if m:
+        return m.group(1)
+    return line
+
+
+def _find_contiguous_subsequence(haystack: list[str], needle: list[str]) -> tuple[int, int] | None:
+    """Return (start_idx, end_idx_exclusive) if needle matches a contiguous region of haystack."""
+    if not needle:
+        return None
+    n = len(needle)
+    if n > len(haystack):
+        return None
+    # Compare using rstrip() to tolerate trailing spaces.
+    hs = [x.rstrip() for x in haystack]
+    nd = [x.rstrip() for x in needle]
+    first = nd[0]
+    for i in range(0, len(hs) - n + 1):
+        if hs[i] != first:
+            continue
+        if hs[i : i + n] == nd:
+            return i, i + n
+    return None
+
+
+def truncate_hunk(
+    env: Env,
+    hunk: str,
+    *,
+    file_path: str | None = None,
+    func_name: str | None = None,
+    max_lines: int = 500,
+    window_lines: int = 200,
+    keep_last_lines: int = 200,
+) -> str:
+    if not isinstance(hunk, str):
+        return hunk
+    lines = hunk.splitlines()
+    if len(lines) <= max_lines:
+        return hunk
+
+    numbered = "\n".join(f"{i+1:5d}: {ln}" for i, ln in enumerate(lines))
+    issue_desc = ""
+    try:
+        issue_desc = get_issue_desc(env)
+    except Exception:
+        issue_desc = ""
+
+    meta = []
+    if file_path:
+        meta.append(f"file: {file_path}")
+    if func_name:
+        meta.append(f"function: {func_name}")
+    meta_s = ("\n".join(meta) + "\n") if meta else ""
+
+    system = (
+        "You are an expert LLVM engineer and code localizer.\n"
+        "Given an LLVM optimization bug report and a C++ function body, pick the smallest contiguous region "
+        "that is most likely to require modification to fix the issue.\n"
+        "Do NOT propose a patch. Do NOT call any tools.\n"
+        "You MUST output only the truncated hunk text (no Markdown, no code fences, no JSON).\n"
+        "The output must be a contiguous excerpt copied verbatim from the given hunk.\n"
+        f"Keep it within {window_lines} lines.\n"
+    )
+    user = (
+        f"{issue_desc}"
+        f"{meta_s}"
+        "Below is the FULL hunk with line numbers.\n"
+        "Return ONLY the truncated hunk text (without the line numbers), as a contiguous excerpt.\n"
+        "Do not add, rewrite, or summarize any lines; copy the exact lines from the hunk.\n"
+        "\n"
+        f"{numbered}\n"
+    )
+
+    messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    full_messages: list[dict] = []
+    try:
+        reply = chat(env, messages, full_messages)
+        # Be tolerant: some models may wrap with ``` or keep the "NNN:" prefixes.
+        picked = extract_code_from_reply(reply).strip()
+        if not picked:
+            return _fallback_truncate_hunk(hunk, keep_last_lines=keep_last_lines)
+    except Exception:
+        return _fallback_truncate_hunk(hunk, keep_last_lines=keep_last_lines)
+
+    # Normalize reply: drop optional "NNN:" prefixes, and enforce line budget.
+    picked_lines = [_strip_optional_lineno_prefix(x) for x in picked.splitlines()]
+    picked_lines = [x.rstrip("\n") for x in picked_lines]
+    while picked_lines and picked_lines[0].strip() == "":
+        picked_lines.pop(0)
+    while picked_lines and picked_lines[-1].strip() == "":
+        picked_lines.pop()
+    if not picked_lines:
+        return _fallback_truncate_hunk(hunk, keep_last_lines=keep_last_lines)
+
+    n = len(lines)
+    if window_lines is None or window_lines <= 0:
+        window_lines = keep_last_lines
+    window_lines = min(window_lines, n)
+    if len(picked_lines) > window_lines:
+        picked_lines = picked_lines[:window_lines]
+
+    match = _find_contiguous_subsequence(lines, picked_lines)
+    if not match:
+        return _fallback_truncate_hunk(hunk, keep_last_lines=keep_last_lines)
+    start_idx, end_idx = match
+    return "\n".join(lines[start_idx:end_idx])
+
+
 def load_func_info_from_json(issue_id: str, json_path: str = None) -> tuple[dict, list, str | None]:
-    """Load pred_funcs, gold_funcs, and gold_file from test-func-filecontent.json"""
+    """Load pred_funcs, gold_funcs, and gold_file from pipeline/localize-result.json"""
     if json_path is None:
-        json_path = os.path.join(os.path.dirname(__file__), "..", "test-func-filecontent.json")
+        json_path = os.path.join(os.path.dirname(__file__), "localize-result.json")
     
     if not os.path.exists(json_path):
         return {}, [], None
@@ -538,7 +644,7 @@ def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, s
     """Extract function content as hunk from specified file and function name"""
     base_commit = env.get_base_commit()
     llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
-    
+
     # Read file content from git
     try:
         if file_path.startswith("llvm/"):
@@ -555,12 +661,12 @@ def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, s
     except Exception as e:
         print(f"Warning: Cannot read file {file_path}: {e}, skipping")
         return None
-    
+
     # Extract function content using tree-sitter
     func_content = extract_function_content(file_path, func_name, source_code)
     if func_content:
-        return file_path, func_content
-    
+        return file_path, truncate_hunk(env, func_content, file_path=file_path, func_name=func_name)
+
     # Fallback: try to find function by name using regex (less accurate)
     lines = source_code.splitlines()
     for i, line in enumerate(lines):
@@ -578,14 +684,12 @@ def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, s
                     break
             if end > i + 1:
                 func_content = "\n".join(lines[start:end])
-                return file_path, func_content
-    
+                return file_path, truncate_hunk(env, func_content, file_path=file_path, func_name=func_name)
     return None
 
 
 def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
-    """Get list of (file_path, func_name) tuples to try from test-func-filecontent.json"""
-    # Load function information from JSON
+    """Get list of (file_path, func_name) tuples to try from pipeline/localize-result.json"""
     pred_funcs, gold_funcs, gold_file = load_func_info_from_json(issue_id)
     
     # If no pred_funcs found, return empty list (will fall back to original method)
@@ -636,32 +740,6 @@ def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
             functions_to_try.append((full_path or pred_file, pred_func))
     
     return functions_to_try
-
-
-def get_hunk_short(env: Env) -> tuple[str, str]:
-    """Get hunk using original method (fallback)"""
-    lineno = env.get_hint_line_level_bug_locations()
-    bug_file = next(iter(lineno.keys()))
-    bug_hunks = next(iter(lineno.values()))
-    min_lineno = 1e9
-    max_lineno = 0
-    max_range = 0
-    for range in bug_hunks:
-        # for multiple hunks, we select the longest one
-        if range[1] - range[0] > max_range:
-            min_lineno = range[0]
-            max_lineno = range[1]
-            max_range = range[1] - range[0]
-    margin = 10  # before 11.04, margin is 30
-    base_commit = env.get_base_commit()
-    source_code = str(
-        llvm_helper.git_execute(["show", f"{base_commit}:{bug_file}"])
-    ).splitlines()
-    min_lineno = max(min_lineno - margin, 1)
-    max_lineno = min(max_lineno + margin, len(source_code))
-    hunk = "\n".join(source_code[min_lineno - 1 : max_lineno])
-    return bug_file, hunk
-
 
 def extract_code_from_reply(tgt: str):
     # if tgt.startswith("```"):
@@ -757,6 +835,72 @@ def normalize_feedback_with_build_failure(log) -> str:
         return str(log_str) or "No LLVM errors found."
     return json.dumps(llvm_helper.get_first_failed_test(log), indent=2)
 
+def truncate_text(text: str, *, max_chars: int = 8000) -> str:
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n<Truncated>..."
+
+
+def get_alive2_log(test_log: dict) -> str | None:
+    try:
+        a2 = test_log.get("log", {}).get("alive2", {})
+        a2log = a2.get("log", None)
+        if isinstance(a2log, str) and a2log.strip():
+            return a2log
+    except Exception:
+        pass
+    return None
+
+
+def alive2_log_looks_success(alive2_log: str) -> bool:
+    """Heuristic: treat Alive2 as success if it reports 0 incorrect/failed-to-prove/errors."""
+    if not isinstance(alive2_log, str):
+        return False
+    s = alive2_log
+    # Typical success strings:
+    # - "Transformation seems to be correct!"
+    # - "Transformation seems to be correct! (syntactically equal)"
+    # - Summary with 0 incorrect / 0 failed-to-prove / 0 errors
+    return (
+        ("Summary:" in s)
+        and ("0 incorrect transformations" in s)
+        and ("0 failed-to-prove transformations" in s)
+        and ("0 Alive2 errors" in s)
+        and ("Transformation seems to be correct" in s)
+    )
+
+
+def test_is_successfully_optimized(test_log: dict) -> bool:
+    """Prefer verifier result / IR equality over cost heuristics.
+
+    We observed cases where FileCheck fails (IR != expected) but cost looks
+    "good", which previously caused us to incorrectly mark a test as
+    successful and skip adding it to the next prompt.
+    """
+    if isinstance(test_log, dict):
+        r = test_log.get("result", None)
+        if isinstance(r, bool):
+            return r
+        try:
+            cur = test_log.get("log", {}).get("current_optimized_program", None)
+            exp = test_log.get("log", {}).get("expect_optimized_program", None)
+            if isinstance(cur, str) and isinstance(exp, str):
+                return cur.strip() == exp.strip()
+        except Exception:
+            pass
+        try:
+            cost = test_log.get("log", {}).get("cost", {})
+            curc = cost.get("current_optimized_program", None)
+            srcc = cost.get("source_program", None)
+            expc = cost.get("expect_optimized_program", None)
+            if all(isinstance(x, (int, float)) for x in [curc, srcc, expc]):
+                return (curc < srcc) or (curc <= expc)
+        except Exception:
+            pass
+    return False
+
 def issue_fixing_iter(
     env: Env, file, src, messages, full_messages, context_requirement
 ):
@@ -786,10 +930,19 @@ def issue_fixing_iter(
             for test_log in log:
                 if test_log["name"] == test_name:
                     # print("[TEST LOG1]", test_log)   
-                    test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
-                    test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
-                    test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
-                    break
+                    try:
+                        test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
+                        test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
+                        test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
+                        break
+                    except Exception as e:
+                        print(f"Error updating cost of test {test_name}: {e}")
+                        print(f"Test log: {test_log}")
+                        print(f"Test log cost: {test_log['log']['cost']}")
+                        print(f"Test log cost source program: {test_log['log']['cost']['source_program']}")
+                        print(f"Test log cost expect optimized program: {test_log['log']['cost']['expect_optimized_program']}")
+                        print(f"Test log cost current optimized program: {test_log['log']['cost']['current_optimized_program']}")
+                        continue
         # then, check if the optimization was successful
         feedback = ""
         prompted_test_fail_count = 0
@@ -801,14 +954,19 @@ def issue_fixing_iter(
                     test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
                     test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
                     test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
-                    if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or \
-                        test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
-                            feedback += f"The previous test program `@{test_name}` was successfully optimized.\n"
+                    if test_is_successfully_optimized(test_log):
+                        feedback += f"The previous test program `@{test_name}` was successfully optimized.\n"
                     else:
                         prompted_test_fail_count += 1
                         feedback += f"The previous test program `@{test_name}` was not successfully optimized.\n"
                         feedback += f"The previous test program is:\n```llvm\n{test_log['log']['source_program']}\n```\n"
                         feedback += f"The expected optimized program is:\n```llvm\n{test_log['log']['expect_optimized_program']}\n```\nBut the current optimized program is:\n```llvm\n{test_log['log']['current_optimized_program']}\n```\n"
+                        alive2_log = get_alive2_log(test_log)
+                        if alive2_log and not alive2_log_looks_success(alive2_log):
+                            feedback += (
+                                "Alive2 failed to verify the transformation; log follows:\n"
+                                f"```text\n{truncate_text(alive2_log)}\n```\n"
+                            )
         if prompted_test_fail_count == 0:
             # add new test to the prompt
             for test_file in env.get_tests():
@@ -820,8 +978,7 @@ def issue_fixing_iter(
                     for test_log in log:
                         if test_log["name"] != test["test_name"]:
                             continue
-                        if test_log["log"]["cost"]["current_optimized_program"] < test_log["log"]["cost"]["source_program"] or \
-                            test_log["log"]["cost"]["current_optimized_program"] <= test_log["log"]["cost"]["expect_optimized_program"]:
+                        if test_is_successfully_optimized(test_log):
                             continue
                         env.prompted_tests[test["test_name"]] = {
                             "cost": {
@@ -835,6 +992,20 @@ def issue_fixing_iter(
                         feedback += f"Here is another failed to optimize program:\n" + \
                             f"The source program is:\n```llvm\n{source_program}\n```\n" + \
                             f"The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
+                        alive2_log = get_alive2_log(test_log)
+                        if alive2_log and not alive2_log_looks_success(alive2_log):
+                            feedback += (
+                                "Alive2 failed to verify the transformation; log follows:\n"
+                                f"```text\n{truncate_text(alive2_log)}\n```\n"
+                            )
+                        # keep prompt sizes under control: add at most one new failing test each round
+                        break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
@@ -878,6 +1049,7 @@ def fix_issue(issue_id):
         messages, full_messages, {"role": "system", "content": get_system_prompt()}
     )
     bug_type = env.get_bug_type()
+    bug_file_hint = next(iter(bug_funcs.keys()))
     bug_func_name = next(iter(bug_funcs.values()))[0]
     # component = next(iter(env.get_hint_components()))
     component = next(iter(env.get_hint_components()), None)
@@ -929,14 +1101,16 @@ def fix_issue(issue_id):
     # Get functions to try from JSON
     functions_to_try = get_functions_to_try(issue_id)
     
-    # If no functions found in JSON, fall back to original method
+    # If no functions found in JSON, fall back to the hint function itself.
     if not functions_to_try:
-        # desc += "Detailed information:\n"
-        # desc += normalize_feedback(log) + "\n"
-        file, hunk = get_hunk_short(env)
+        result = get_hunk_from_func(env, bug_file_hint, bug_func_name)
+        if not result:
+            print(
+                f"Warning: Cannot extract function {bug_func_name} from {bug_file_hint}, skipping"
+            )
+            return
+        file, hunk = result
         desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
-        # desc += f"Please insert new code into the following code in {file}:{bug_func_name} to implement the missed optimization. **You must not change or delete any of the existing code.** \
-        #     \n```cpp\n{hunk}\n```\n"
         prefix = "\n".join(hunk.splitlines()[:5])
         suffix = "\n".join(hunk.splitlines()[-5:])
         context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
@@ -1020,133 +1194,6 @@ def fix_issue(issue_id):
     with open(fix_log_path, "w") as f:
         f.write(json.dumps(cert, indent=2))
 
-def canonicalize_line(line: str) -> str:
-    special_chars = set(string.punctuation + string.whitespace)
-    canonicalized = line.strip()
-    canonicalized = "".join(
-        [" " if c in special_chars else c for c in canonicalized]
-    )
-    return canonicalized
-
-def get_hunk_from_patch(base_commit: str, patch: str):
-    patch_set = PatchSet(patch)
-    valid_file = None
-    for file in patch_set:
-        if not file.is_modified_file:
-            continue
-        if valid_file is None:
-            valid_file = file
-        else:
-            raise Exception("Multiple modified files in the patch")
-    if valid_file is None:
-        raise Exception("No modified file in the patch")
-    file_path = valid_file.path
-    lines = dict()
-    llvm_helper.git_execute(["checkout", base_commit, "--", file_path])
-    with open(os.path.join(llvm_helper.llvm_dir, file_path)) as f:
-        source_lines = f.readlines()
-        for lineno, line in enumerate(source_lines):
-            canonicalized = canonicalize_line(line)
-            if canonicalized in lines:
-                lines[canonicalized].append(lineno)
-            else:
-                lines[canonicalized] = [lineno]
-
-    min_pos = 1e9
-    max_pos = 0
-    mapping_hint = []
-    for hunk in valid_file:
-        for line in hunk:
-            if line.is_removed:
-                continue
-            pos = line.target_line_no
-            min_pos = min(min_pos, pos)
-            max_pos = max(max_pos, pos)
-            content = canonicalize_line(line.value)
-            if content in lines and len(lines[content]) == 1:
-                source_pos = lines[content][0]
-                mapping_hint.append((pos, source_pos))
-    if min_pos > max_pos:
-        raise Exception("No valid change")
-    if len(mapping_hint) == 0:
-        raise Exception("No valid line mapping found")
-    start_pos = 1e9
-    end_pos = 0
-    for src_pos, tgt_pos in mapping_hint:
-        start = tgt_pos - (src_pos - min_pos)
-        end = tgt_pos + (max_pos - src_pos)
-        start_pos = min(start_pos, start)
-        end_pos = max(end_pos, end)
-    if start_pos > end_pos:
-        raise Exception("Invalid line mapping")
-    if end_pos - start_pos > 100:
-        raise Exception("The hunk is too large")
-    margin = 30
-    start_pos = max(start_pos - margin, 0)
-    end_pos = min(end_pos + margin, len(source_lines) - 1)
-    hunk_lines = "".join(source_lines[start_pos : end_pos + 1])
-    return file_path, hunk_lines
-
-
-def fix_issue_without_hint(issue_id):
-    fix_log_path = os.path.join(fix_dir, f"{issue_id}.json")
-    if not override and os.path.exists(fix_log_path):
-        print(f"Skip {issue_id}")
-        return
-    print(f"Fixing {issue_id}")
-    env = Env(issue_id, basemodel_cutoff, max_build_jobs=max_build_jobs)
-    bisect_commit = env.get_bisect_commit()
-    if bisect_commit is None:
-        print("Bisection info is unavailable")
-        return
-    if not env.is_single_func_fix():
-        print("Multi-func bug is not supported")
-        return
-    buggy_patch = llvm_helper.git_execute(
-        ["show", bisect_commit, "--", "llvm/lib/*", "llvm/include/*"]
-    )
-    try:
-        file, hunk = get_hunk_from_patch(env.get_base_commit(), buggy_patch)
-    except Exception as e:
-        print(e)
-        return
-    env.reset()
-    messages = []
-    full_messages = []  # Log with COT tokens
-    append_message(
-        messages, full_messages, {"role": "system", "content": get_system_prompt()}
-    )
-    bug_type = env.get_bug_type()
-    desc = f"This is a {bug_type} bug.\n"
-    desc += "The bisection result shows that the bug is introduced in the following commit:\n"
-    desc += buggy_patch + "\n"
-    res, log = env.check_fast()
-    assert not res
-    desc += "Detailed information:\n"
-    desc += normalize_feedback(log) + "\n"
-    desc += f"Please modify the following code in {file} to fix the bug:\n```cpp\n{hunk}\n```\n"
-    prefix = "\n".join(hunk.splitlines()[:5])
-    suffix = "\n".join(hunk.splitlines()[-5:])
-    context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
-    desc += format_requirement + context_requirement
-    append_message(messages, full_messages, {"role": "user", "content": desc})
-    try:
-        for idx in range(max_sample_count):
-            print(f"Round {idx + 1}")
-            if issue_fixing_iter(
-                env, file, hunk, messages, full_messages, context_requirement
-            ):
-                cert = env.dump(normalize_messages(full_messages))
-                print(cert)
-                with open(fix_log_path, "w") as f:
-                    f.write(json.dumps(cert, indent=2))
-                return
-    except Exception:
-        pass
-    cert = env.dump(normalize_messages(full_messages))
-    with open(fix_log_path, "w") as f:
-        f.write(json.dumps(cert, indent=2))
-
 
 if len(sys.argv) == 1:
     task_list = sorted(
@@ -1162,10 +1209,7 @@ if DEBUG:
 
 for task in task_list:
     # try:
-        if use_bisection:
-            fix_issue_without_hint(task)
-        else:
-            fix_issue(task)
+        fix_issue(task)
     # except Exception as e:
     #     print(e)
     #     pass
