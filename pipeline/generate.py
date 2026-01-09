@@ -701,7 +701,8 @@ def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
     
     # If gold_funcs exist, try to match with pred_funcs
     # pred_funcs is a dict: {"filename.cpp": ["func1", "func2", ...], ...}
-    if gold_funcs and gold_file:
+    # If there are multiple gold functions, skip matching and directly use all pred funcs.
+    if gold_funcs and len(gold_funcs) == 1 and gold_file:
         # Find matching functions
         for pred_file, pred_func_list in pred_funcs.items():
             # pred_func_list is the list of function names for this file
@@ -843,6 +844,42 @@ def truncate_text(text: str, *, max_chars: int = 8000) -> str:
     return text[:max_chars] + "\n<Truncated>..."
 
 
+def _extract_cost_fields(test_log: dict) -> tuple[dict | None, dict | None]:
+    """
+    Safely extract cost fields from a test log.
+
+    Returns:
+      (cost_dict, log_dict). If any part is missing/malformed, cost_dict is None.
+    """
+    if not isinstance(test_log, dict):
+        return None, None
+    log_obj = test_log.get("log", None)
+    if not isinstance(log_obj, dict):
+        return None, None
+    cost_obj = log_obj.get("cost", None)
+    if not isinstance(cost_obj, dict):
+        return None, log_obj
+    required = ("source_program", "expect_optimized_program", "current_optimized_program")
+    if not all(k in cost_obj for k in required):
+        return None, log_obj
+    return {k: cost_obj.get(k) for k in required}, log_obj
+
+
+def _append_missing_cost_feedback(feedback: str, test_name: str, test_log: dict) -> str:
+    log_obj = test_log.get("log", None) if isinstance(test_log, dict) else None
+    try:
+        rendered = json.dumps(log_obj, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        rendered = str(log_obj)
+    feedback += (
+        f"The test log for `@{test_name}` is missing expected cost fields under "
+        f"`log.cost` (need: source_program/expect_optimized_program/current_optimized_program). "
+        "Raw `test_log['log']` follows:\n"
+        f"```json\n{truncate_text(rendered)}\n```\n"
+    )
+    return feedback
+
+
 def get_alive2_log(test_log: dict) -> str | None:
     try:
         a2 = test_log.get("log", {}).get("alive2", {})
@@ -930,19 +967,13 @@ def issue_fixing_iter(
             for test_log in log:
                 if test_log["name"] == test_name:
                     # print("[TEST LOG1]", test_log)   
-                    try:
-                        test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
-                        test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
-                        test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
+                    cost_fields, _ = _extract_cost_fields(test_log)
+                    if cost_fields is not None:
+                        test["cost"]["source_program"] = cost_fields["source_program"]
+                        test["cost"]["expect_optimized_program"] = cost_fields["expect_optimized_program"]
+                        test["cost"]["current_optimized_program"] = cost_fields["current_optimized_program"]
                         break
-                    except Exception as e:
-                        print(f"Error updating cost of test {test_name}: {e}")
-                        print(f"Test log: {test_log}")
-                        print(f"Test log cost: {test_log['log']['cost']}")
-                        print(f"Test log cost source program: {test_log['log']['cost']['source_program']}")
-                        print(f"Test log cost expect optimized program: {test_log['log']['cost']['expect_optimized_program']}")
-                        print(f"Test log cost current optimized program: {test_log['log']['cost']['current_optimized_program']}")
-                        continue
+                    continue
         # then, check if the optimization was successful
         feedback = ""
         prompted_test_fail_count = 0
@@ -951,16 +982,31 @@ def issue_fixing_iter(
             for test_log in log:
                 if test_log["name"] == test_name:
                     # print("[TEST LOG2]", test_log)
-                    test["cost"]["source_program"] = test_log["log"]["cost"]["source_program"]
-                    test["cost"]["expect_optimized_program"] = test_log["log"]["cost"]["expect_optimized_program"]
-                    test["cost"]["current_optimized_program"] = test_log["log"]["cost"]["current_optimized_program"]
+                    cost_fields, log_obj = _extract_cost_fields(test_log)
+                    if cost_fields is not None:
+                        test["cost"]["source_program"] = cost_fields["source_program"]
+                        test["cost"]["expect_optimized_program"] = cost_fields["expect_optimized_program"]
+                        test["cost"]["current_optimized_program"] = cost_fields["current_optimized_program"]
+                    else:
+                        feedback = _append_missing_cost_feedback(feedback, test_name, test_log)
                     if test_is_successfully_optimized(test_log):
                         feedback += f"The previous test program `@{test_name}` was successfully optimized.\n"
                     else:
                         prompted_test_fail_count += 1
                         feedback += f"The previous test program `@{test_name}` was not successfully optimized.\n"
-                        feedback += f"The previous test program is:\n```llvm\n{test_log['log']['source_program']}\n```\n"
-                        feedback += f"The expected optimized program is:\n```llvm\n{test_log['log']['expect_optimized_program']}\n```\nBut the current optimized program is:\n```llvm\n{test_log['log']['current_optimized_program']}\n```\n"
+                        if isinstance(log_obj, dict) and isinstance(log_obj.get("source_program", None), str):
+                            feedback += f"The previous test program is:\n```llvm\n{log_obj['source_program']}\n```\n"
+                        if isinstance(log_obj, dict) and isinstance(log_obj.get("expect_optimized_program", None), str):
+                            feedback += f"The expected optimized program is:\n```llvm\n{log_obj['expect_optimized_program']}\n```\n"
+                        if isinstance(log_obj, dict) and isinstance(log_obj.get("current_optimized_program", None), str):
+                            feedback += f"But the current optimized program is:\n```llvm\n{log_obj['current_optimized_program']}\n```\n"
+                        if not isinstance(log_obj, dict):
+                            # fall back: show whatever we have
+                            try:
+                                rendered = json.dumps(test_log.get("log", None), ensure_ascii=False, indent=2, default=str)
+                            except Exception:
+                                rendered = str(test_log.get("log", None))
+                            feedback += f"Raw log follows:\n```json\n{truncate_text(rendered)}\n```\n"
                         alive2_log = get_alive2_log(test_log)
                         if alive2_log and not alive2_log_looks_success(alive2_log):
                             feedback += (
@@ -980,15 +1026,18 @@ def issue_fixing_iter(
                             continue
                         if test_is_successfully_optimized(test_log):
                             continue
+                        cost_fields, log_obj = _extract_cost_fields(test_log)
                         env.prompted_tests[test["test_name"]] = {
                             "cost": {
-                                "source_program": test_log["log"]["cost"]["source_program"],
-                                "expect_optimized_program": test_log["log"]["cost"]["expect_optimized_program"],
+                                "source_program": (cost_fields or {}).get("source_program", -1),
+                                "expect_optimized_program": (cost_fields or {}).get("expect_optimized_program", -1),
                                 "current_optimized_program": -1,
                             }
                         }
-                        source_program = test_log["log"]["source_program"]
-                        expect_optimized_program = test_log["log"]["expect_optimized_program"]
+                        if not isinstance(log_obj, dict):
+                            log_obj = test_log.get("log", {}) if isinstance(test_log, dict) else {}
+                        source_program = log_obj.get("source_program", "")
+                        expect_optimized_program = log_obj.get("expect_optimized_program", "")
                         feedback += f"Here is another failed to optimize program:\n" + \
                             f"The source program is:\n```llvm\n{source_program}\n```\n" + \
                             f"The expect optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"

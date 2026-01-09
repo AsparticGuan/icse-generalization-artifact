@@ -24,9 +24,9 @@ elif [[ "$1" == "gpt-4o" ]]; then
     export http_proxy="" # disable proxy on our cse servers
     export https_proxy="" # disable proxy on our cse servers
 elif [[ "$1" == "gemini-3" ]]; then
-    export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
-    export LAB_LLM_URL=$OPENROUTER_URL
-    export LAB_LLM_MODEL=google/gemini-3-pro-preview
+    export LAB_LLM_TOKEN=$YUNWU_TOKEN
+    export LAB_LLM_URL=$YUNWU_URL
+    export LAB_LLM_MODEL=gemini-3-pro-preview
 elif [[ "$1" == "deepseek-v3.1" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
