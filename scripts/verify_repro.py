@@ -38,11 +38,15 @@ def verify_issue(issue):
         raise RuntimeError("Failed to build")
     bug_type = data["bug_type"]
     print("Stage 1 verify")
-    res, log = llvm_helper.verify_test_group(
-        repro=True, input=data["tests"], type=bug_type
+    # res, log = llvm_helper.verify_test_group(
+    #     repro=True, input=data["tests"], type=bug_type
+    # )
+    res, log = llvm_helper.verify_test_group_orig(
+        repro=True, input_tests=data["tests"], type_str=bug_type, component_list=data["hints"].get("components")
     )
+    print(json.dumps(log, indent=2))
+    print(res)
     if not res:
-        print(json.dumps(log, indent=2))
         raise RuntimeError("Failed to reproduce")
     else:
         # we successfully reproduced the bug, so dump the failed_to_optimize programs for later use
@@ -53,10 +57,12 @@ def verify_issue(issue):
                 for test_index in range(len(data["tests"][test_file_index]["tests"])):
                     if data["tests"][test_file_index]["tests"][test_index]["test_name"] != log[log_index]["name"]:
                         continue
-                    optimized_program = log[log_index]["log"]["filecheck"]["tgt"]
+                    # optimized_program = log[log_index]["log"]["filecheck"]["tgt"]
+                    optimized_program = log[log_index]["log"]["alive2"]["tgt"]
                     optimized_program = optimized_program.removeprefix(
                         "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n"
                     ).removeprefix("\n")
+                    optimized_program = optimized_program.removesuffix("\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n")
                     data["tests"][test_file_index]["tests"][test_index]["current_optimized_program"] = optimized_program
                     break
                 break

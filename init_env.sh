@@ -24,18 +24,18 @@ elif [[ "$1" == "gpt-4o" ]]; then
     export http_proxy="" # disable proxy on our cse servers
     export https_proxy="" # disable proxy on our cse servers
 elif [[ "$1" == "gemini-3" ]]; then
-    export LAB_LLM_TOKEN=$YUNWU_TOKEN
-    export LAB_LLM_URL=$YUNWU_URL
-    export LAB_LLM_MODEL=gemini-3-pro-preview
-elif [[ "$1" == "deepseek-v3.1" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
-    export LAB_LLM_MODEL=deepseek/deepseek-chat-v3.1
-elif [[ "$1" == "qwen3-coder" ]]; then
+    export LAB_LLM_MODEL=google/gemini-3-pro-preview
+elif [[ "$1" == "deepseek-v3.2" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
-    export LAB_LLM_MODEL=qwen/qwen3-coder
-elif [[ "$1" == "qwen3" ]]; then
+    export LAB_LLM_MODEL=deepseek/deepseek-v3.2
+elif [[ "$1" == "glm-4.7" ]]; then
+    export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
+    export LAB_LLM_URL=$OPENROUTER_URL
+    export LAB_LLM_MODEL=z-ai/glm-4.7
+elif [[ "$1" == "qwen-3" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
     export LAB_LLM_MODEL=qwen/qwen3-235b-a22b-2507
@@ -46,7 +46,7 @@ elif [[ "$1" == "sonnet-4.5" ]]; then
 else
     # error
     echo "Invalid model: $1"
-    # exit the script butavoid exiting from tmux session
+    # exit the script but avoid exiting from tmux session
     return
 fi
 
@@ -60,7 +60,14 @@ export LAB_USE_BISECTION=OFF
 export LAB_ISSUE_CACHE=$SCRIPT_DIR/issue_cache
 export LAB_LLVM_BUILD_DIR=$SCRIPT_DIR/build
 export LAB_DATASET_DIR=$SCRIPT_DIR/dataset
-export LAB_FIX_DIR=$SCRIPT_DIR/examples/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_LLM_MAX_SAMPLE_COUNT
+export LAB_RESULTS_DIR=$SCRIPT_DIR/results
+export LAB_FIX_DIR=$LAB_RESULTS_DIR/generate/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_LLM_MAX_SAMPLE_COUNT
+export LAB_FIX_DIR_ORIG=$LAB_RESULTS_DIR/generate/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_LLM_MAX_SAMPLE_COUNT-orig
+mkdir -p "$LAB_FIX_DIR"
+mkdir -p "$LAB_FIX_DIR_ORIG"
+export LAB_LOCALIZE_DIR=$LAB_RESULTS_DIR/localize
+export LAB_LOCALIZE_OUTPUT=$LAB_LOCALIZE_DIR/$1.json
+mkdir -p "$LAB_LOCALIZE_DIR"
 
 # setup LLVM
 export LAB_LLVM_DIR=$SCRIPT_DIR/utils/llvm/llvm-project

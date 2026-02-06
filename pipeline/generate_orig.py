@@ -1,18 +1,82 @@
 #!/usr/bin/env python3
-
+"""
+Generate script for dataset entries with 'orig' in filename:
+test_body is empty, no FileCheck. Uses verify_test_group_orig
+(opt + alive2 + cost only).
+"""
 import sys
 import os
+
+# Force dataset to dataset before any script reads LAB_DATASET_DIR
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, ".."))
+os.environ["LAB_DATASET_DIR"] = os.path.join(_project_root, "dataset")
+
 import json
 import re
 import string
 import tarfile
+import subprocess
 from pathlib import Path
 
 sys.path.append(os.path.join(os.path.dirname(os.environ["LAB_DATASET_DIR"]), "scripts"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+sys.path.append(os.path.join(_script_dir, "..", "scripts"))
 import shutil
 import llvm_helper # pyright: ignore[reportMissingImports]  # noqa: E402
 from lab_env import Environment as Env # pyright: ignore[reportMissingImports]  # noqa: E402
+
+
+class EnvironmentOrig(Env):
+    """Environment for dataset-orig: verification without FileCheck (test_body empty)."""
+
+    def check_fast(self, skip_build=False):
+        from lab_env import TimeCompensationGuard
+        with TimeCompensationGuard(self):
+            self.fast_check_count += 1
+            if not skip_build:
+                res, reason = self.build()
+                if not res:
+                    return (False, reason)
+            else:
+                self.build_count += 1
+            res, log = llvm_helper.verify_test_group_orig(
+                repro=False,
+                input_tests=self.data["tests"],
+                type_str=self.bug_type,
+                component_list=self.data["hints"].get("components"),
+            )
+            if not res:
+                return (False, log)
+            self.fast_check_pass = True
+            return (True, log)
+
+    def check_full(self):
+        from lab_env import TimeCompensationGuard
+        with TimeCompensationGuard(self):
+            self.full_check_count += 1
+            res, reason = self.build()
+            if not res:
+                return (False, reason)
+            res, log = llvm_helper.verify_test_group_orig(
+                repro=False,
+                input_tests=self.data["tests"],
+                type_str=self.bug_type,
+                component_list=self.data["hints"].get("components"),
+            )
+            self.check_fast_log.append(log)
+            if not res:
+                return (False, log)
+            self.fast_check_pass = True
+            res, log = llvm_helper.verify_lit(
+                test_commit=self.test_commit,
+                dirs=self.data["lit_test_dir"],
+                max_test_jobs=self.max_build_jobs,
+            )
+            self.check_full_log.append(log)
+            if not res:
+                return (False, log)
+            self.full_check_pass = True
+            return (True, log)
 from openai import OpenAI
 from openai import NOT_GIVEN
 
@@ -46,8 +110,12 @@ max_log_size = int(os.environ.get("LAB_LLM_MAX_LOG_SIZE", 1000000000))
 max_sample_count = int(os.environ.get("LAB_LLM_MAX_SAMPLE_COUNT", 4))
 omit_issue_body = os.environ.get("LAB_LLM_OMIT_ISSUE_BODY", "ON") == "ON"
 max_build_jobs = int(os.environ.get("LAB_MAX_BUILD_JOBS", os.cpu_count()))
-fix_dir = os.environ["LAB_FIX_DIR"]
+# 结果写到 LAB_FIX_DIR_ORIG
+fix_dir = os.environ["LAB_FIX_DIR_ORIG"]
 os.makedirs(fix_dir, exist_ok=True)
+BASE_LLVM_DIR = os.environ.get("LAB_LLVM_DIR")
+DEFAULT_LLVM_DIR = os.path.join(_project_root, "utils", "llvm", "llvm-project")
+UTILS_DIR = os.path.join(_project_root, "utils")
 
 tools = []
 tool_get_source_prompt = "If you need to view the source code, please call the `get_source` function. It is very helpful to address compilation errors by inspecting the latest LLVM API."
@@ -76,7 +144,7 @@ tool_get_source_desc = {
 
 def tool_get_source(env, args):
     file = args["file"]
-    if not file.startswith("llvm/") or file.contains(".."):
+    if not file.startswith("llvm/") or ".." in file:
         return "Invalid file path"
     lineno = int(args["lineno"])
     path = os.path.join(llvm_helper.llvm_dir, file)
@@ -428,10 +496,35 @@ def extract_function_name(func_def_node):
         return None
 
 
+def get_llvm_root() -> str:
+    if getattr(llvm_helper, "llvm_dir", None):
+        return llvm_helper.llvm_dir
+    env_dir = os.environ.get("LAB_LLVM_DIR")
+    if env_dir:
+        return env_dir
+    return DEFAULT_LLVM_DIR
+
+
+def ensure_llvm_clone_for_issue(issue_id: str) -> str:
+    issue_dir = os.path.join(UTILS_DIR, f"llvm-{issue_id}")
+    if os.path.isdir(issue_dir):
+        return issue_dir
+    os.makedirs(UTILS_DIR, exist_ok=True)
+    if BASE_LLVM_DIR and os.path.isdir(BASE_LLVM_DIR):
+        print(f"Cloning llvm-project from {BASE_LLVM_DIR} to {issue_dir}")
+        subprocess.check_call(["git", "clone", BASE_LLVM_DIR, issue_dir])
+    else:
+        print(f"Cloning llvm-project from remote to {issue_dir}")
+        subprocess.check_call(
+            ["git", "clone", "https://github.com/llvm/llvm-project.git", issue_dir]
+        )
+    return issue_dir
+
+
 def get_full_path_from_filename(filename: str, llvm_root: str = None) -> str | None:
     """Find the full path from filename (relative to llvm_root)"""
     if llvm_root is None:
-        llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+        llvm_root = get_llvm_root()
     basename = os.path.basename(filename)
     llvm_path = Path(llvm_root)
     for cpp_file in llvm_path.rglob(basename):
@@ -619,7 +712,6 @@ def truncate_hunk(
 
 
 def load_func_info_from_json(issue_id: str, json_path: str = None) -> tuple[dict, list, str | None]:
-    """Load pred_funcs, gold_funcs, and gold_file from pipeline/localize-result.json"""
     if json_path is None:
         json_path = os.environ.get("LAB_LOCALIZE_OUTPUT", os.path.join(os.path.dirname(__file__)))
     
@@ -643,7 +735,7 @@ def load_func_info_from_json(issue_id: str, json_path: str = None) -> tuple[dict
 def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, str] | None:
     """Extract function content as hunk from specified file and function name"""
     base_commit = env.get_base_commit()
-    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    llvm_root = get_llvm_root()
 
     # Read file content from git
     try:
@@ -697,7 +789,7 @@ def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
         return []
     
     functions_to_try = []
-    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    llvm_root = get_llvm_root()
     
     # If gold_funcs exist, try to match with pred_funcs
     # pred_funcs is a dict: {"filename.cpp": ["func1", "func2", ...], ...}
@@ -1083,7 +1175,10 @@ def fix_issue(issue_id):
         print(f"Skip {issue_id}")
         return
     print(f"Fixing {issue_id}")
-    env = Env(issue_id, basemodel_cutoff, max_build_jobs=max_build_jobs)
+    issue_llvm_dir = ensure_llvm_clone_for_issue(issue_id)
+    llvm_helper.llvm_dir = issue_llvm_dir
+    os.environ["LAB_LLVM_DIR"] = issue_llvm_dir
+    env = EnvironmentOrig(issue_id, basemodel_cutoff, max_build_jobs=max_build_jobs)
     verified = env.data.get("verified", False)
     if not verified:
         print(f"Issue {issue_id} is not verified")
@@ -1247,10 +1342,43 @@ def fix_issue(issue_id):
 
 if len(sys.argv) == 1:
     task_list = sorted(
-        map(lambda x: x.removesuffix(".json"), os.listdir(llvm_helper.dataset_dir))
+        map(
+            lambda x: x.removesuffix(".json"),
+            [
+                f
+                for f in os.listdir(llvm_helper.dataset_dir)
+                if f.endswith(".json") and "orig" in f
+            ],
+        )
     )
 else:
-    task_list = [sys.argv[1]]
+    input_id = sys.argv[1].strip()
+    if input_id:
+        if input_id.endswith("-orig"):
+            cand = input_id
+            cand_file = cand + ".json"
+            cand_path = os.path.join(llvm_helper.dataset_dir, cand_file)
+            if os.path.exists(cand_path):
+                task_list = [cand]
+            else:
+                print(f"[WARN] {cand_file} not found in {llvm_helper.dataset_dir}, skipping")
+                task_list = []
+        else:
+            orig_cand = f"{input_id}-orig"
+            orig_file = orig_cand + ".json"
+            orig_path = os.path.join(llvm_helper.dataset_dir, orig_file)
+            plain_path = os.path.join(llvm_helper.dataset_dir, input_id + ".json")
+            if os.path.exists(orig_path) and os.path.exists(plain_path):
+                print(
+                    f"[WARN] Found {orig_file}; skip {input_id}. "
+                    "Please pass the -orig id to avoid duplicates."
+                )
+                task_list = []
+            elif os.path.exists(orig_path):
+                task_list = [orig_cand]
+            else:
+                print(f"[WARN] {orig_file} not found in {llvm_helper.dataset_dir}, skipping")
+                task_list = []
     if len(sys.argv) == 3 and sys.argv[2] == "-f":
         override = True
 

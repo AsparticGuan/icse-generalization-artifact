@@ -1,0 +1,71 @@
+{
+  "bug_id": "59393",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/59393",
+  "bug_type": "missed-optimization",
+  "base_commit": "c94d104413cd70aa3267ae19d231b6e446fef42c",
+  "knowledge_cutoff": "2022-12-08T11:35:16Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "9ddff66d0c9c3e18d56e6b20aa26a2a8cdfb6d2b",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          2669,
+          2674
+        ],
+        [
+          3292,
+          3296
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::foldSelectOfBools",
+        "InstCombinerImpl::visitSelectInst",
+        "foldRoundUpIntegerWithPow2Alignment"
+      ]
+    }
+  },
+  "patch": "commit 9ddff66d0c9c3e18d56e6b20aa26a2a8cdfb6d2b\nAuthor: Roman Lebedev <lebedev.ri@gmail.com>\nDate:   Sun Dec 11 00:51:03 2022 +0300\n\n    [InstCombine] Fold nested selects\n    \n    https://alive2.llvm.org/ce/z/GjCXkB\n    https://alive2.llvm.org/ce/z/Guz2tt\n    \n    Fixes https://github.com/llvm/llvm-project/issues/59393\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 0633388cd411..b8328572195b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -2669,6 +2669,80 @@ foldRoundUpIntegerWithPow2Alignment(SelectInst &SI,\n   return R;\n }\n \n+/// Look for patterns like\n+///   %outer.cond = select i1 %inner.cond, i1 %alt.cond, i1 false\n+///   %inner.sel = select i1 %inner.cond, i8 %inner.sel.t, i8 %inner.sel.f\n+///   %outer.sel = select i1 %outer.cond, i8 %outer.sel.t, i8 %inner.sel\n+/// and rewrite it as\n+///   %inner.sel = select i1 %cond.alternative, i8 %sel.outer.t, i8 %sel.inner.t\n+///   %sel.outer = select i1 %cond.inner, i8 %inner.sel, i8 %sel.inner.f\n+static Instruction *foldNestedSelects(SelectInst &OuterSel,\n+                                      InstCombiner::BuilderTy &Builder) {\n+  // We must start with a `select`.\n+  Value *OuterCond, *InnerSel, *OuterSelFalseVal;\n+  match(&OuterSel, m_Select(m_Value(OuterCond), m_Value(InnerSel),\n+                            m_Value(OuterSelFalseVal)));\n+\n+  // Canonicalize inversion of the outermost `select`'s condition.\n+  if (match(OuterCond, m_Not(m_Value(OuterCond))))\n+    std::swap(InnerSel, OuterSelFalseVal);\n+\n+  auto m_c_LogicalOp = [](auto L, auto R) {\n+    return m_CombineOr(m_c_LogicalAnd(L, R), m_c_LogicalOr(L, R));\n+  };\n+\n+  // The condition of the outermost select must be an `and`/`or`.\n+  if (!match(OuterCond, m_c_LogicalOp(m_Value(), m_Value())))\n+    return nullptr;\n+\n+  // To simplify logic, prefer the pattern variant with an `or`.\n+  bool IsAndVariant = match(OuterCond, m_LogicalAnd());\n+  if (match(OuterCond, m_LogicalAnd()))\n+    std::swap(InnerSel, OuterSelFalseVal);\n+\n+  // Profitability check - avoid increasing instruction count.\n+  if (none_of(ArrayRef<Value *>({OuterCond, InnerSel}),\n+              [](Value *V) { return V->hasOneUse(); }))\n+    return nullptr;\n+\n+  // The appropriate hand of the outermost `select` must be a select itself.\n+  Value *InnerCond, *InnerSelTrueVal, *InnerSelFalseVal;\n+  if (!match(InnerSel, m_Select(m_Value(InnerCond), m_Value(InnerSelTrueVal),\n+                                m_Value(InnerSelFalseVal))))\n+    return nullptr;\n+\n+  // Canonicalize inversion of the innermost `select`'s condition.\n+  if (match(InnerCond, m_Not(m_Value(InnerCond))))\n+    std::swap(InnerSelTrueVal, InnerSelFalseVal);\n+\n+  Value *AltCond = nullptr;\n+  auto matchOuterCond = [OuterCond, m_c_LogicalOp, &AltCond](auto m_InnerCond) {\n+    return match(OuterCond, m_c_LogicalOp(m_InnerCond, m_Value(AltCond)));\n+  };\n+\n+  // Finally, match the condition that was driving the outermost `select`,\n+  // it should be a logical operation between the condition that was driving\n+  // the innermost `select` (after accounting for the possible inversions\n+  // of the condition), and some other condition.\n+  if (matchOuterCond(m_Specific(InnerCond))) {\n+    // Done!\n+  } else if (Value * NotInnerCond; matchOuterCond(m_CombineAnd(\n+                 m_Not(m_Specific(InnerCond)), m_Value(NotInnerCond)))) {\n+    // Done!\n+    std::swap(InnerSelTrueVal, InnerSelFalseVal);\n+    InnerCond = NotInnerCond;\n+  } else // Not the pattern we were looking for.\n+    return nullptr;\n+\n+  Value *SelInner = Builder.CreateSelect(\n+      AltCond, IsAndVariant ? OuterSelFalseVal : InnerSelFalseVal,\n+      IsAndVariant ? InnerSelTrueVal : OuterSelFalseVal);\n+  SelInner->takeName(InnerSel);\n+  return SelectInst::Create(InnerCond,\n+                            IsAndVariant ? SelInner : InnerSelTrueVal,\n+                            IsAndVariant ? InnerSelFalseVal : SelInner);\n+}\n+\n Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   Value *CondVal = SI.getCondition();\n   Value *TrueVal = SI.getTrueValue();\n@@ -3292,5 +3366,8 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     }\n   }\n \n+  if (Instruction *I = foldNestedSelects(SI, Builder))\n+    return I;\n+\n   return nullptr;\n }\n",
+  "tests": [
+    {
+      "file": "issue_body_ir.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "",
+          "source_program": "define i32 @test(i1 %t1, i1 %t2, i32 %a, i32 %b, i32 %c) {\r\n  %s1 = select i1 %t1, i32 %a, i32 %b\r\n  %and = select i1 %t1, i1 %t2, i1 false\r\n  %s2 = select i1 %and, i32 %c, i32 %s1\r\n  ret i32 %s2\r\n}\n",
+          "expect_optimized_program": "define i32 @test(i1 %t1, i1 %t2, i32 %a, i32 %b, i32 %c) {\r\n  %s1 = select i1 %t2, i32 %c, i32 %a\r\n  %s2 = select i1 %t1, i32 %s1, i32 %b\r\n  ret i32 %s2\r\n}\n",
+          "current_optimized_program": "define i32 @test(i1 %t1, i1 %t2, i32 %a, i32 %b, i32 %c) {\n  %s1 = select i1 %t1, i32 %a, i32 %b\n  %and = select i1 %t1, i1 %t2, i1 false\n  %s2 = select i1 %and, i32 %c, i32 %s1\n  ret i32 %s2\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] Failure to simplify nested selects",
+    "body": "https://alive2.llvm.org/ce/z/GjCXkB\r\n```ll\r\ndefine i32 @src(i1 %t1, i1 %t2, i32 %a, i32 %b, i32 %c) {\r\n  %s1 = select i1 %t1, i32 %a, i32 %b\r\n  %and = select i1 %t1, i1 %t2, i1 false\r\n  %s2 = select i1 %and, i32 %c, i32 %s1\r\n  ret i32 %s2\r\n}\r\ndefine i32 @tgt(i1 %t1, i1 %t2, i32 %a, i32 %b, i32 %c) {\r\n  %s1 = select i1 %t2, i32 %c, i32 %a\r\n  %s2 = select i1 %t1, i32 %s1, i32 %b\r\n  ret i32 %s2\r\n}\r\n```",
+    "author": "nikic",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Or conjugate: https://alive2.llvm.org/ce/z/Guz2tt"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

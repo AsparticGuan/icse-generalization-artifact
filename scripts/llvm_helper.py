@@ -252,9 +252,14 @@ def cost_check(source_program: str, expect_optimized_program: str, current_optim
     success = False
     # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or 
     # \ test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
-    if costs["current_optimized_program"] < costs["source_program"] or \
+    # if costs["current_optimized_program"] < costs["source_program"] and \
+    #     costs["current_optimized_program"] <= costs["expect_optimized_program"]:
+    if costs["current_optimized_program"] < costs["source_program"] and \
         costs["current_optimized_program"] <= costs["expect_optimized_program"]:
         success = True
+
+    print(f"costs: {costs}")
+    print(f"success: {success}")
     return (success, costs)
 
 def filecheck_check(src: str, tgt: str, args_list: list[str]):
@@ -400,6 +405,7 @@ def verify_test_group(repro: bool, input, type: str):
     test_res = []
     overall_test_res = not repro
     for test in input:
+        print("test: ", test)
         file = test["file"]
         commands = test["commands"]
         tests = test["tests"]
@@ -431,6 +437,147 @@ def verify_test_group(repro: bool, input, type: str):
                     overall_test_res = overall_test_res or res
                 else:
                     overall_test_res = overall_test_res and res
+    return (overall_test_res, test_res)
+
+
+# Component name -> opt pass(es) for dataset-orig (no FileCheck, test_body empty)
+_COMPONENT_TO_OPT_PASS = {
+    "InstCombine": "instcombine",
+    "Scalar": "default",  # generic scalar opts
+}
+
+
+def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_list):
+    """
+    Verify tests when test_body is empty and commands is empty (e.g. dataset-orig).
+    Runs opt on source_program with pass inferred from component, then checks
+    alive2 + cost only (no FileCheck).
+    """
+    test_res = []
+    overall_test_res = not repro
+    if not component_list:
+        component_list = ["InstCombine"]
+    component = component_list[0] if component_list else "InstCombine"
+    pass_name = _COMPONENT_TO_OPT_PASS.get(component, "instcombine")
+    opt_base = [os.path.join(llvm_build_dir, "bin/opt"), "--passes=" + pass_name, "-S"]
+
+    for test in input_tests:
+        print("test: ", test)
+        file = test["file"]
+        commands = test.get("commands", [])
+        tests = test["tests"]
+        if commands:
+            # Fallback to normal verify if commands present
+            for subtest in tests:
+                body = subtest.get("test_body", "")
+                for args in commands:
+                    res, log = verify_dispatch(
+                        repro,
+                        body,
+                        args,
+                        type_str,
+                        subtest.get("additional_args"),
+                        subtest.get("lli_expected_out"),
+                        subtest.get("source_program"),
+                        subtest.get("expect_optimized_program"),
+                    )
+                    test_res.append(
+                        {
+                            "file": file,
+                            "args": args,
+                            "name": subtest["test_name"],
+                            "body": body,
+                            "result": res,
+                            "log": log,
+                        }
+                    )
+                    if repro:
+                        overall_test_res = overall_test_res or res
+                    else:
+                        overall_test_res = overall_test_res and res
+            continue
+
+        # commands empty: run opt on source_program, check alive2 + cost only (no FileCheck)
+        for subtest in tests:
+            name = subtest["test_name"]
+            source_program = subtest.get("source_program") or ""
+            expect_optimized_program = subtest.get("expect_optimized_program") or ""
+            if not source_program or not expect_optimized_program:
+                test_res.append(
+                    {
+                        "file": file,
+                        "args": "(no FileCheck)",
+                        "name": name,
+                        "body": "",
+                        "result": False,
+                        "log": {"error": "missing source_program or expect_optimized_program"},
+                    }
+                )
+                overall_test_res = False
+                continue
+            try:
+                out = subprocess.run(
+                    opt_base,
+                    input=source_program.encode(),
+                    timeout=10.0,
+                    capture_output=True,
+                    check=True,
+                )
+                output = out.stdout.decode()
+                new_input = copy_triple(source_program, out.stdout)
+                new_input = copy_datalayout(new_input, out.stdout)
+                additional_args = subtest.get("additional_args")
+                res_alive2, log_alive2 = alive2_check(
+                    new_input, output, additional_args
+                )
+                current_optimized_program = output.removeprefix(
+                    "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n"
+                ).removeprefix("\n")
+                res_cost, log_cost = cost_check(
+                    source_program, expect_optimized_program, current_optimized_program
+                )
+                log = {
+                    "alive2": log_alive2,
+                    "cost": log_cost,
+                    "source_program": source_program,
+                    "expect_optimized_program": expect_optimized_program,
+                    "current_optimized_program": current_optimized_program,
+                }
+                res = res_alive2 and res_cost
+                print(f"res: {res}")
+                print(f"res_alive2: {res_alive2}")
+                print(f"res_cost: {res_cost}")
+                test_res.append(
+                    {
+                        "file": file,
+                        "args": "(no FileCheck)",
+                        "name": name,
+                        "body": "",
+                        "result": res,
+                        "log": log,
+                    }
+                )
+                if repro:
+                    overall_test_res = overall_test_res or res
+                else:
+                    overall_test_res = overall_test_res and res
+            except Exception as e:
+                err_log = str(e)
+                if hasattr(e, "stderr") and e.stderr:
+                    err_log += "\n" + decode_output(e.stderr)
+                if hasattr(e, "stdout") and e.stdout:
+                    err_log += "\n" + decode_output(e.stdout)
+                test_res.append(
+                    {
+                        "file": file,
+                        "args": "(no FileCheck)",
+                        "name": name,
+                        "body": "",
+                        "result": False,
+                        "log": {"error": err_log},
+                    }
+                )
+                overall_test_res = False
     return (overall_test_res, test_res)
 
 

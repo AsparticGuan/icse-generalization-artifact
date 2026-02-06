@@ -19,7 +19,12 @@ import llvm_helper  # pyright: ignore[reportMissingImports]  # noqa: E402
 from lab_env import Environment as Env  # pyright: ignore[reportMissingImports]  # noqa: E402
 
 DATASET_DIR = os.environ.get("LAB_DATASET_DIR", "dataset")
-OUTPUT_RESULTS_PATH = os.environ.get("LAB_LOCALIZE_OUTPUT", os.path.join(os.path.dirname(__file__), "localize-result.json"))
+_DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "localize")
+_DEFAULT_MODEL_TAG = re.sub(r"[^A-Za-z0-9._-]+", "_", os.environ.get("LAB_LLM_MODEL", "model"))
+OUTPUT_RESULTS_PATH = os.environ.get(
+    "LAB_LOCALIZE_OUTPUT",
+    os.path.join(_DEFAULT_RESULTS_DIR, f"{_DEFAULT_MODEL_TAG}.json"),
+)
 
 DEFAULT_LLVM_ROOT = os.environ.get("LAB_LLVM_DIR", "utils/llvm/llvm-project")
 LLVM_ROOT = os.environ.get("LAB_LOCALIZE_LLVM_ROOT", DEFAULT_LLVM_ROOT)
@@ -425,6 +430,10 @@ def compute_func_correct(
 def main() -> None:
     issue_ids, override = parse_args(sys.argv)
 
+    output_dir = os.path.dirname(OUTPUT_RESULTS_PATH)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     try:
         dataset_files = [
             f
@@ -512,7 +521,6 @@ def main() -> None:
                 print("[INFO] No debug output")
 
         file_prompt = build_file_localize_prompt(issue_desc, file_list_tree, debug_output)
-        print(f"[PROMPT:file_localize:{issue_id}]\n{file_prompt}\n")
         print(f"[INFO] Calling model (file localize) for {issue_id}...")
         try:
             file_model_output = call_model(file_prompt, sys_prompt=SYS_PROMPT_FILE)
@@ -546,7 +554,6 @@ def main() -> None:
                     continue
 
                 func_prompt = build_func_localize_prompt(pred_file, full_rel, issue_desc, file_text)
-                print(f"[PROMPT:func_localize:{issue_id}:{pred_file}]\n{func_prompt}\n")
                 print(f"[INFO] Calling model (func localize) for {pred_file}...")
                 try:
                     func_model_output = call_model(func_prompt, sys_prompt=SYS_PROMPT_FUNC)
