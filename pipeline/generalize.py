@@ -4,6 +4,7 @@ import re
 import json
 import sys
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 from openai import OpenAI
@@ -147,6 +148,28 @@ def _run_opt_instcombine(ir: str, timeout_s: int = 10) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _run_cost_model(ir: str) -> tuple[bool, int, str]:
+    if not isinstance(ir, str) or not ir.strip():
+        return False, -1, "empty ir"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ll") as code_file:
+            code_file.write(ir.encode())
+            code_file.flush()
+            out = subprocess.check_output(
+                [llvm_helper.llvm_cost_tool, code_file.name],
+                stderr=subprocess.STDOUT,
+            ).decode()
+            m = re.search(r"Cost:\s*(\d+)", out)
+            if not m:
+                return False, -1, out
+            return True, int(m.group(1)), out
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, "output"):
+            err += "\n" + llvm_helper.decode_output(e.output)
+        return False, -1, err
+
+
 def _alive2_check(src: str, tgt: str) -> tuple[bool, Any]:
     src = _ensure_ptr_datalayout(src)
     tgt = _ensure_ptr_datalayout(tgt)
@@ -155,6 +178,30 @@ def _alive2_check(src: str, tgt: str) -> tuple[bool, Any]:
 
 def _find_first_testcase(data: dict) -> tuple[dict, dict] | None:
     tests = data.get("tests", [])
+    has_current = False
+    for test_file in tests:
+        for test in test_file.get("tests", []):
+            if isinstance(test, dict) and "current_optimized_program" in test:
+                has_current = True
+                break
+        if has_current:
+            break
+
+    if has_current:
+        for test_file in tests:
+            for test in test_file.get("tests", []):
+                if not isinstance(test, dict):
+                    continue
+                if not test.get("source_program") or not test.get("expect_optimized_program"):
+                    continue
+                if "current_optimized_program" not in test:
+                    continue
+                current = test.get("current_optimized_program")
+                expected = test.get("expect_optimized_program")
+                if isinstance(current, str) and isinstance(expected, str) and current != expected:
+                    return test_file, test
+        return None
+
     for test_file in tests:
         for test in test_file.get("tests", []):
             if test.get("source_program") and test.get("expect_optimized_program"):
@@ -177,17 +224,18 @@ def _load_first_dataset_item(dataset_dir: str) -> tuple[str, dict, dict, dict] |
     if not dataset_files:
         return None
 
-    first_file = dataset_files[0]
-    issue_id, _ext = os.path.splitext(first_file)
-    json_path = os.path.join(dataset_dir, first_file)
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    for dataset_file in dataset_files:
+        issue_id, _ext = os.path.splitext(dataset_file)
+        json_path = os.path.join(dataset_dir, dataset_file)
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    found = _find_first_testcase(data)
-    if not found:
-        return None
-    test_file, test = found
-    return issue_id, data, test_file, test
+        found = _find_first_testcase(data)
+        if not found:
+            continue
+        test_file, test = found
+        return issue_id, data, test_file, test
+    return None
 
 
 def _call_model(prompt: str) -> str:
@@ -286,17 +334,40 @@ def main() -> None:
             )
             continue
 
-        a2_src_exp_ok, a2_src_exp_log = _alive2_check(src_ir, exp_ir)
-        a2_opt_exp_ok, a2_opt_exp_log = _alive2_check(opt_out, exp_ir)
-        a2_exp_opt_ok, a2_exp_opt_log = _alive2_check(exp_ir, opt_out)
+        cost_exp_ok, cost_exp, cost_exp_log = _run_cost_model(exp_ir)
+        cost_opt_ok, cost_opt, cost_opt_log = _run_cost_model(opt_out)
+        cost_ok = cost_exp_ok and cost_opt_ok
+        expected_le_opt = cost_ok and cost_exp <= cost_opt
 
-        equivalent = a2_opt_exp_ok and a2_exp_opt_ok
-        missed_optimization = a2_src_exp_ok and (not equivalent)
+        a2_src_exp_ok = None
+        a2_src_exp_log = None
+        if expected_le_opt:
+            a2_src_exp_ok, a2_src_exp_log = _alive2_check(src_ir, exp_ir)
+
+        a2_opt_exp_ok = None
+        a2_opt_exp_log = None
+        a2_exp_opt_ok = None
+        a2_exp_opt_log = None
+        equivalent = None
+        if expected_le_opt and a2_src_exp_ok:
+            a2_opt_exp_ok, a2_opt_exp_log = _alive2_check(opt_out, exp_ir)
+            a2_exp_opt_ok, a2_exp_opt_log = _alive2_check(exp_ir, opt_out)
+            equivalent = a2_opt_exp_ok and a2_exp_opt_ok
+
+        missed_optimization = bool(expected_le_opt and a2_src_exp_ok and equivalent is False)
 
         results["validation"].append(
             {
                 "name": name,
                 "missed_optimization": missed_optimization,
+                "cost": {
+                    "expected": cost_exp,
+                    "current_opt": cost_opt,
+                    "expected_le_current_opt": expected_le_opt,
+                    "ok": cost_ok,
+                    "expected_log": cost_exp_log,
+                    "current_opt_log": cost_opt_log,
+                },
                 "source_to_expected_ok": a2_src_exp_ok,
                 "opt_equivalent_expected": equivalent,
                 "alive2": {

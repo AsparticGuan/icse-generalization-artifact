@@ -6,7 +6,11 @@ import json
 import re
 import string
 import tarfile
+import subprocess
 from pathlib import Path
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, ".."))
 
 sys.path.append(os.path.join(os.path.dirname(os.environ["LAB_DATASET_DIR"]), "scripts"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -48,6 +52,9 @@ omit_issue_body = os.environ.get("LAB_LLM_OMIT_ISSUE_BODY", "ON") == "ON"
 max_build_jobs = int(os.environ.get("LAB_MAX_BUILD_JOBS", os.cpu_count()))
 fix_dir = os.environ["LAB_FIX_DIR"]
 os.makedirs(fix_dir, exist_ok=True)
+BASE_LLVM_DIR = os.environ.get("LAB_LLVM_DIR")
+DEFAULT_LLVM_DIR = os.path.join(_project_root, "utils", "llvm", "llvm-project")
+UTILS_DIR = os.path.join(_project_root, "utils")
 
 tools = []
 tool_get_source_prompt = "If you need to view the source code, please call the `get_source` function. It is very helpful to address compilation errors by inspecting the latest LLVM API."
@@ -428,10 +435,35 @@ def extract_function_name(func_def_node):
         return None
 
 
+def get_llvm_root() -> str:
+    if getattr(llvm_helper, "llvm_dir", None):
+        return llvm_helper.llvm_dir
+    env_dir = os.environ.get("LAB_LLVM_DIR")
+    if env_dir:
+        return env_dir
+    return DEFAULT_LLVM_DIR
+
+
+def ensure_llvm_clone_for_issue(issue_id: str) -> str:
+    issue_dir = os.path.join(UTILS_DIR, f"llvm-{issue_id}")
+    if os.path.isdir(issue_dir):
+        return issue_dir
+    os.makedirs(UTILS_DIR, exist_ok=True)
+    if BASE_LLVM_DIR and os.path.isdir(BASE_LLVM_DIR):
+        print(f"Cloning llvm-project from {BASE_LLVM_DIR} to {issue_dir}")
+        subprocess.check_call(["git", "clone", BASE_LLVM_DIR, issue_dir])
+    else:
+        print(f"Cloning llvm-project from remote to {issue_dir}")
+        subprocess.check_call(
+            ["git", "clone", "https://github.com/llvm/llvm-project.git", issue_dir]
+        )
+    return issue_dir
+
+
 def get_full_path_from_filename(filename: str, llvm_root: str = None) -> str | None:
     """Find the full path from filename (relative to llvm_root)"""
     if llvm_root is None:
-        llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+        llvm_root = get_llvm_root()
     basename = os.path.basename(filename)
     llvm_path = Path(llvm_root)
     for cpp_file in llvm_path.rglob(basename):
@@ -643,7 +675,7 @@ def load_func_info_from_json(issue_id: str, json_path: str = None) -> tuple[dict
 def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, str] | None:
     """Extract function content as hunk from specified file and function name"""
     base_commit = env.get_base_commit()
-    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    llvm_root = get_llvm_root()
 
     # Read file content from git
     try:
@@ -697,7 +729,7 @@ def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
         return []
     
     functions_to_try = []
-    llvm_root = os.path.join(os.path.dirname(__file__), "..", "utils", "llvm", "llvm-project")
+    llvm_root = get_llvm_root()
     
     # If gold_funcs exist, try to match with pred_funcs
     # pred_funcs is a dict: {"filename.cpp": ["func1", "func2", ...], ...}
@@ -938,6 +970,32 @@ def test_is_successfully_optimized(test_log: dict) -> bool:
             pass
     return False
 
+def _record_fast_full_mismatch_patch(env: Env) -> None:
+    try:
+        patch = llvm_helper.git_execute(
+            ["diff", "--", "llvm/lib/*", "llvm/include/*"]
+        )
+    except Exception:
+        patch = ""
+    env.last_fast_full_mismatch_patch = patch
+    env.last_fast_full_mismatch_full_check_count = env.full_check_count
+
+
+def _maybe_attach_fast_full_mismatch_patch(env: Env, cert: dict) -> dict:
+    patch = getattr(env, "last_fast_full_mismatch_patch", None)
+    if patch and env.fast_check_pass and not env.full_check_pass:
+        cert["fast_full_mismatch_patch"] = patch
+        cert["fast_full_mismatch_full_check_count"] = getattr(
+            env, "last_fast_full_mismatch_full_check_count", None
+        )
+    return cert
+
+
+def _dump_with_fast_full_patch(env: Env, full_messages: list) -> dict:
+    cert = env.dump(normalize_messages(full_messages))
+    return _maybe_attach_fast_full_mismatch_patch(env, cert)
+
+
 def issue_fixing_iter(
     env: Env, file, src, messages, full_messages, context_requirement
 ):
@@ -1057,6 +1115,7 @@ def issue_fixing_iter(
                 break
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
+        _record_fast_full_mismatch_patch(env)
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
             normalize_feedback(log) + \
             "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
@@ -1083,6 +1142,9 @@ def fix_issue(issue_id):
         print(f"Skip {issue_id}")
         return
     print(f"Fixing {issue_id}")
+    issue_llvm_dir = ensure_llvm_clone_for_issue(issue_id)
+    llvm_helper.llvm_dir = issue_llvm_dir
+    os.environ["LAB_LLVM_DIR"] = issue_llvm_dir
     env = Env(issue_id, basemodel_cutoff, max_build_jobs=max_build_jobs)
     verified = env.data.get("verified", False)
     if not verified:
@@ -1172,7 +1234,7 @@ def fix_issue(issue_id):
             if issue_fixing_iter(
                 env, file, hunk, messages, full_messages, context_requirement
             ):
-                cert = env.dump(normalize_messages(full_messages))
+                cert = _dump_with_fast_full_patch(env, full_messages)
                 # print(cert)
                 with open(fix_log_path, "w") as f:
                     f.write(json.dumps(cert, indent=2))
@@ -1184,7 +1246,7 @@ def fix_issue(issue_id):
         #     # traceback.print_exc()  
         #     pass
 
-        cert = env.dump(normalize_messages(full_messages))
+        cert = _dump_with_fast_full_patch(env, full_messages)
         with open(fix_log_path, "w") as f:
             f.write(json.dumps(cert, indent=2))
         return
@@ -1231,7 +1293,7 @@ def fix_issue(issue_id):
                 env, file, hunk, messages, full_messages, context_requirement
             ):
                 # Check if the fix passes both fast_check and full_check
-                cert = env.dump(normalize_messages(full_messages))
+                cert = _dump_with_fast_full_patch(env, full_messages)
                 with open(fix_log_path, "w") as f:
                     f.write(json.dumps(cert, indent=2))
                 print(f"Successfully fixed with function {func_name} in {file_path}")
@@ -1240,7 +1302,7 @@ def fix_issue(issue_id):
         print(f"Failed to fix with function {func_name} in {file_path}")
     
     # If all functions failed, save the last attempt
-    cert = env.dump(normalize_messages(full_messages))
+    cert = _dump_with_fast_full_patch(env, full_messages)
     with open(fix_log_path, "w") as f:
         f.write(json.dumps(cert, indent=2))
 

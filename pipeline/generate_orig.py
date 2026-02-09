@@ -920,9 +920,10 @@ def normalize_feedback_with_build_failure(log) -> str:
         # if len(log_str) > max_log_size:
         #     return log_str[:max_log_size] + "\n..."
         # return str(log_str)
-        pattern = re.compile(r"(llvm-project/llvm/[^\n]+error:[^\n]+(?:\n[ ]*\d+\s*\|[^\n]*)?)")
+        pattern = re.compile(r"(llvm/[^\n]+error:[^\n]+(?:\n[ ]*\d+\s*\|[^\n]*)?)")
         matches = pattern.findall(str(log))
         log_str = "\n".join(matches)
+        print("[LOG STR]", log_str)
         if len(log_str) > max_log_size:
             return log_str[:max_log_size] + "\n..."
         return str(log_str) or "No LLVM errors found."
@@ -1029,6 +1030,32 @@ def test_is_successfully_optimized(test_log: dict) -> bool:
         except Exception:
             pass
     return False
+
+def _record_fast_full_mismatch_patch(env: Env) -> None:
+    try:
+        patch = llvm_helper.git_execute(
+            ["diff", "--", "llvm/lib/*", "llvm/include/*"]
+        )
+    except Exception:
+        patch = ""
+    env.last_fast_full_mismatch_patch = patch
+    env.last_fast_full_mismatch_full_check_count = env.full_check_count
+
+
+def _maybe_attach_fast_full_mismatch_patch(env: Env, cert: dict) -> dict:
+    patch = getattr(env, "last_fast_full_mismatch_patch", None)
+    if patch and env.fast_check_pass and not env.full_check_pass:
+        cert["fast_full_mismatch_patch"] = patch
+        cert["fast_full_mismatch_full_check_count"] = getattr(
+            env, "last_fast_full_mismatch_full_check_count", None
+        )
+    return cert
+
+
+def _dump_with_fast_full_patch(env: Env, full_messages: list) -> dict:
+    cert = env.dump(normalize_messages(full_messages))
+    return _maybe_attach_fast_full_mismatch_patch(env, cert)
+
 
 def issue_fixing_iter(
     env: Env, file, src, messages, full_messages, context_requirement
@@ -1149,6 +1176,7 @@ def issue_fixing_iter(
                 break
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
     else:
+        _record_fast_full_mismatch_patch(env)
         feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
             normalize_feedback(log) + \
             "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
@@ -1267,7 +1295,7 @@ def fix_issue(issue_id):
             if issue_fixing_iter(
                 env, file, hunk, messages, full_messages, context_requirement
             ):
-                cert = env.dump(normalize_messages(full_messages))
+                cert = _dump_with_fast_full_patch(env, full_messages)
                 # print(cert)
                 with open(fix_log_path, "w") as f:
                     f.write(json.dumps(cert, indent=2))
@@ -1279,7 +1307,7 @@ def fix_issue(issue_id):
         #     # traceback.print_exc()  
         #     pass
 
-        cert = env.dump(normalize_messages(full_messages))
+        cert = _dump_with_fast_full_patch(env, full_messages)
         with open(fix_log_path, "w") as f:
             f.write(json.dumps(cert, indent=2))
         return
@@ -1326,7 +1354,7 @@ def fix_issue(issue_id):
                 env, file, hunk, messages, full_messages, context_requirement
             ):
                 # Check if the fix passes both fast_check and full_check
-                cert = env.dump(normalize_messages(full_messages))
+                cert = _dump_with_fast_full_patch(env, full_messages)
                 with open(fix_log_path, "w") as f:
                     f.write(json.dumps(cert, indent=2))
                 print(f"Successfully fixed with function {func_name} in {file_path}")
@@ -1335,7 +1363,7 @@ def fix_issue(issue_id):
         print(f"Failed to fix with function {func_name} in {file_path}")
     
     # If all functions failed, save the last attempt
-    cert = env.dump(normalize_messages(full_messages))
+    cert = _dump_with_fast_full_patch(env, full_messages)
     with open(fix_log_path, "w") as f:
         f.write(json.dumps(cert, indent=2))
 

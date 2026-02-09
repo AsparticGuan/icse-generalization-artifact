@@ -18,7 +18,7 @@ MAX_JOBS=${MAX_JOBS:-$NPROC}
 for f in dataset/*-orig.json; do
     id=$(basename "$f" .json)
     echo "Running task $id ..."
-    ./pipeline/generate_orig.py "$id" > "log/output-orig-glm-4.7-cot-iter4-${id}.log" 2>&1 &
+    ./pipeline/generate_orig.py "$id" > "log/gemini/output-orig-gemini-3-cot-iter4-${id}.log" 2>&1 &
     while [ "$(jobs -rp | wc -l)" -ge "$MAX_JOBS" ]; do
         wait -n
     done
