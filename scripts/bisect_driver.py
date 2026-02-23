@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""批量执行 LLVM issue 的 git bisect 驱动脚本。
+
+核心目标：
+1. 基于数据集中的 base_commit（通常是已知 bad）向历史回溯寻找 good 边界；
+2. 调用 bisect_runner.py 作为单点判定器，让 git bisect 自动收敛到 first bad commit；
+3. 将结果写回对应数据 JSON（字段 bisect）。
+"""
+
 
 import os
 import sys
@@ -28,6 +36,11 @@ bisect_runner_file = os.path.join(
 
 
 def is_llvm_functional_change(commit: str) -> bool:
+    """判断候选提交是否触及 LLVM 中端功能代码。
+
+当 bisect 无法精确定位到单个提交时，git 可能返回多个候选。
+这里通过是否修改 llvm/lib 或 llvm/include 粗筛掉明显无关提交。
+"""
     commit = commit.strip()
     changed_files = llvm_helper.git_execute(
         [
@@ -44,12 +57,15 @@ def is_llvm_functional_change(commit: str) -> bool:
 
 
 def bisect_issue(issue):
+    """对单个 issue 数据执行 bisect，并回写结果。"""
     path = os.path.join(llvm_helper.dataset_dir, issue)
     with open(path) as f:
         data = json.load(f)
     if data["bug_type"] == "hang":
         # Not supported yet
         return
+
+    # 若已有可解析的 bisect 结果，直接跳过，避免重复长时间计算。
     if "bisect" in data:
       commit = data["bisect"]
       try:
@@ -61,6 +77,7 @@ def bisect_issue(issue):
         pass
     print(data["issue"]["title"])
     try:
+        # base_commit 视为 BAD 端点。
         base_commit = data["base_commit"]  # bad
         base_commit_time = dateparser.parse(
             llvm_helper.git_execute(["show", "-s", "--format=%ci", base_commit]).strip()
@@ -71,6 +88,8 @@ def bisect_issue(issue):
         print("Report time:", report_time)
         print("Base commit time:", base_commit_time)
         if report_time < base_commit_time:
+            # 若报告时间早于 base_commit，尝试把 BAD 端点调整到“报告前最近提交”，
+            # 避免把模型本不该知道的未来信息引入 bisect 区间。
             commit_before_report = llvm_helper.git_execute(
                 [
                     "log",
@@ -99,6 +118,7 @@ def bisect_issue(issue):
 
         good_commit = None
         offset = 100
+        # 指数扩张向历史回退，直到找到一个 GOOD 点，减少线性探测开销。
         while offset <= 204800:  # ~5 years
             commit_sha = llvm_helper.git_execute(
                 ["rev-parse", f"{base_commit}~{offset}"]
@@ -110,6 +130,8 @@ def bisect_issue(issue):
         if good_commit is None:
             raise RuntimeError("Cannot find a good commit")
         print("BAD", base_commit, "GOOD", good_commit)
+
+        # 启动无 checkout 的 bisect，实际判定交给 bisect_runner.py。
         llvm_helper.git_execute(["bisect", "reset"])
         llvm_helper.git_execute(
             ["bisect", "start", "--no-checkout", base_commit, good_commit]
@@ -142,6 +164,7 @@ def bisect_issue(issue):
         data["bisect"] = "Timeout"
         print("Timeout")
     except subprocess.CalledProcessError as e:
+        # 某些情况下 bisect 只返回候选集合，这里做保守回退与筛选。
         out = e.stdout.decode()
         key = "The first bad commit could be any of:\n"
         pos = out.rfind(key)
@@ -169,8 +192,10 @@ def bisect_issue(issue):
 
 task_list = []
 if len(sys.argv) == 2:
+    # 传入单个 issue id 时，仅处理该样本。
     task_list = [sys.argv[1] + ".json"]
 else:
+    # 不带参数时遍历整个数据集。
     for name in os.listdir(llvm_helper.dataset_dir):
         if name.endswith(".json"):
             task_list.append(name)

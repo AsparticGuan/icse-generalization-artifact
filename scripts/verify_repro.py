@@ -13,34 +13,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""验证数据集样本是否“可复现且可修复”。
+
+该脚本是数据质量门禁，按两阶段执行：
+1. 在 base_commit 上构建并验证 repro=True（应当复现问题）；
+2. 应用修复 patch 后再构建并验证 repro=False（应当通过修复检查 + lit 测试）。
+
+若两阶段都通过，会在样本 JSON 中打上 verified=true，并记录中间优化产物。
+"""
+
 import os
 import sys
 import llvm_helper
 import json
 import re
 
+# 默认按机器 CPU 核数并行构建。
 max_build_jobs = os.cpu_count()
 
 
 def verify_issue(issue):
+    """对单个 issue 样本执行完整复现/修复验证流程。"""
     path = os.path.join(llvm_helper.dataset_dir, issue)
     with open(path) as f:
         data = json.load(f)
+
+    # 已验证样本直接跳过，避免重复编译。
     if data.get("verified", False):
         return
+
     print(data["issue"]["title"])
     base_commit = data["base_commit"]
+
+    # 先 reset 到样本基线提交，保证验证环境一致。
     llvm_helper.reset(base_commit)
     print("Stage 1 build")
     res, log = llvm_helper.build(max_build_jobs)
     if not res:
         print(log)
         raise RuntimeError("Failed to build")
+
     bug_type = data["bug_type"]
     print("Stage 1 verify")
     # res, log = llvm_helper.verify_test_group(
     #     repro=True, input=data["tests"], type=bug_type
     # )
+    # 阶段 1：应在缺陷版本上成功复现问题。
     res, log = llvm_helper.verify_test_group_orig(
         repro=True, input_tests=data["tests"], type_str=bug_type, component_list=data["hints"].get("components")
     )
@@ -49,7 +67,7 @@ def verify_issue(issue):
     if not res:
         raise RuntimeError("Failed to reproduce")
     else:
-        # we successfully reproduced the bug, so dump the failed_to_optimize programs for later use
+        # 复现成功后，回写当前优化结果，后续可用于比较/分析。
         for log_index in range(len(log)):
             for test_file_index in range(len(data["tests"])):
                 if data["tests"][test_file_index]["file"] != log[log_index]["file"]:
@@ -66,15 +84,19 @@ def verify_issue(issue):
                     data["tests"][test_file_index]["tests"][test_index]["current_optimized_program"] = optimized_program
                     break
                 break
+            # 防御性断言：确保日志与 test_name 对应函数一致。
             assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != []
             
+    # 应用修复 patch，进入“修复后”验证阶段。
     llvm_helper.apply(data["patch"])
     print("Stage 2 build")
     res, log = llvm_helper.build(max_build_jobs)
     if not res:
         print(log)
         raise RuntimeError("Failed to build")
+
     print("Stage 2 verify")
+    # 阶段 2：修复后应能通过测试（不再复现问题）。
     res, log = llvm_helper.verify_test_group(
         repro=False, input=data["tests"], type=bug_type
     )
@@ -82,7 +104,7 @@ def verify_issue(issue):
         print(json.dumps(llvm_helper.get_first_failed_test(log), indent=2))
         raise RuntimeError("Failed to fix")
     else:
-        # we successfully reproduced the bug, so dump the expected_to_optimize programs for later use
+        # 修复验证通过后，回写“期望优化结果”供后续评估。
         for log_index in range(len(log)):
             for test_file_index in range(len(data["tests"])):
                 if data["tests"][test_file_index]["file"] != log[log_index]["file"]:
@@ -100,6 +122,7 @@ def verify_issue(issue):
             assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != []
 
     print("Stage 2 lit check")
+    # 最后跑 lit 子目录回归，确保相关测试集也通过。
     res, log = llvm_helper.verify_lit(
         test_commit=data.get("test_commit", data["hints"]["fix_commit"]),
         dirs=data["lit_test_dir"],
@@ -108,6 +131,8 @@ def verify_issue(issue):
     if not res:
         print(log)
         raise RuntimeError("Lit check failure")
+
+    # 全流程通过，标记 verified。
     data["verified"] = True
 
     with open(path, "w") as f:
@@ -116,8 +141,10 @@ def verify_issue(issue):
 
 task_list = []
 if len(sys.argv) == 2:
+    # 指定 issue id：仅处理单样本。
     task_list = [sys.argv[1] + ".json"]
 else:
+    # 无参数：全量遍历数据集。
     for name in os.listdir(llvm_helper.dataset_dir):
         if name.endswith(".json"):
             task_list.append(name)

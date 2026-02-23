@@ -13,6 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""对单个 LLVM issue 做深度抽取并生成标准化样本 JSON。
+
+该脚本是数据集构建的核心步骤，输入 issue_id 后会：
+1. 拉取 issue 与 timeline，定位 fix commit；
+2. 抽取修复 patch、组件 hints、行级/函数级 bug 定位；
+3. 从修复提交相关测试中提取 RUN/FileCheck 指令与子测试体；
+4. 汇总 issue 正文/评论，生成 dataset/{issue_id}.json。
+
+通常由 extract_from_issues.py 批量调用，也支持单独手工执行。
+"""
+
 from curses import flash
 import os
 import requests
@@ -24,6 +35,7 @@ from unidiff import PatchSet
 import re
 import subprocess
 
+# GitHub API 会话：统一加 token 与版本头。
 github_token = os.environ["LAB_GITHUB_TOKEN"]
 session = requests.Session()
 session.headers.update(
@@ -33,14 +45,17 @@ session.headers.update(
         "Accept": "application/vnd.github+json",
     }
 )
+# 启动前检查 llvm-extract 是否可用，避免后续流程中途失败。
 subprocess.check_output(["llvm-extract", "--version"])
 
+# CLI: python3 postfix_extract.py <issue_id> [-f]
 issue_id = sys.argv[1]
 override = False
 if len(sys.argv) == 3 and sys.argv[2] == "-f":
     print("Force override")
     override = True
 
+# 默认若目标文件已存在则跳过；-f 可强制覆盖。
 data_json_path = os.path.join(llvm_helper.dataset_dir, f"{issue_id}.json")
 if not override and os.path.exists(data_json_path):
     print(f"Item {issue_id}.json already exists")
@@ -50,13 +65,21 @@ force = override
 issue_url = f"https://api.github.com/repos/llvm/llvm-project/issues/{issue_id}"
 print(f"Fetching {issue_url}")
 issue = session.get(issue_url).json()
+
+# 非 closed/completed 的 issue 默认不处理，除非显式 force。
 if (issue["state"] != "closed" or issue["state_reason"] != "completed") and not force:
     print("The issue/PR should be closed")
     exit(1)
 
+# 样本的知识截断时间取 issue 创建时间。
 knowledge_cutoff = issue["created_at"]
+# timeline 用于推断关闭提交、引用提交等 fix 线索。
 timeline = session.get(issue["timeline_url"]).json()
 fix_commit = None
+
+# 人工维护的特殊映射：
+# - 值为 None 表示该 issue 已确认不适合纳入数据集；
+# - 值为 commit 哈希表示使用指定修复提交覆盖自动推断。
 fix_commit_map = {
     "76789": None,  # Cannot reproduce with alive2
     "77842": None,  # Threshold problem
@@ -174,6 +197,7 @@ if issue_id in fix_commit_map:
         print("This issue is marked as invalid")
         exit(0)
 else:
+    # 自动推断 fix_commit：优先 closed 事件里的 commit，再看 referenced 事件。
     for event in timeline:
         # cannot handle 164436 because the fix is in a PR
         if event["event"] == "closed":
@@ -188,6 +212,7 @@ else:
 
 if fix_commit is None:
     if force:
+        # force 模式下兜底用 main 最新提交，便于调试抽取流程。
         fix_commit = llvm_helper.git_execute(
             ["rev-parse", "origin/main"]
         ).strip()
@@ -195,6 +220,7 @@ if fix_commit is None:
         print("Cannot find the fix commit")
         exit(0)
 
+# 识别 issue 类型，并过滤明显无效标签。
 issue_type = "unknown"
 for label in issue["labels"]:
     label_name = label["name"]
@@ -213,22 +239,25 @@ for label in issue["labels"]:
         print("This issue is marked as invalid")
         exit(1)
 
+# base_commit 取 fix 的前一提交，代表“修复前状态”。
 base_commit = llvm_helper.git_execute(["rev-parse", fix_commit + "~"]).strip()
 changed_files = llvm_helper.git_execute(
     ["show", "--name-only", "--format=", fix_commit]
 ).strip()
+# 某些前端/bitcode 子系统暂不纳入该数据集。
 if "/AsmParser/" in changed_files or "/Bitcode/" in changed_files:
     print("This issue is marked as invalid")
     exit(0)
 
-# Component level
+# 组件级 hints：由变更路径推断。
 components = llvm_helper.infer_related_components(changed_files.split("\n"))
-# Extract patch
+# 提取代码 patch（限定 llvm/lib + llvm/include）。
 patch = llvm_helper.git_execute(
     ["show", fix_commit, "--", "llvm/lib/*", "llvm/include/*"]
 )
 patchset = PatchSet(patch)
-# Line level
+
+# 行级 hints：记录每个改动文件的行号区间。
 bug_location_lineno = {}
 for file in patchset:
     location = hints.get_line_loc(file)
@@ -236,8 +265,7 @@ for file in patchset:
         bug_location_lineno[file.path] = location
 
 
-# Function level
-
+# 函数级 hints：在 base_commit 源码上定位受影响函数。
 bug_location_funcname = {}
 for file in patchset.modified_files:
     print(f"Parsing {file.path}")
@@ -246,13 +274,14 @@ for file in patchset.modified_files:
     if len(modified_funcs_valid) != 0:
         bug_location_funcname[file.path] = sorted(modified_funcs_valid)
 
-# Extract tests
+# 提取测试 patch（限定 llvm/test）。
 test_patchset = PatchSet(
     llvm_helper.git_execute(["show", fix_commit, "--", "llvm/test/*"])
 )
 
 
 def remove_target_suffix(path):
+    """归一化测试目录：去掉目标架构子目录后缀。"""
     targets = [
         "X86",
         "AArch64",
@@ -270,12 +299,15 @@ def remove_target_suffix(path):
     return path
 
 
+# lit_test_dir：用于后续 verify_lit 的目录集合。
 lit_test_dir = set(
     map(
         lambda x: remove_target_suffix(os.path.dirname(x)),
         filter(lambda x: x.count("llvm/test/"), changed_files.split("\n")),
     )
 )
+
+# tests：最终写入样本 JSON 的测试结构。
 tests = []
 runline_pattern_list = [
     re.compile(r"; RUN: (.+)\| (FileCheck .*)"),
@@ -292,8 +324,10 @@ retrieve_test_from_main = {
     "89500",
     "91178",
 }
+# 某些特殊 issue 的测试在 fix_commit 上不可直接提取，改从 main 取。
 test_commit = "origin/main" if issue_id in retrieve_test_from_main else fix_commit
 for file in test_patchset:
+    # 获取测试文件全文（用于 RUN 命令提取与子函数抽取）。
     test_file = llvm_helper.git_execute(["show", f"{test_commit}:{file.path}"])
     # merge all check-prefixes such that we can do the filtering later in verify_dispatch
     check_prefixes_raw = re.findall(r"--check-prefixes=([^\s]+)", test_file) + re.findall(r"--check-prefix=([^\s]+)", test_file)
@@ -307,6 +341,7 @@ for file in test_patchset:
         for match in re.findall(runline_pattern, test_file):
             check_prefixes_curr = re.findall(r"(--check-prefix[^\s]+)", match[1])
             if check_prefixes_curr:
+                # 把当前 RUN 行中的 check-prefix 统一扩展为全量集合，便于后续过滤。
                 check_prefixes_use_all = f'--check-prefixes={",".join(check_prefixes_all)}'
                 commands.append([match[0].strip(), match[1].strip().replace(check_prefixes_curr[0], check_prefixes_use_all)])
             else:
@@ -347,6 +382,7 @@ for file in test_patchset:
     subtests = []
     for test_name in test_names:
         try:
+            # 用 llvm-extract 抽取单函数 IR 作为子测试主体。
             test_body_extract = subprocess.check_output(
                 ["llvm-extract-18", f"--func={test_name}", "-S", "-"],
                 input=test_file.encode(),
@@ -383,10 +419,12 @@ for file in test_patchset:
             )
         except Exception as e:
             print(f"Error extracting test body for {test_name}: {e}")
+
+    # 一个测试文件下可能包含多个 subtest；为空则忽略。
     if len(subtests) != 0:
         tests.append({"file": file.path, "commands": commands, "tests": subtests})
 
-# Extract full issue context
+# 提取 issue 对话上下文，并过滤噪声评论。
 issue_comments = []
 comments = session.get(issue["comments_url"]).json()
 for comment in comments:
@@ -396,6 +434,8 @@ for comment in comments:
     }
     if llvm_helper.is_valid_comment(comment_obj):
         issue_comments.append(comment_obj)
+
+# 规范化 issue 字段，便于下游统一消费。
 normalized_issue = {
     "title": issue["title"],
     "body": issue["body"],
@@ -410,7 +450,7 @@ for item in bug_location_funcname.values():
 is_single_file_fix = len(bug_location_funcname) == 1
 is_single_func_fix = is_single_file_fix and bug_func_count == 1
 
-# Write to file
+# 写入标准化样本 JSON。
 metadata = {
     "bug_id": issue_id,
     "issue_url": issue["html_url"],
