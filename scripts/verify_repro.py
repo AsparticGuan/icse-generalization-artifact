@@ -28,13 +28,13 @@ def verify_issue(issue):
         data = json.load(f)
     if data.get("verified", False):
         return
-    print(data["issue"]["title"])
+    # print(data["issue"]["title"])
     base_commit = data["base_commit"]
     llvm_helper.reset(base_commit)
     print("Stage 1 build")
     res, log = llvm_helper.build(max_build_jobs)
     if not res:
-        print(log)
+        # print(log)
         raise RuntimeError("Failed to build")
     bug_type = data["bug_type"]
     print("Stage 1 verify")
@@ -66,13 +66,13 @@ def verify_issue(issue):
                     data["tests"][test_file_index]["tests"][test_index]["current_optimized_program"] = optimized_program
                     break
                 break
-            assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != []
+            assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != [], f"optimized_program: {optimized_program}"
             
     llvm_helper.apply(data["patch"])
     print("Stage 2 build")
     res, log = llvm_helper.build(max_build_jobs)
     if not res:
-        print(log)
+        # print(log)
         raise RuntimeError("Failed to build")
     print("Stage 2 verify")
     res, log = llvm_helper.verify_test_group(
@@ -125,10 +125,10 @@ task_list.sort()
 
 for idx, task in enumerate(task_list):
     print("Verifying", idx + 1, task.removesuffix(".json"))
-    # verify_issue(task)
-    try:
-        verify_issue(task)
-        print("Verification successful")
-    except Exception as e:
-        print(e)
-        print("Verification failed")
+    verify_issue(task)
+    # try:
+    #     verify_issue(task)
+    #     print("Verification successful")
+    # except Exception as e:
+    #     print(e)
+    #     print("Verification failed")

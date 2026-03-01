@@ -43,6 +43,55 @@
   "patch": "commit baf2953097a8d606c8e8441c61c09f607f583cc8\nAuthor: kissholic <kissholicovo@outlook.com>\nDate:   Sat Jul 19 16:52:06 2025 +0800\n\n    Optimize fptrunc(x)>=C1 -->  x>=C2 (#99475)\n    \n    Fix https://github.com/llvm/llvm-project/issues/85265#issue-2186848949\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 9df08553d86e..c90ff2a868d4 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -11,6 +11,7 @@\n //===----------------------------------------------------------------------===//\n \n #include \"InstCombineInternal.h\"\n+#include \"llvm/ADT/APFloat.h\"\n #include \"llvm/ADT/APSInt.h\"\n #include \"llvm/ADT/SetVector.h\"\n #include \"llvm/ADT/Statistic.h\"\n@@ -21,8 +22,10 @@\n #include \"llvm/Analysis/Utils/Local.h\"\n #include \"llvm/Analysis/VectorUtils.h\"\n #include \"llvm/IR/ConstantRange.h\"\n+#include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DataLayout.h\"\n #include \"llvm/IR/InstrTypes.h\"\n+#include \"llvm/IR/Instructions.h\"\n #include \"llvm/IR/IntrinsicInst.h\"\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/Support/KnownBits.h\"\n@@ -8222,6 +8225,98 @@ static Instruction *foldFCmpReciprocalAndZero(FCmpInst &I, Instruction *LHSI,\n   return new FCmpInst(Pred, LHSI->getOperand(1), RHSC, \"\", &I);\n }\n \n+// Transform 'fptrunc(x) cmp C' to 'x cmp ext(C)' if possible.\n+// Patterns include:\n+//    fptrunc(x) <  C  -->  x <  ext(C)\n+//    fptrunc(x) <= C  -->  x <= ext(C)\n+//    fptrunc(x) >  C  -->  x >  ext(C)\n+//    fptrunc(x) >= C  -->  x >= ext(C)\n+// where 'ext(C)' is the extension of 'C' to the type of 'x' with a small bias\n+// due to precision loss.\n+static Instruction *foldFCmpFpTrunc(FCmpInst &I, const Instruction &FPTrunc,\n+                                    const Constant &C) {\n+  FCmpInst::Predicate Pred = I.getPredicate();\n+  bool RoundDown = false;\n+\n+  if (Pred == FCmpInst::FCMP_OGE || Pred == FCmpInst::FCMP_UGE ||\n+      Pred == FCmpInst::FCMP_OLT || Pred == FCmpInst::FCMP_ULT)\n+    RoundDown = true;\n+  else if (Pred == FCmpInst::FCMP_OGT || Pred == FCmpInst::FCMP_UGT ||\n+           Pred == FCmpInst::FCMP_OLE || Pred == FCmpInst::FCMP_ULE)\n+    RoundDown = false;\n+  else\n+    return nullptr;\n+\n+  const APFloat *CValue;\n+  if (!match(&C, m_APFloat(CValue)))\n+    return nullptr;\n+\n+  if (CValue->isNaN() || CValue->isInfinity())\n+    return nullptr;\n+\n+  auto ConvertFltSema = [](const APFloat &Src, const fltSemantics &Sema) {\n+    bool LosesInfo;\n+    APFloat Dest = Src;\n+    Dest.convert(Sema, APFloat::rmNearestTiesToEven, &LosesInfo);\n+    return Dest;\n+  };\n+\n+  auto NextValue = [](const APFloat &Value, bool RoundDown) {\n+    APFloat NextValue = Value;\n+    NextValue.next(RoundDown);\n+    return NextValue;\n+  };\n+\n+  APFloat NextCValue = NextValue(*CValue, RoundDown);\n+\n+  Type *DestType = FPTrunc.getOperand(0)->getType();\n+  const fltSemantics &DestFltSema =\n+      DestType->getScalarType()->getFltSemantics();\n+\n+  APFloat ExtCValue = ConvertFltSema(*CValue, DestFltSema);\n+  APFloat ExtNextCValue = ConvertFltSema(NextCValue, DestFltSema);\n+\n+  // When 'NextCValue' is infinity, use an imaged 'NextCValue' that equals\n+  // 'CValue + bias' to avoid the infinity after conversion. The bias is\n+  // estimated as 'CValue - PrevCValue', where 'PrevCValue' is the previous\n+  // value of 'CValue'.\n+  if (NextCValue.isInfinity()) {\n+    APFloat PrevCValue = NextValue(*CValue, !RoundDown);\n+    APFloat Bias = ConvertFltSema(*CValue - PrevCValue, DestFltSema);\n+\n+    ExtNextCValue = ExtCValue + Bias;\n+  }\n+\n+  APFloat ExtMidValue =\n+      scalbn(ExtCValue + ExtNextCValue, -1, APFloat::rmNearestTiesToEven);\n+\n+  const fltSemantics &SrcFltSema =\n+      C.getType()->getScalarType()->getFltSemantics();\n+\n+  // 'MidValue' might be rounded to 'NextCValue'. Correct it here.\n+  APFloat MidValue = ConvertFltSema(ExtMidValue, SrcFltSema);\n+  if (MidValue != *CValue)\n+    ExtMidValue.next(!RoundDown);\n+\n+  // Check whether 'ExtMidValue' is a valid result since the assumption on\n+  // imaged 'NextCValue' might not hold for new float types.\n+  // ppc_fp128 can't pass here when converting from max float because of\n+  // APFloat implementation.\n+  if (NextCValue.isInfinity()) {\n+    // ExtMidValue --- narrowed ---> Finite\n+    if (ConvertFltSema(ExtMidValue, SrcFltSema).isInfinity())\n+      return nullptr;\n+\n+    // NextExtMidValue --- narrowed ---> Infinity\n+    APFloat NextExtMidValue = NextValue(ExtMidValue, RoundDown);\n+    if (ConvertFltSema(NextExtMidValue, SrcFltSema).isFinite())\n+      return nullptr;\n+  }\n+\n+  return new FCmpInst(Pred, FPTrunc.getOperand(0),\n+                      ConstantFP::get(DestType, ExtMidValue), \"\", &I);\n+}\n+\n /// Optimize fabs(X) compared with zero.\n static Instruction *foldFabsWithFcmpZero(FCmpInst &I, InstCombinerImpl &IC) {\n   Value *X;\n@@ -8712,6 +8807,10 @@ Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {\n                   cast<LoadInst>(LHSI), GEP, GV, I))\n             return Res;\n       break;\n+    case Instruction::FPTrunc:\n+      if (Instruction *NV = foldFCmpFpTrunc(I, *LHSI, *RHSC))\n+        return NV;\n+      break;\n     }\n   }\n \n",
   "tests": [
     {
+      "file": "issue_body_ir.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "",
+          "source_program": "define i1 @test(double %0) {\r\nif.end155:\r\n%1 = fptrunc double %0 to float\r\n%2 = fcmp oge float %1, 1.000000e+02\r\nret i1 %2\r\n}\n",
+          "expect_optimized_program": "define i1 @test(double %0) {\r\nif.end155:\r\n%oge = fcmp oge double %0, 0x4058FFFFF0000000\r\nret i1 %oge\r\n}\n",
+          "current_optimized_program": "define i1 @test(double %0) {\nif.end155:\n  %1 = fptrunc double %0 to float\n  %2 = fcmp oge float %1, 1.000000e+02\n  ret i1 %2\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "missed optimization, fptrunc (x) >= C1 => x >= C2",
+    "body": "https://alive2.llvm.org/ce/z/n53up6\r\nhttps://godbolt.org/z/q6vrbxTo3\r\n```llvm\r\ndefine i1 @src(double %0) {\r\nif.end155:\r\n%1 = fptrunc double %0 to float\r\n%2 = fcmp oge float %1, 1.000000e+02\r\nret i1 %2\r\n}\r\ndefine i1 @tgt(double %0) {\r\nif.end155:\r\n%oge = fcmp oge double %0, 0x4058FFFFF0000000\r\nret i1 %oge\r\n}\r\n```\r\n\r\nOther variants may follow the same patterns.",
+    "author": "zhengyang92",
+    "labels": [
+      "good first issue",
+      "llvm:instcombine",
+      "missed-optimization",
+      "floating-point"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Could you please provide proofs about FMF propagation for all your recent issues? Thank you :)\r\n"
+      },
+      {
+        "author": "miguelraz",
+        "body": "Hey all, I'd like to claim working on this issue if possible. "
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "@miguelraz Ping."
+      },
+      {
+        "author": "kissholic",
+        "body": "Hey, I'm interested in fixing this issue.  Marks here, and please assign this issue to me when it available."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "dev_tests": [
+    {
       "file": "llvm/test/Transforms/InstCombine/fold-fcmp-trunc.ll",
       "commands": [
         [
@@ -445,39 +494,5 @@
         }
       ]
     }
-  ],
-  "issue": {
-    "title": "missed optimization, fptrunc (x) >= C1 => x >= C2",
-    "body": "https://alive2.llvm.org/ce/z/n53up6\r\nhttps://godbolt.org/z/q6vrbxTo3\r\n```llvm\r\ndefine i1 @src(double %0) {\r\nif.end155:\r\n%1 = fptrunc double %0 to float\r\n%2 = fcmp oge float %1, 1.000000e+02\r\nret i1 %2\r\n}\r\ndefine i1 @tgt(double %0) {\r\nif.end155:\r\n%oge = fcmp oge double %0, 0x4058FFFFF0000000\r\nret i1 %oge\r\n}\r\n```\r\n\r\nOther variants may follow the same patterns.",
-    "author": "zhengyang92",
-    "labels": [
-      "good first issue",
-      "llvm:instcombine",
-      "missed-optimization",
-      "floating-point"
-    ],
-    "comments": [
-      {
-        "author": "dtcxzyw",
-        "body": "Could you please provide proofs about FMF propagation for all your recent issues? Thank you :)\r\n"
-      },
-      {
-        "author": "miguelraz",
-        "body": "Hey all, I'd like to claim working on this issue if possible. "
-      },
-      {
-        "author": "dtcxzyw",
-        "body": "@miguelraz Ping."
-      },
-      {
-        "author": "kissholic",
-        "body": "Hey, I'm interested in fixing this issue.  Marks here, and please assign this issue to me when it available."
-      }
-    ]
-  },
-  "properties": {
-    "is_single_file_fix": true,
-    "is_single_func_fix": false
-  },
-  "verified": true
+  ]
 }

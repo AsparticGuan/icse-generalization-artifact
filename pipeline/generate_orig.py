@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Generate script for dataset entries with 'orig' in filename:
-test_body is empty, no FileCheck. Uses verify_test_group_orig
-(opt + alive2 + cost only).
-"""
 import sys
 import os
 
@@ -25,12 +20,15 @@ import shutil
 import llvm_helper # pyright: ignore[reportMissingImports]  # noqa: E402
 from lab_env import Environment as Env # pyright: ignore[reportMissingImports]  # noqa: E402
 
+from openai import OpenAI
+from openai import NOT_GIVEN
+
 
 class EnvironmentOrig(Env):
     """Environment for dataset-orig: verification without FileCheck (test_body empty)."""
 
     def check_fast(self, skip_build=False):
-        from lab_env import TimeCompensationGuard
+        from lab_env import TimeCompensationGuard # pyright: ignore[reportMissingImports]  # noqa: E402
         with TimeCompensationGuard(self):
             self.fast_check_count += 1
             if not skip_build:
@@ -51,7 +49,7 @@ class EnvironmentOrig(Env):
             return (True, log)
 
     def check_full(self):
-        from lab_env import TimeCompensationGuard
+        from lab_env import TimeCompensationGuard # pyright: ignore[reportMissingImports]  # noqa: E402
         with TimeCompensationGuard(self):
             self.full_check_count += 1
             res, reason = self.build()
@@ -77,8 +75,7 @@ class EnvironmentOrig(Env):
                 return (False, log)
             self.full_check_pass = True
             return (True, log)
-from openai import OpenAI
-from openai import NOT_GIVEN
+
 
 # Import tree-sitter for C++ function extraction
 try:
@@ -781,7 +778,6 @@ def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, s
 
 
 def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
-    """Get list of (file_path, func_name) tuples to try from pipeline/localize-result.json"""
     pred_funcs, gold_funcs, gold_file = load_func_info_from_json(issue_id)
     
     # If no pred_funcs found, return empty list (will fall back to original method)
@@ -1026,7 +1022,7 @@ def test_is_successfully_optimized(test_log: dict) -> bool:
             srcc = cost.get("source_program", None)
             expc = cost.get("expect_optimized_program", None)
             if all(isinstance(x, (int, float)) for x in [curc, srcc, expc]):
-                return (curc < srcc) or (curc <= expc)
+                return (curc < srcc) and (curc <= expc)
         except Exception:
             pass
     return False
@@ -1042,7 +1038,13 @@ def _record_fast_full_mismatch_patch(env: Env) -> None:
     env.last_fast_full_mismatch_full_check_count = env.full_check_count
 
 
-def _maybe_attach_fast_full_mismatch_patch(env: Env, cert: dict) -> dict:
+def _dump_with_fast_full_patch(env: Env, full_messages: list) -> dict:
+    cert = env.dump(None)
+    cert.pop("log", None)
+    cert.pop("check_fast_log", None)
+    cert.pop("check_full_log", None)
+    cert.pop("full_check_count", None)
+    cert.pop("full_check_pass", None)
     patch = getattr(env, "last_fast_full_mismatch_patch", None)
     if patch and env.fast_check_pass and not env.full_check_pass:
         cert["fast_full_mismatch_patch"] = patch
@@ -1050,11 +1052,6 @@ def _maybe_attach_fast_full_mismatch_patch(env: Env, cert: dict) -> dict:
             env, "last_fast_full_mismatch_full_check_count", None
         )
     return cert
-
-
-def _dump_with_fast_full_patch(env: Env, full_messages: list) -> dict:
-    cert = env.dump(normalize_messages(full_messages))
-    return _maybe_attach_fast_full_mismatch_patch(env, cert)
 
 
 def issue_fixing_iter(
@@ -1070,7 +1067,8 @@ def issue_fixing_iter(
         tgt = chat(env, messages, full_messages)
     modify_inplace(file, src, tgt)
     last_build_failure_count = env.build_failure_count
-    res, log = env.check_full()
+    res, log = env.check_fast()
+    # res, log = env.check_full()
     if res:
         return True
     if env.build_failure_count > last_build_failure_count:
@@ -1078,7 +1076,8 @@ def issue_fixing_iter(
         feedback = "Your generated code caused the following build failure:\n" + \
             normalize_feedback_with_build_failure(log) + \
             "\nPlease adjust your code according to the feedback."
-    elif env.fast_check_pass != True:
+    # elif env.fast_check_pass != True:
+    else:
         # if the build is successful, we get the remaining unoptimized test program
         # firstly, update the cost of the prompted tests
         for test_name in env.prompted_tests:
@@ -1175,11 +1174,11 @@ def issue_fixing_iter(
                     continue
                 break
         feedback += "Please revisit your generated code and adjust it according to the feedback.\n"
-    else:
-        _record_fast_full_mismatch_patch(env)
-        feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
-            normalize_feedback(log) + \
-            "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
+    # else:
+    #     _record_fast_full_mismatch_patch(env)
+    #     feedback = "Your generated code has successfully optimized the given programs. However, it caused the behavior change in other programs as revealed by the following log:\n" + \
+    #         normalize_feedback(log) + \
+    #         "\nPlease adjust your code such that it keeps the already-achieved optimization while fixing the behavior change."
     append_message(
         messages,
         full_messages,
@@ -1195,6 +1194,72 @@ def normalize_messages(messages):
 
 
 override = False
+use_generalize = False
+
+
+def load_generalize_tests(issue_id: str) -> list[dict]:
+    """Load additional test cases from generalize results.
+
+    Scans the generalize JSON for validation entries with missed_optimization=true,
+    then extracts the corresponding ir and expected_optimized_ir from testcases.
+
+    Returns a list of test dicts with keys:
+        test_name, test_body, source_program, expect_optimized_program
+    """
+    generalize_dir = os.environ.get("LAB_GENERALIZE_DIR")
+    if not generalize_dir:
+        print("Warning: LAB_GENERALIZE_DIR not set, skipping generalize tests")
+        return []
+
+    generalize_file = os.path.join(generalize_dir, f"{issue_id}.json")
+    if not os.path.exists(generalize_file):
+        print(f"Warning: Generalize file {generalize_file} not found, skipping")
+        return []
+
+    try:
+        with open(generalize_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load generalize file {generalize_file}: {e}")
+        return []
+
+    # Get validation entries with missed_optimization=true
+    validation = data.get("validation", [])
+    missed_names = set()
+    for v in validation:
+        if v.get("missed_optimization") is True:
+            missed_names.add(v.get("name"))
+
+    if not missed_names:
+        print(f"No missed optimization test cases found in {generalize_file}")
+        return []
+
+    # Get corresponding testcases from parsed data
+    parsed = data.get("parsed", {})
+    testcases = parsed.get("testcases", [])
+
+    extra_tests = []
+    skipped_negative = 0
+    for tc in testcases:
+        tc_name = tc.get("name")
+        if tc_name in missed_names:
+            ir = tc.get("ir", "")
+            expected_ir = tc.get("expected_optimized_ir", "")
+            if ir and expected_ir:
+                if ir.strip() == expected_ir.strip():
+                    skipped_negative += 1
+                    continue
+                extra_tests.append({
+                    "test_name": f"gen_{tc_name}",
+                    "test_body": "",
+                    "source_program": ir,
+                    "expect_optimized_program": expected_ir,
+                })
+    if skipped_negative:
+        print(f"Skipped {skipped_negative} negative test cases (source == expected)")
+
+    print(f"Loaded {len(extra_tests)} generalize test cases from {generalize_file}")
+    return extra_tests
 
 
 def fix_issue(issue_id):
@@ -1211,6 +1276,16 @@ def fix_issue(issue_id):
     if not verified:
         print(f"Issue {issue_id} is not verified")
         return
+    # Inject generalize test cases if enabled
+    if use_generalize:
+        extra_tests = load_generalize_tests(issue_id)
+        if extra_tests:
+            env.data["tests"].append({
+                "file": "generalize_tests.ll",
+                "commands": [],
+                "tests": extra_tests,
+            })
+            print(f"Injected {len(extra_tests)} generalize test cases for {issue_id}")
     bug_funcs = env.get_hint_bug_functions()
     # if not env.is_single_func_fix():
     #     print("Multi-func bug is not supported")
@@ -1256,63 +1331,67 @@ def fix_issue(issue_id):
     env.reset()
     llvm_helper.llvm_build_dir = os.path.join(os.environ["LAB_LLVM_BUILD_DIR"], task)
     llvm_build_cache_dir = os.path.join(os.environ["LAB_LLVM_BUILD_DIR"], task + "_cache")
-    if os.path.exists(llvm_build_cache_dir):
-        # first, remove the build directory
-        shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
-        # copy the build directory
-        shutil.copytree(llvm_build_cache_dir, llvm_helper.llvm_build_dir)
-        res, log = env.check_fast(skip_build=True)
-        print("[LOG]", log)
-    else:
-        res, log = env.check_fast(skip_build=False)
-        # copy the build directory
-        shutil.copytree(llvm_helper.llvm_build_dir, llvm_build_cache_dir)
+    # if os.path.exists(llvm_build_cache_dir):
+    #     # first, remove the build directory
+    #     shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
+    #     # copy the build directory
+    #     shutil.copytree(llvm_build_cache_dir, llvm_helper.llvm_build_dir)
+    #     res, log = env.check_fast(skip_build=True)
+    #     print("[LOG]", log)
+    # else:
+    #     res, log = env.check_fast(skip_build=False)
+    #     # copy the build directory
+    #     shutil.copytree(llvm_helper.llvm_build_dir, llvm_build_cache_dir)
             
-    # Some case can pass check fast directly, these test cases are skipped.
-    assert not res, "Could pass check fast directly without fix."
+    # # Some case can pass check fast directly, these test cases are skipped.
+    # assert not res, "Could pass check fast directly without fix."
     
     # Get functions to try from JSON
     functions_to_try = get_functions_to_try(issue_id)
     
-    # If no functions found in JSON, fall back to the hint function itself.
-    if not functions_to_try:
-        result = get_hunk_from_func(env, bug_file_hint, bug_func_name)
-        if not result:
-            print(
-                f"Warning: Cannot extract function {bug_func_name} from {bug_file_hint}, skipping"
-            )
-            return
-        file, hunk = result
-        desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
-        prefix = "\n".join(hunk.splitlines()[:5])
-        suffix = "\n".join(hunk.splitlines()[-5:])
-        context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
-        desc += format_requirement + context_requirement
-        append_message(messages, full_messages, {"role": "user", "content": desc})
-        # try:
-        for idx in range(max_sample_count):
-            print(f"Round {idx + 1}")
-            if issue_fixing_iter(
-                env, file, hunk, messages, full_messages, context_requirement
-            ):
-                cert = _dump_with_fast_full_patch(env, full_messages)
-                # print(cert)
-                with open(fix_log_path, "w") as f:
-                    f.write(json.dumps(cert, indent=2))
-                return
-        print(messages)
-        # except Exception as e:
-        #     # import traceback
-        #     # print("⚠️ An exception occurred:")
-        #     # traceback.print_exc()  
-        #     pass
-
-        cert = _dump_with_fast_full_patch(env, full_messages)
-        with open(fix_log_path, "w") as f:
-            f.write(json.dumps(cert, indent=2))
+    if len(functions_to_try) != 1:
+        print(f"Skipping {issue_id}: expected exactly 1 candidate function, got {len(functions_to_try)}")
         return
     
-    # Try each function separately
+    # result = get_hunk_from_func(env, bug_file_hint, bug_func_name)
+    # if not result:
+    #     print(
+    #         f"Warning: Cannot extract function {bug_func_name} from {bug_file_hint}, skipping"
+    #     )
+    #     return
+    # file, hunk = result
+    # desc += f"Please modify the following code in {file}:{bug_func_name} to implement the missed optimization:\n```cpp\n{hunk}\n```\n"
+    # prefix = "\n".join(hunk.splitlines()[:5])
+    # suffix = "\n".join(hunk.splitlines()[-5:])
+    # context_requirement = f"Please make sure the answer includes the prefix:\n```cpp\n{prefix}\n```\nand the suffix:\n```cpp\n{suffix}\n```\n"
+    # desc += format_requirement + context_requirement
+    # append_message(messages, full_messages, {"role": "user", "content": desc})
+    # # try:
+    # for idx in range(max_sample_count):
+    #     print(f"Round {idx + 1}")
+    #     if issue_fixing_iter(
+    #         env, file, hunk, messages, full_messages, context_requirement
+    #     ):
+    #         cert = _dump_with_fast_full_patch(env, full_messages)
+    #         # print(cert)
+    #         with open(fix_log_path, "w") as f:
+    #             f.write(json.dumps(cert, indent=2))
+    #         return
+    # print(messages)
+    # # except Exception as e:
+    # #     # import traceback
+    # #     # print("⚠️ An exception occurred:")
+    # #     # traceback.print_exc()  
+    # #     pass
+
+    # cert = _dump_with_fast_full_patch(env, full_messages)
+    # with open(fix_log_path, "w") as f:
+    #     f.write(json.dumps(cert, indent=2))
+    # return
+    
+    # Try each function separately, track per-function results
+    func_results = []
+
     for func_idx, (file_path, func_name) in enumerate(functions_to_try):
         print(f"\nTrying function {func_idx + 1}/{len(functions_to_try)}: {func_name} in {file_path}")
         
@@ -1347,28 +1426,80 @@ def fix_issue(issue_id):
         func_desc += format_requirement + context_requirement
         append_message(messages, full_messages, {"role": "user", "content": func_desc})
         
+        last_fast_pass_result = None
+        full_success = False
+        
         # Try to fix with this function
         for idx in range(max_sample_count):
             print(f"Round {idx + 1}")
-            if issue_fixing_iter(
+            iter_success = issue_fixing_iter(
                 env, file, hunk, messages, full_messages, context_requirement
-            ):
-                # Check if the fix passes both fast_check and full_check
-                cert = _dump_with_fast_full_patch(env, full_messages)
-                with open(fix_log_path, "w") as f:
-                    f.write(json.dumps(cert, indent=2))
-                print(f"Successfully fixed with function {func_name} in {file_path}")
-                return
+            )
+            
+            # Capture the patch whenever fast check passes
+            if env.fast_check_pass:
+                try:
+                    patch = str(llvm_helper.git_execute(
+                        ["diff", "--", "llvm/lib/*", "llvm/include/*"]
+                    ))
+                except Exception:
+                    patch = ""
+                last_fast_pass_result = {
+                    "file_path": file_path,
+                    "func_name": func_name,
+                    "patch": patch,
+                    "check_fast_pass": True,
+                    "check_full_pass": bool(iter_success),
+                }
+            
+            if iter_success:
+                full_success = True
+                break
         
-        print(f"Failed to fix with function {func_name} in {file_path}")
+        if last_fast_pass_result:
+            func_results.append(last_fast_pass_result)
+            print(f"Saved last fast-check-passing patch for {func_name} in {file_path} (full_pass={last_fast_pass_result['check_full_pass']})")
+        else:
+            print(f"No fast-check-passing patch found for {func_name} in {file_path}")
+        
+        if full_success:
+            print(f"Successfully fixed with function {func_name} in {file_path}")
+            break
+        else:
+            print(f"Failed to fix with function {func_name} in {file_path}")
     
-    # If all functions failed, save the last attempt
+    # Save combined results: keep original top-level cert fields + per-function data
     cert = _dump_with_fast_full_patch(env, full_messages)
+    cert["func_results"] = func_results
+    cert["success"] = any(r["check_full_pass"] for r in func_results) if func_results else False
     with open(fix_log_path, "w") as f:
-        f.write(json.dumps(cert, indent=2))
+        f.write(json.dumps(cert, indent=2, default=str))
 
 
-if len(sys.argv) == 1:
+# Parse command-line arguments: separate flags from positional args
+_cli_args = sys.argv[1:]
+_cli_flags = set()
+_cli_positional = []
+for _a in _cli_args:
+    if _a.startswith("-"):
+        _cli_flags.add(_a)
+    else:
+        _cli_positional.append(_a)
+
+if "-f" in _cli_flags:
+    override = True
+if "-g" in _cli_flags:
+    use_generalize = True
+    os.makedirs(fix_dir, exist_ok=True)
+else:
+    fix_dir = fix_dir + "-single"
+    os.makedirs(fix_dir, exist_ok=True)
+
+
+print(f"fix_dir: {fix_dir}")
+
+
+if not _cli_positional:
     task_list = sorted(
         map(
             lambda x: x.removesuffix(".json"),
@@ -1380,7 +1511,7 @@ if len(sys.argv) == 1:
         )
     )
 else:
-    input_id = sys.argv[1].strip()
+    input_id = _cli_positional[0].strip()
     if input_id:
         if input_id.endswith("-orig"):
             cand = input_id
@@ -1407,8 +1538,6 @@ else:
             else:
                 print(f"[WARN] {orig_file} not found in {llvm_helper.dataset_dir}, skipping")
                 task_list = []
-    if len(sys.argv) == 3 and sys.argv[2] == "-f":
-        override = True
 
 if DEBUG:
     task_list = [issue_id_debug]

@@ -40,6 +40,81 @@
   "patch": "commit 5d8fb473d3848d2d3c4b88ef3a9bbf494ba0ff0b\nAuthor: elhewaty <mohamedatef1698@gmail.com>\nDate:   Fri Oct 6 12:29:13 2023 +0300\n\n    [InstCombine] Fold comparison of adding two z/sext booleans (#67895)\n    \n    - Add test coverage for sext/zext boolean additions\n    - [InstCombine] Fold comparison of adding two z/sext booleans\n    \n    Fixes https://github.com/llvm/llvm-project/issues/64859.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 9f034aba874a..8e314ddd972f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -26,6 +26,7 @@\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/Support/KnownBits.h\"\n #include \"llvm/Transforms/InstCombine/InstCombiner.h\"\n+#include <bitset>\n \n using namespace llvm;\n using namespace PatternMatch;\n@@ -2895,19 +2896,89 @@ Instruction *InstCombinerImpl::foldICmpSubConstant(ICmpInst &Cmp,\n   return new ICmpInst(SwappedPred, Add, ConstantInt::get(Ty, ~C));\n }\n \n+static Value *createLogicFromTable(const std::bitset<4> &Table, Value *Op0,\n+                                   Value *Op1, IRBuilderBase &Builder,\n+                                   bool HasOneUse) {\n+  switch (Table.to_ulong()) {\n+  case 0: // 0 0 0 0\n+    return Builder.getFalse();\n+  case 1: // 0 0 0 1\n+    return HasOneUse ? Builder.CreateNot(Builder.CreateOr(Op0, Op1)) : nullptr;\n+  case 2: // 0 0 1 0\n+    return HasOneUse ? Builder.CreateAnd(Builder.CreateNot(Op0), Op1) : nullptr;\n+  case 3: // 0 0 1 1\n+    return Builder.CreateNot(Op0);\n+  case 4: // 0 1 0 0\n+    return HasOneUse ? Builder.CreateAnd(Op0, Builder.CreateNot(Op1)) : nullptr;\n+  case 5: // 0 1 0 1\n+    return Builder.CreateNot(Op1);\n+  case 6: // 0 1 1 0\n+    return Builder.CreateXor(Op0, Op1);\n+  case 7: // 0 1 1 1\n+    return HasOneUse ? Builder.CreateNot(Builder.CreateAnd(Op0, Op1)) : nullptr;\n+  case 8: // 1 0 0 0\n+    return Builder.CreateAnd(Op0, Op1);\n+  case 9: // 1 0 0 1\n+    return HasOneUse ? Builder.CreateNot(Builder.CreateXor(Op0, Op1)) : nullptr;\n+  case 10: // 1 0 1 0\n+    return Op1;\n+  case 11: // 1 0 1 1\n+    return HasOneUse ? Builder.CreateOr(Builder.CreateNot(Op0), Op1) : nullptr;\n+  case 12: // 1 1 0 0\n+    return Op0;\n+  case 13: // 1 1 0 1\n+    return HasOneUse ? Builder.CreateOr(Op0, Builder.CreateNot(Op1)) : nullptr;\n+  case 14: // 1 1 1 0\n+    return Builder.CreateOr(Op0, Op1);\n+  case 15: // 1 1 1 1\n+    return Builder.getTrue();\n+  default:\n+    llvm_unreachable(\"Invalid Operation\");\n+  }\n+  return nullptr;\n+}\n+\n /// Fold icmp (add X, Y), C.\n Instruction *InstCombinerImpl::foldICmpAddConstant(ICmpInst &Cmp,\n                                                    BinaryOperator *Add,\n                                                    const APInt &C) {\n   Value *Y = Add->getOperand(1);\n+  Value *X = Add->getOperand(0);\n+\n+  Value *Op0, *Op1;\n+  Instruction *Ext0, *Ext1;\n+  const CmpInst::Predicate Pred = Cmp.getPredicate();\n+  if (match(Add,\n+            m_Add(m_CombineAnd(m_Instruction(Ext0), m_ZExtOrSExt(m_Value(Op0))),\n+                  m_CombineAnd(m_Instruction(Ext1),\n+                               m_ZExtOrSExt(m_Value(Op1))))) &&\n+      Op0->getType()->isIntOrIntVectorTy(1) &&\n+      Op1->getType()->isIntOrIntVectorTy(1)) {\n+    unsigned BW = C.getBitWidth();\n+    std::bitset<4> Table;\n+    auto ComputeTable = [&](bool Op0Val, bool Op1Val) {\n+      int Res = 0;\n+      if (Op0Val)\n+        Res += isa<ZExtInst>(Ext0) ? 1 : -1;\n+      if (Op1Val)\n+        Res += isa<ZExtInst>(Ext1) ? 1 : -1;\n+      return ICmpInst::compare(APInt(BW, Res, true), C, Pred);\n+    };\n+\n+    Table[0] = ComputeTable(false, false);\n+    Table[1] = ComputeTable(false, true);\n+    Table[2] = ComputeTable(true, false);\n+    Table[3] = ComputeTable(true, true);\n+    if (auto *Cond =\n+            createLogicFromTable(Table, Op0, Op1, Builder, Add->hasOneUse()))\n+      return replaceInstUsesWith(Cmp, Cond);\n+  }\n   const APInt *C2;\n   if (Cmp.isEquality() || !match(Y, m_APInt(C2)))\n     return nullptr;\n \n   // Fold icmp pred (add X, C2), C.\n-  Value *X = Add->getOperand(0);\n   Type *Ty = Add->getType();\n-  const CmpInst::Predicate Pred = Cmp.getPredicate();\n \n   // If the add does not wrap, we can always adjust the compare by subtracting\n   // the constants. Equality comparisons are handled elsewhere. SGE/SLE/UGE/ULE\n@@ -6410,60 +6481,6 @@ Instruction *InstCombinerImpl::foldICmpUsingBoolRange(ICmpInst &I) {\n       Y->getType()->isIntOrIntVectorTy(1) && Pred == ICmpInst::ICMP_ULE)\n     return BinaryOperator::CreateOr(Builder.CreateIsNull(X), Y);\n \n-  const APInt *C;\n-  if (match(I.getOperand(0), m_c_Add(m_ZExt(m_Value(X)), m_SExt(m_Value(Y)))) &&\n-      match(I.getOperand(1), m_APInt(C)) &&\n-      X->getType()->isIntOrIntVectorTy(1) &&\n-      Y->getType()->isIntOrIntVectorTy(1)) {\n-    unsigned BitWidth = C->getBitWidth();\n-    Pred = I.getPredicate();\n-    APInt Zero = APInt::getZero(BitWidth);\n-    APInt MinusOne = APInt::getAllOnes(BitWidth);\n-    APInt One(BitWidth, 1);\n-    if ((C->sgt(Zero) && Pred == ICmpInst::ICMP_SGT) ||\n-        (C->slt(Zero) && Pred == ICmpInst::ICMP_SLT))\n-      return replaceInstUsesWith(I, ConstantInt::getFalse(I.getType()));\n-    if ((C->sgt(One) && Pred == ICmpInst::ICMP_SLT) ||\n-        (C->slt(MinusOne) && Pred == ICmpInst::ICMP_SGT))\n-      return replaceInstUsesWith(I, ConstantInt::getTrue(I.getType()));\n-\n-    if (I.getOperand(0)->hasOneUse()) {\n-      APInt NewC = *C;\n-      // canonicalize predicate to eq/ne\n-      if ((*C == Zero && Pred == ICmpInst::ICMP_SLT) ||\n-          (*C != Zero && *C != MinusOne && Pred == ICmpInst::ICMP_UGT)) {\n-        // x s< 0 in [-1, 1] --> x == -1\n-        // x u> 1(or any const !=0 !=-1) in [-1, 1] --> x == -1\n-        NewC = MinusOne;\n-        Pred = ICmpInst::ICMP_EQ;\n-      } else if ((*C == MinusOne && Pred == ICmpInst::ICMP_SGT) ||\n-                 (*C != Zero && *C != One && Pred == ICmpInst::ICMP_ULT)) {\n-        // x s> -1 in [-1, 1] --> x != -1\n-        // x u< -1 in [-1, 1] --> x != -1\n-        Pred = ICmpInst::ICMP_NE;\n-      } else if (*C == Zero && Pred == ICmpInst::ICMP_SGT) {\n-        // x s> 0 in [-1, 1] --> x == 1\n-        NewC = One;\n-        Pred = ICmpInst::ICMP_EQ;\n-      } else if (*C == One && Pred == ICmpInst::ICMP_SLT) {\n-        // x s< 1 in [-1, 1] --> x != 1\n-        Pred = ICmpInst::ICMP_NE;\n-      }\n-\n-      if (NewC == MinusOne) {\n-        if (Pred == ICmpInst::ICMP_EQ)\n-          return BinaryOperator::CreateAnd(Builder.CreateNot(X), Y);\n-        if (Pred == ICmpInst::ICMP_NE)\n-          return BinaryOperator::CreateOr(X, Builder.CreateNot(Y));\n-      } else if (NewC == One) {\n-        if (Pred == ICmpInst::ICMP_EQ)\n-          return BinaryOperator::CreateAnd(X, Builder.CreateNot(Y));\n-        if (Pred == ICmpInst::ICMP_NE)\n-          return BinaryOperator::CreateOr(Builder.CreateNot(X), Y);\n-      }\n-    }\n-  }\n-\n   return nullptr;\n }\n \n",
   "tests": [
     {
+      "file": "issue_body_ir.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "",
+          "source_program": "define i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %i = zext i1 %arg to i32\r\n  %i2 = zext i1 %arg1 to i32\r\n  %i3 = add nuw nsw i32 %i2, %i\r\n  %i4 = icmp eq i32 %i3, 1\r\n  ret i1 %i4\r\n}\n",
+          "expect_optimized_program": "define i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %xor = xor i1 %arg, %arg1\r\n  ret i1 %xor\r\n}\n",
+          "current_optimized_program": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add nuw nsw i32 %i2, %i\n  %i4 = icmp eq i32 %i3, 1\n  ret i1 %i4\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Comparison of add of extended booleans not folded to xor",
+    "body": "I was looking at [some code that tried to compute a sort of enum scheme by adding booleans, and comparing to constant values which failed to form nice boolean code](https://github.com/RadeonOpenCompute/ROCm-Device-Libs/blob/46939af92ad91238c878a82aad2220822073ffa1/ocml/src/powF_base.h#L64). This is really just an xor.\r\n\r\nhttps://alive2.llvm.org/ce/z/RSnV-d\r\n\r\n```\r\ndefine i1 @src(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %i = zext i1 %arg to i32\r\n  %i2 = zext i1 %arg1 to i32\r\n  %i3 = add nuw nsw i32 %i2, %i\r\n  %i4 = icmp eq i32 %i3, 1\r\n  ret i1 %i4\r\n}\r\n\r\ndefine i1 @tgt(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %xor = xor i1 %arg, %arg1\r\n  ret i1 %xor\r\n}\r\n\r\n```",
+    "author": "arsenm",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "elhewaty",
+        "body": "Can I fix this? But I will need some help, as I am not familiar with LLVM system yet"
+      },
+      {
+        "author": "elhewaty",
+        "body": " `%i4 = icmp eq i32 %i3, 1`\r\nwhat if the `1` were `0`?\r\n"
+      },
+      {
+        "author": "dc03",
+        "body": "> `%i4 = icmp eq i32 %i3, 1` what if the `1` were `0`?\r\n\r\nThat would be equivalent to `not(or(x, y))`: https://alive2.llvm.org/ce/z/8z7Q4G"
+      },
+      {
+        "author": "elhewaty",
+        "body": "so the `xor` case holds for `eq`,  `1`, and `zext` only"
+      },
+      {
+        "author": "dc03",
+        "body": "> so the `xor` case holds for `eq` and `1` only\r\n\r\nYes, if you sketch out the truth table for this function you will see it is equivalent to the table for an xor, and with 0 it is equivalent to the table for a nor."
+      },
+      {
+        "author": "elhewaty",
+        "body": "So we need to create a new function `foldICmpAddExtI1` and handle all our cases? or do we have something like this already?"
+      },
+      {
+        "author": "dc03",
+        "body": "I think `foldICmpAddConstant` may be what you're looking for: https://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp#L2898"
+      },
+      {
+        "author": "elhewaty",
+        "body": "@arsenm Here is a candidate patch : https://reviews.llvm.org/D159464"
+      },
+      {
+        "author": "elhewaty",
+        "body": "Can you please review the patch again."
+      },
+      {
+        "author": "elhewaty",
+        "body": "@arsenm \r\nping"
+      },
+      {
+        "author": "elhewaty",
+        "body": "@arsenm @nikic @goldsteinn Here's a candidate pull: https://github.com/llvm/llvm-project/pull/67895"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "dev_tests": [
+    {
       "file": "llvm/test/Transforms/InstCombine/icmp-add.ll",
       "commands": [
         [
@@ -456,65 +531,5 @@
         }
       ]
     }
-  ],
-  "issue": {
-    "title": "Comparison of add of extended booleans not folded to xor",
-    "body": "I was looking at [some code that tried to compute a sort of enum scheme by adding booleans, and comparing to constant values which failed to form nice boolean code](https://github.com/RadeonOpenCompute/ROCm-Device-Libs/blob/46939af92ad91238c878a82aad2220822073ffa1/ocml/src/powF_base.h#L64). This is really just an xor.\r\n\r\nhttps://alive2.llvm.org/ce/z/RSnV-d\r\n\r\n```\r\ndefine i1 @src(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %i = zext i1 %arg to i32\r\n  %i2 = zext i1 %arg1 to i32\r\n  %i3 = add nuw nsw i32 %i2, %i\r\n  %i4 = icmp eq i32 %i3, 1\r\n  ret i1 %i4\r\n}\r\n\r\ndefine i1 @tgt(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %xor = xor i1 %arg, %arg1\r\n  ret i1 %xor\r\n}\r\n\r\n```",
-    "author": "arsenm",
-    "labels": [
-      "llvm:instcombine",
-      "missed-optimization"
-    ],
-    "comments": [
-      {
-        "author": "elhewaty",
-        "body": "Can I fix this? But I will need some help, as I am not familiar with LLVM system yet"
-      },
-      {
-        "author": "elhewaty",
-        "body": " `%i4 = icmp eq i32 %i3, 1`\r\nwhat if the `1` were `0`?\r\n"
-      },
-      {
-        "author": "dc03",
-        "body": "> `%i4 = icmp eq i32 %i3, 1` what if the `1` were `0`?\r\n\r\nThat would be equivalent to `not(or(x, y))`: https://alive2.llvm.org/ce/z/8z7Q4G"
-      },
-      {
-        "author": "elhewaty",
-        "body": "so the `xor` case holds for `eq`,  `1`, and `zext` only"
-      },
-      {
-        "author": "dc03",
-        "body": "> so the `xor` case holds for `eq` and `1` only\r\n\r\nYes, if you sketch out the truth table for this function you will see it is equivalent to the table for an xor, and with 0 it is equivalent to the table for a nor."
-      },
-      {
-        "author": "elhewaty",
-        "body": "So we need to create a new function `foldICmpAddExtI1` and handle all our cases? or do we have something like this already?"
-      },
-      {
-        "author": "dc03",
-        "body": "I think `foldICmpAddConstant` may be what you're looking for: https://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp#L2898"
-      },
-      {
-        "author": "elhewaty",
-        "body": "@arsenm Here is a candidate patch : https://reviews.llvm.org/D159464"
-      },
-      {
-        "author": "elhewaty",
-        "body": "Can you please review the patch again."
-      },
-      {
-        "author": "elhewaty",
-        "body": "@arsenm \r\nping"
-      },
-      {
-        "author": "elhewaty",
-        "body": "@arsenm @nikic @goldsteinn Here's a candidate pull: https://github.com/llvm/llvm-project/pull/67895"
-      }
-    ]
-  },
-  "properties": {
-    "is_single_file_fix": true,
-    "is_single_func_fix": false
-  },
-  "verified": true
+  ]
 }

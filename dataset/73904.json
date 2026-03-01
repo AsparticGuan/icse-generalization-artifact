@@ -49,6 +49,45 @@
   "patch": "commit 88cc35b27e6c7966ab2463fa06d3dd970e88df64\nAuthor: Sizov Nikita <s.nikita.v@gmail.com>\nDate:   Wed Dec 13 09:09:27 2023 +0300\n\n    [InstCombine] Fold `binop (select cond, a, b), (select cond, b, a)` to `binop a, b` (#74953)\n    \n    ```\n    CommutativeBinOp(select(V, A, B), select(V, B, A) --> CommutativeBinOp(A, B)\n    CommutativeIntrinsicCall(select(V, A, B), select(V, B, A), ...) --> CommutativeIntrinsicCall(A, B, ...)\n    ```\n    \n    https://alive2.llvm.org/ce/z/8CDUZ4\n    \n    Closes #73904\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 255ce6973a16..104c73602223 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1536,6 +1536,9 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n   }\n \n   if (II->isCommutative()) {\n+    if (Instruction *I = foldCommutativeIntrinsicOverSelects(*II))\n+      return I;\n+\n     if (CallInst *NewCall = canonicalizeConstantArg0ToArg1(CI))\n       return NewCall;\n   }\n@@ -4217,3 +4220,23 @@ InstCombinerImpl::transformCallThroughTrampoline(CallBase &Call,\n   Call.setCalledFunction(FTy, NestF);\n   return &Call;\n }\n+\n+// op(select(%v, %x, %y), select(%v, %y, %x)) --> op(%x, %y)\n+Instruction *\n+InstCombinerImpl::foldCommutativeIntrinsicOverSelects(IntrinsicInst &II) {\n+  assert(II.isCommutative());\n+\n+  Value *A, *B, *C;\n+  bool LHSIsSelect =\n+      match(II.getOperand(0), m_Select(m_Value(A), m_Value(B), m_Value(C)));\n+  bool RHSIsSymmetricalSelect = match(\n+      II.getOperand(1), m_Select(m_Specific(A), m_Specific(C), m_Specific(B)));\n+\n+  if (LHSIsSelect && RHSIsSymmetricalSelect) {\n+    replaceOperand(II, 0, B);\n+    replaceOperand(II, 1, C);\n+    return &II;\n+  }\n+\n+  return nullptr;\n+}\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex bb620ad8d41c..1d50fa9b6bf7 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -276,6 +276,7 @@ private:\n   bool transformConstExprCastCall(CallBase &Call);\n   Instruction *transformCallThroughTrampoline(CallBase &Call,\n                                               IntrinsicInst &Tramp);\n+  Instruction *foldCommutativeIntrinsicOverSelects(IntrinsicInst &II);\n \n   Value *simplifyMaskedLoad(IntrinsicInst &II);\n   Instruction *simplifyMaskedStore(IntrinsicInst &II);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex f072f5cec309..ba40ee769363 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1132,6 +1132,14 @@ Value *InstCombinerImpl::SimplifySelectsFeedingBinaryOp(BinaryOperator &I,\n   };\n \n   if (LHSIsSelect && RHSIsSelect && A == D) {\n+    // op(select(%v, %x, %y), select(%v, %y, %x)) --> op(%x, %y)\n+    if (I.isCommutative() && B == F && C == E) {\n+      Value *BI = Builder.CreateBinOp(I.getOpcode(), B, E);\n+      if (auto *BO = dyn_cast<BinaryOperator>(BI))\n+        BO->copyIRFlags(&I);\n+      return BI;\n+    }\n+\n     // (A ? B : C) op (A ? E : F) -> A ? (B op E) : (C op F)\n     Cond = A;\n     True = simplifyBinOp(Opcode, B, E, FMF, Q);\n",
   "tests": [
     {
+      "file": "issue_body_ir.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "",
+          "source_program": "define i8 @test(i1 %c, i8 %a, i8 %b) {\r\n  %.sink = select i1 %c, i8 %a, i8 %b\r\n  %add.sink = select i1 %c, i8 %b, i8 %a\r\n  %mul4 = mul i8 %add.sink, %.sink\r\n  ret i8 %mul4\r\n}\n",
+          "expect_optimized_program": "define i8 @test(i1 %c, i8 %a, i8 %b) {\r\n  %mul = mul i8 %a, %b\r\n  ret i8 %mul\r\n}\n",
+          "current_optimized_program": "define i8 @test(i1 %c, i8 %a, i8 %b) {\n  %.sink = select i1 %c, i8 %a, i8 %b\n  %add.sink = select i1 %c, i8 %b, i8 %a\n  %mul4 = mul i8 %add.sink, %.sink\n  ret i8 %mul4\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] Missing optimization: fold `mul (select a, b), (select b, a)` to `mul a, b`",
+    "body": "Alive2 proof: https://alive2.llvm.org/ce/z/kQGt-z\r\n\r\n### Description:\r\n\r\n```llvm\r\ndefine i8 @src(i1 %c, i8 %a, i8 %b) {\r\n  %.sink = select i1 %c, i8 %a, i8 %b\r\n  %add.sink = select i1 %c, i8 %b, i8 %a\r\n  %mul4 = mul i8 %add.sink, %.sink\r\n  ret i8 %mul4\r\n}\r\n```\r\ncan be folded to:\r\n```llvm\r\ndefine i8 @tgt(i1 %c, i8 %a, i8 %b) {\r\n  %mul = mul i8 %a, %b\r\n  ret i8 %mul\r\n}\r\n```\r\nSimilarly, for any commutative binary operator like `add`, it's correct too.\r\n\r\n### Real-world motivation\r\n\r\nThis snippet of IR is derived from [redis/src/evict.c](https://github.com/redis/redis/blob/unstable/src/evict.c) (after O3 pipeline).\r\nThe example above is a reduced version. If you're interested in the original suboptimal IR and optimal IR, see also:https://godbolt.org/z/v5G3hvs87\r\n\r\n**Let me know if you can confirm that it's an optimization opportunity, thanks.**",
+    "author": "XChy",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "snikitav",
+        "body": "May I take this one?"
+      },
+      {
+        "author": "snikitav",
+        "body": "@dtcxzyw PTAL #74953"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "dev_tests": [
+    {
       "file": "llvm/test/Transforms/InstCombine/commutative-operation-over-selects.ll",
       "commands": [
         [
@@ -339,29 +378,5 @@
         }
       ]
     }
-  ],
-  "issue": {
-    "title": "[InstCombine] Missing optimization: fold `mul (select a, b), (select b, a)` to `mul a, b`",
-    "body": "Alive2 proof: https://alive2.llvm.org/ce/z/kQGt-z\r\n\r\n### Description:\r\n\r\n```llvm\r\ndefine i8 @src(i1 %c, i8 %a, i8 %b) {\r\n  %.sink = select i1 %c, i8 %a, i8 %b\r\n  %add.sink = select i1 %c, i8 %b, i8 %a\r\n  %mul4 = mul i8 %add.sink, %.sink\r\n  ret i8 %mul4\r\n}\r\n```\r\ncan be folded to:\r\n```llvm\r\ndefine i8 @tgt(i1 %c, i8 %a, i8 %b) {\r\n  %mul = mul i8 %a, %b\r\n  ret i8 %mul\r\n}\r\n```\r\nSimilarly, for any commutative binary operator like `add`, it's correct too.\r\n\r\n### Real-world motivation\r\n\r\nThis snippet of IR is derived from [redis/src/evict.c](https://github.com/redis/redis/blob/unstable/src/evict.c) (after O3 pipeline).\r\nThe example above is a reduced version. If you're interested in the original suboptimal IR and optimal IR, see also:https://godbolt.org/z/v5G3hvs87\r\n\r\n**Let me know if you can confirm that it's an optimization opportunity, thanks.**",
-    "author": "XChy",
-    "labels": [
-      "llvm:instcombine",
-      "missed-optimization"
-    ],
-    "comments": [
-      {
-        "author": "snikitav",
-        "body": "May I take this one?"
-      },
-      {
-        "author": "snikitav",
-        "body": "@dtcxzyw PTAL #74953"
-      }
-    ]
-  },
-  "properties": {
-    "is_single_file_fix": false,
-    "is_single_func_fix": false
-  },
-  "verified": true
+  ]
 }

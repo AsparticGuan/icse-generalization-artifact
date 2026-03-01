@@ -15,11 +15,9 @@ import llvm_helper  # pyright: ignore[reportMissingImports]  # noqa: E402
 from lab_env import Environment as Env  # pyright: ignore[reportMissingImports]  # noqa: E402
 
 DATASET_DIR = os.environ.get("LAB_DATASET_DIR", "dataset")
-_DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "generalize")
-_DEFAULT_MODEL_TAG = re.sub(r"[^A-Za-z0-9._-]+", "_", os.environ.get("LAB_LLM_MODEL", "model"))
-OUTPUT_RESULTS_PATH = os.environ.get(
-    "LAB_GENERALIZE_OUTPUT",
-    os.path.join(_DEFAULT_RESULTS_DIR, f"{_DEFAULT_MODEL_TAG}.json"),
+OUTPUT_RESULTS_DIR = os.environ.get(
+    "LAB_GENERALIZE_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "results", "generalize"),
 )
 
 TOKEN = os.environ.get("LAB_LLM_TOKEN")
@@ -58,17 +56,17 @@ When generating more cases, expand along two main lines:
 Goal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.
 Systematically vary:
 - **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).
-- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).
+- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and "noise" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).
 - **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.
 
 ### (2) Boundary conditions & context perturbations
-Goal: validate “only under some constraints” and reveal why InstCombine might be conservative.
+Goal: validate "only under some constraints" and reveal why InstCombine might be conservative.
 Systematically vary:
 - **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.
-- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.
+- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.
 - **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.
 
-Use these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.
+Use these dimensions to generate grouped variants (e.g., "only bitwidth changes", then "only flags changes"), so each new case remains attributable and easy to debug.
 
 ---
 
@@ -106,7 +104,7 @@ Each testcase object must include at least:
 """.strip()
 
 
-def _extract_json_obj(text: str) -> dict | None:
+def extract_json_obj(text: str) -> dict | None:
     if not isinstance(text, str):
         return None
     try:
@@ -125,13 +123,7 @@ def _extract_json_obj(text: str) -> dict | None:
         return None
 
 
-def _ensure_ptr_datalayout(ir: str) -> str:
-    if "ptr" in ir and "target datalayout" not in ir:
-        return 'target datalayout = "p:8:8:8"\n' + ir
-    return ir
-
-
-def _run_opt_instcombine(ir: str, timeout_s: int = 10) -> tuple[bool, str]:
+def run_opt_instcombine(ir: str, timeout_s: int = 10) -> tuple[bool, str]:
     opt_path = os.path.join(llvm_helper.llvm_build_dir, "bin/opt")
     if not os.path.exists(opt_path):
         return False, f"[ERROR] opt not found at {opt_path}"
@@ -148,7 +140,7 @@ def _run_opt_instcombine(ir: str, timeout_s: int = 10) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _run_cost_model(ir: str) -> tuple[bool, int, str]:
+def run_cost_model(ir: str) -> tuple[bool, int, str]:
     if not isinstance(ir, str) or not ir.strip():
         return False, -1, "empty ir"
     try:
@@ -170,13 +162,15 @@ def _run_cost_model(ir: str) -> tuple[bool, int, str]:
         return False, -1, err
 
 
-def _alive2_check(src: str, tgt: str) -> tuple[bool, Any]:
-    src = _ensure_ptr_datalayout(src)
-    tgt = _ensure_ptr_datalayout(tgt)
+def alive2_check(src: str, tgt: str) -> tuple[bool, Any]:
+    if "ptr" in src and "target datalayout" not in src:
+        src = 'target datalayout = "p:8:8:8"\n' + src
+    if "ptr" in tgt and "target datalayout" not in tgt:
+        tgt = 'target datalayout = "p:8:8:8"\n' + tgt
     return llvm_helper.alive2_check(src, tgt, "-src-unroll=8 -tgt-unroll=8")
 
 
-def _find_first_testcase(data: dict) -> tuple[dict, dict] | None:
+def find_first_testcase(data: dict) -> tuple[dict, dict] | None:
     tests = data.get("tests", [])
     has_current = False
     for test_file in tests:
@@ -209,36 +203,7 @@ def _find_first_testcase(data: dict) -> tuple[dict, dict] | None:
     return None
 
 
-def _load_first_dataset_item(dataset_dir: str) -> tuple[str, dict, dict, dict] | None:
-    try:
-        dataset_files = sorted(
-            [
-                f
-                for f in os.listdir(dataset_dir)
-                if os.path.isfile(os.path.join(dataset_dir, f)) and f.endswith(".json")
-            ]
-        )
-    except FileNotFoundError:
-        return None
-
-    if not dataset_files:
-        return None
-
-    for dataset_file in dataset_files:
-        issue_id, _ext = os.path.splitext(dataset_file)
-        json_path = os.path.join(dataset_dir, dataset_file)
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        found = _find_first_testcase(data)
-        if not found:
-            continue
-        test_file, test = found
-        return issue_id, data, test_file, test
-    return None
-
-
-def _call_model(prompt: str) -> str:
+def call_model(prompt: str) -> str:
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
@@ -251,18 +216,57 @@ def _call_model(prompt: str) -> str:
     return resp.choices[0].message.content or ""
 
 
-def main() -> None:
-    os.makedirs(os.path.dirname(OUTPUT_RESULTS_PATH), exist_ok=True)
-    loaded = _load_first_dataset_item(DATASET_DIR)
-    if not loaded:
-        print(f"[ERROR] Failed to load a test case from {DATASET_DIR}")
+def write_result(path: str, result: dict[str, Any]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] Failed to write result to {path}: {e}")
+
+
+override = False
+
+
+def process_issue(issue_id: str) -> None:
+    """Process a single issue: call model, validate testcases, write result."""
+    dataset_file = f"{issue_id}.json"
+    json_path = os.path.join(DATASET_DIR, dataset_file)
+    out_path = os.path.join(OUTPUT_RESULTS_DIR, f"{issue_id}.json")
+
+    # --- skip check ---
+    if not override and os.path.exists(out_path):
+        print(f"Skip {issue_id} (already at {out_path}, use -f to override)")
         return
 
-    issue_id, data, _test_file, test = loaded
+    if not os.path.isfile(json_path):
+        print(f"[ERROR] Dataset file not found: {json_path}")
+        return
+
+    print(f"\n[INFO] Processing issue {issue_id}...")
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        err = f"Failed to read/parse {json_path}: {e}"
+        print(f"[ERROR] {err}")
+        write_result(out_path, {"issue_id": issue_id, "dataset_file": dataset_file, "error": err})
+        return
+
+    found = find_first_testcase(data)
+    if not found:
+        err = "no valid testcase found"
+        print(f"[SKIP] No valid testcase found for {issue_id}")
+        write_result(out_path, {"issue_id": issue_id, "dataset_file": dataset_file, "error": err})
+        return
+
+    _test_file, test = found
     source_program = test.get("source_program", "")
     expect_optimized_program = test.get("expect_optimized_program", "")
     if not source_program or not expect_optimized_program:
-        print("[ERROR] source_program or expect_optimized_program missing")
+        err = "source_program or expect_optimized_program missing"
+        print(f"[ERROR] {err} for {issue_id}")
+        write_result(out_path, {"issue_id": issue_id, "dataset_file": dataset_file, "error": err})
         return
 
     prompt = PROMPT_TEMPLATE.format(
@@ -271,12 +275,22 @@ def main() -> None:
     )
 
     print(f"[INFO] Calling model for {issue_id}...")
-    model_output = _call_model(prompt)
-    parsed = _extract_json_obj(model_output)
+    try:
+        model_output = call_model(prompt)
+    except Exception as e:
+        err = f"model call failed: {e}"
+        print(f"[ERROR] {err}")
+        write_result(out_path, {
+            "issue_id": issue_id, "dataset_file": dataset_file,
+            "prompt": prompt, "error": err,
+        })
+        return
 
-    results: dict[str, Any] = {
+    parsed = extract_json_obj(model_output)
+
+    results_entry: dict[str, Any] = {
         "issue_id": issue_id,
-        "dataset_file": f"{issue_id}.json",
+        "dataset_file": dataset_file,
         "prompt": prompt,
         "model_output": model_output,
         "parsed": parsed,
@@ -285,8 +299,8 @@ def main() -> None:
 
     if parsed is None:
         print("[ERROR] Failed to parse model output as JSON")
-        with open(OUTPUT_RESULTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+        results_entry["error"] = "failed to parse model output as JSON"
+        write_result(out_path, results_entry)
         return
 
     print(f"[INFO] Building LLVM for {issue_id}...")
@@ -294,17 +308,15 @@ def main() -> None:
         env = Env(issue_id, BASEMODEL_CUTOFF, max_build_jobs=MAX_BUILD_JOBS)
         env.reset()
         build_ok, build_log = env.build()
-        results["build"] = {"ok": build_ok, "log": build_log}
+        results_entry["build"] = {"ok": build_ok, "log": build_log}
         if not build_ok:
             print("[ERROR] Build failed; aborting validation")
-            with open(OUTPUT_RESULTS_PATH, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
+            write_result(out_path, results_entry)
             return
     except Exception as e:
-        results["build"] = {"ok": False, "log": str(e)}
+        results_entry["build"] = {"ok": False, "log": str(e)}
         print(f"[ERROR] Build failed: {e}")
-        with open(OUTPUT_RESULTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+        write_result(out_path, results_entry)
         return
 
     testcases = parsed.get("testcases", [])
@@ -313,7 +325,7 @@ def main() -> None:
 
     for idx, tc in enumerate(testcases):
         if not isinstance(tc, dict):
-            results["validation"].append(
+            results_entry["validation"].append(
                 {"index": idx, "ok": False, "error": "testcase is not an object"}
             )
             continue
@@ -321,50 +333,61 @@ def main() -> None:
         name = tc.get("name", f"case_{idx}")
         src_ir = tc.get("ir", "")
         exp_ir = tc.get("expected_optimized_ir", "")
-        if not isinstance(src_ir, str) or not isinstance(exp_ir, str) or not src_ir.strip():
-            results["validation"].append(
+        if (
+            not isinstance(src_ir, str)
+            or not isinstance(exp_ir, str)
+            or not src_ir.strip()
+        ):
+            results_entry["validation"].append(
                 {"name": name, "ok": False, "error": "missing ir or expected_optimized_ir"}
             )
             continue
 
-        opt_ok, opt_out = _run_opt_instcombine(src_ir)
+        opt_ok, opt_out = run_opt_instcombine(src_ir)
         if not opt_ok:
-            results["validation"].append(
+            results_entry["validation"].append(
                 {"name": name, "ok": False, "error": opt_out}
             )
             continue
 
-        cost_exp_ok, cost_exp, cost_exp_log = _run_cost_model(exp_ir)
-        cost_opt_ok, cost_opt, cost_opt_log = _run_cost_model(opt_out)
-        cost_ok = cost_exp_ok and cost_opt_ok
+        cost_src_ok, cost_src, cost_src_log = run_cost_model(src_ir)
+        cost_exp_ok, cost_exp, cost_exp_log = run_cost_model(exp_ir)
+        cost_opt_ok, cost_opt, cost_opt_log = run_cost_model(opt_out)
+        cost_ok = cost_src_ok and cost_exp_ok and cost_opt_ok
         expected_le_opt = cost_ok and cost_exp <= cost_opt
+        expected_le_src = cost_ok and cost_exp <= cost_src
 
         a2_src_exp_ok = None
         a2_src_exp_log = None
-        if expected_le_opt:
-            a2_src_exp_ok, a2_src_exp_log = _alive2_check(src_ir, exp_ir)
+        if expected_le_opt and expected_le_src:
+            a2_src_exp_ok, a2_src_exp_log = alive2_check(src_ir, exp_ir)
 
         a2_opt_exp_ok = None
         a2_opt_exp_log = None
         a2_exp_opt_ok = None
         a2_exp_opt_log = None
         equivalent = None
-        if expected_le_opt and a2_src_exp_ok:
-            a2_opt_exp_ok, a2_opt_exp_log = _alive2_check(opt_out, exp_ir)
-            a2_exp_opt_ok, a2_exp_opt_log = _alive2_check(exp_ir, opt_out)
+        if expected_le_opt and expected_le_src and a2_src_exp_ok:
+            a2_opt_exp_ok, a2_opt_exp_log = alive2_check(opt_out, exp_ir)
+            a2_exp_opt_ok, a2_exp_opt_log = alive2_check(exp_ir, opt_out)
             equivalent = a2_opt_exp_ok and a2_exp_opt_ok
 
-        missed_optimization = bool(expected_le_opt and a2_src_exp_ok and equivalent is False)
+        missed_optimization = bool(
+            expected_le_opt and expected_le_src and a2_src_exp_ok and equivalent is True
+        )
 
-        results["validation"].append(
+        results_entry["validation"].append(
             {
                 "name": name,
                 "missed_optimization": missed_optimization,
                 "cost": {
+                    "source": cost_src,
                     "expected": cost_exp,
                     "current_opt": cost_opt,
                     "expected_le_current_opt": expected_le_opt,
+                    "expected_le_source": expected_le_src,
                     "ok": cost_ok,
+                    "source_log": cost_src_log,
                     "expected_log": cost_exp_log,
                     "current_opt_log": cost_opt_log,
                 },
@@ -378,11 +401,22 @@ def main() -> None:
             }
         )
 
-    with open(OUTPUT_RESULTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print(f"[INFO] Results saved to {OUTPUT_RESULTS_PATH}")
+    write_result(out_path, results_entry)
 
 
-if __name__ == "__main__":
-    main()
+os.makedirs(OUTPUT_RESULTS_DIR, exist_ok=True)
+
+if len(sys.argv) == 1:
+    # No args: process every dataset file
+    task_list = sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(DATASET_DIR)
+        if os.path.isfile(os.path.join(DATASET_DIR, f)) and f.endswith(".json")
+    )
+else:
+    task_list = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
+    if len(sys.argv) >= 3 and sys.argv[2] == "-f":
+        override = True
+
+for task in task_list:
+    process_issue(task)

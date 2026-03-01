@@ -5,7 +5,7 @@
 Retest existing patches on dataset test cases.
 
 Default behavior:
-  - Read patches from results/generate/fixes-gemini-3-cot-iter4-orig
+  - Read patches from results/generate/fixes-glm-4.7-cot-iter4-orig
   - Only process patches with fast_check_pass == true
   - If full_check_pass == false, use fast_full_mismatch_patch
   - If full_check_pass == true, use patch
@@ -33,7 +33,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
 DEFAULT_PATCH_DIR = os.environ.get(
     "LAB_PATCH_DIR",
     os.path.join(
-        _PROJECT_ROOT, "results", "generate", "fixes-gemini-3-cot-iter4-orig"
+        _PROJECT_ROOT, "results", "generate", "fixes-glm-5-cot-iter4-orig"
     ),
 )
 DEFAULT_RETEST_DIR = os.environ.get(
@@ -42,7 +42,7 @@ DEFAULT_RETEST_DIR = os.environ.get(
         _PROJECT_ROOT,
         "results",
         "generate",
-        "retest-fixes-gemini-3-cot-iter4-orig",
+        "retest-fixes-glm-5-cot-iter4-orig",
     ),
 )
 
@@ -172,6 +172,42 @@ def write_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _collect_patches_to_test(patch_data: dict) -> list[dict]:
+    """Extract testable patches from patch JSON (new func_results format or legacy)."""
+    patches: list[dict] = []
+
+    func_results = patch_data.get("func_results", [])
+    if func_results:
+        for fr in func_results:
+            p = fr.get("patch", "")
+            if isinstance(p, str) and p.strip():
+                patches.append({
+                    "patch": p,
+                    "func_name": fr.get("func_name"),
+                    "file_path": fr.get("file_path"),
+                    "source_check_fast_pass": fr.get("check_fast_pass"),
+                    "source_check_full_pass": fr.get("check_full_pass"),
+                })
+
+    if not patches:
+        fast_check_pass = patch_data.get("fast_check_pass")
+        if fast_check_pass is not True:
+            return []
+        full_check_pass = patch_data.get("full_check_pass")
+        patch_key = "fast_full_mismatch_patch" if full_check_pass is False else "patch"
+        patch = patch_data.get(patch_key)
+        if isinstance(patch, str) and patch.strip():
+            patches.append({
+                "patch": patch,
+                "func_name": None,
+                "file_path": None,
+                "source_check_fast_pass": fast_check_pass,
+                "source_check_full_pass": full_check_pass,
+            })
+
+    return patches
+
+
 def retest_patch(
     patch_issue_id: str,
     patch_path: str,
@@ -192,23 +228,10 @@ def retest_patch(
         write_json(out_path, {"error": f"Failed to read patch JSON: {e}"})
         return
 
-    fast_check_pass = patch_data.get("fast_check_pass")
-    if fast_check_pass is not True:
+    patches_to_test = _collect_patches_to_test(patch_data)
+    if not patches_to_test:
         print(
-            f"[SKIP] {patch_issue_id} fast_check_pass != true in {patch_path}"
-        )
-        return
-
-    full_check_pass = patch_data.get("full_check_pass")
-    patch_key = "patch"
-    if full_check_pass is False:
-        patch_key = "fast_full_mismatch_patch"
-
-    patch = patch_data.get(patch_key)
-    if not isinstance(patch, str) or not patch.strip():
-        write_json(
-            out_path,
-            {"error": f"Patch is missing or empty (field: {patch_key})"},
+            f"[SKIP] {patch_issue_id} no testable patches in {patch_path}"
         )
         return
 
@@ -248,27 +271,42 @@ def retest_patch(
         )
         return
 
-    env.reset()
-    if os.path.exists(build_cache_dir):
-        shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
-        shutil.copytree(build_cache_dir, llvm_helper.llvm_build_dir)
-    apply_ok, apply_log = llvm_helper.apply(patch)
-    check_more_res = None
-    check_more_log = None
-    if apply_ok:
-        try:
-            check_more_res, check_more_log = env.check_fast(skip_build=False)
-        except Exception as e:
-            check_more_res = False
-            check_more_log = str(e)
+    retest_results = []
+    for i, pt in enumerate(patches_to_test):
+        label = pt["func_name"] or f"patch_{i}"
+        print(f"  [{i + 1}/{len(patches_to_test)}] Testing {label}")
 
+        env.reset()
+        if os.path.exists(build_cache_dir):
+            shutil.rmtree(llvm_helper.llvm_build_dir, ignore_errors=True)
+            shutil.copytree(build_cache_dir, llvm_helper.llvm_build_dir)
+
+        apply_ok, apply_log = llvm_helper.apply(pt["patch"])
+        check_more_res = None
+        check_more_log = None
+        if apply_ok:
+            try:
+                check_more_res, check_more_log = env.check_fast(skip_build=False)
+            except Exception as e:
+                check_more_res = False
+                check_more_log = str(e)
+
+        retest_results.append({
+            "func_name": pt["func_name"],
+            "file_path": pt["file_path"],
+            "source_check_fast_pass": pt["source_check_fast_pass"],
+            "source_check_full_pass": pt["source_check_full_pass"],
+            "patch_apply": {"ok": apply_ok, "log": apply_log},
+            "check_more": {"ok": check_more_res, "log": check_more_log},
+        })
+
+    any_pass = any(r["check_more"]["ok"] for r in retest_results)
     log_payload = {
         "patch_source_file": patch_path,
         "patch_issue_id": patch_issue_id,
         "test_issue_id": test_issue_id,
-        "source_fast_check_pass": fast_check_pass,
-        "patch_apply": {"ok": apply_ok, "log": apply_log},
-        "check_more": {"ok": check_more_res, "log": check_more_log},
+        "pass": any_pass,
+        "retest_results": retest_results,
     }
 
     try:

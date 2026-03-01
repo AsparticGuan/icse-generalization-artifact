@@ -443,7 +443,24 @@ def verify_test_group(repro: bool, input, type: str):
 # Component name -> opt pass(es) for dataset-orig (no FileCheck, test_body empty)
 _COMPONENT_TO_OPT_PASS = {
     "InstCombine": "instcombine",
-    "Scalar": "default",  # generic scalar opts
+    "InstructionSimplify": "instsimplify",
+    "SimplifyCFG": "simplifycfg",
+    "ConstraintElimination": "constraint-elimination",
+    "CorrelatedValuePropagation": "correlated-propagation",
+    "ValueTracking": "instcombine",
+    "MemCpyOptimizer": "memcpyopt",
+    "VectorCombine": "vector-combine",
+    "PromoteMemoryToRegister": "mem2reg",
+    "FunctionAttrs": "function-attrs",
+    "Attributor": "attributor",
+    "SimplifyLibCalls": "instcombine",
+    "LazyValueInfo": "correlated-propagation",
+    "ScalarEvolution": "indvars",
+    "AliasAnalysis": "gvn",
+    "Loads": "early-cse",
+    "IR": "default<O2>",
+    "Instrumentation": "default<O2>",
+    "Scalar": "default<O2>",
 }
 
 
@@ -516,6 +533,7 @@ def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_li
                 overall_test_res = False
                 continue
             try:
+                print(f"opt_base: {opt_base}")
                 out = subprocess.run(
                     opt_base,
                     input=source_program.encode(),
@@ -543,7 +561,10 @@ def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_li
                     "expect_optimized_program": expect_optimized_program,
                     "current_optimized_program": current_optimized_program,
                 }
-                res = res_alive2 and res_cost
+                if repro:
+                    res = res_alive2 and not res_cost
+                else:
+                    res = res_alive2 and res_cost
                 print(f"res: {res}")
                 print(f"res_alive2: {res_alive2}")
                 print(f"res_cost: {res_cost}")

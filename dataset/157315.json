@@ -51,6 +51,45 @@
   "patch": "commit 11faf88d8fea4d221e826e4e9827864f38d246fb\nAuthor: Brandon <61314499+brandonxin@users.noreply.github.com>\nDate:   Thu Oct 2 14:51:39 2025 -0500\n\n    [InstCombine] Fold icmp with clamp into unsigned bound check (#161303)\n    \n    Fix #157315\n    \n    alive2: https://alive2.llvm.org/ce/z/TEnuFV\n    \n    The equality comparison of `min(max(X, Lo), Hi)` and `X` is actually a\n    range check on `X`. This PR folds this into an unsigned bound check `(X\n    - Lo) u< (Hi - Lo + 1)`.\n    \n    ---------\n    \n    Co-authored-by: Yingwei Zheng <dtcxzyw@qq.com>\n\ndiff --git a/llvm/include/llvm/IR/IntrinsicInst.h b/llvm/include/llvm/IR/IntrinsicInst.h\nindex eb0440f50073..0622bfae2c84 100644\n--- a/llvm/include/llvm/IR/IntrinsicInst.h\n+++ b/llvm/include/llvm/IR/IntrinsicInst.h\n@@ -810,6 +810,26 @@ public:\n   /// Whether the intrinsic is signed or unsigned.\n   bool isSigned() const { return isSigned(getIntrinsicID()); };\n \n+  /// Whether the intrinsic is a smin or umin.\n+  static bool isMin(Intrinsic::ID ID) {\n+    switch (ID) {\n+    case Intrinsic::umin:\n+    case Intrinsic::smin:\n+      return true;\n+    case Intrinsic::umax:\n+    case Intrinsic::smax:\n+      return false;\n+    default:\n+      llvm_unreachable(\"Invalid intrinsic\");\n+    }\n+  }\n+\n+  /// Whether the intrinsic is a smin or a umin.\n+  bool isMin() const { return isMin(getIntrinsicID()); }\n+\n+  /// Whether the intrinsic is a smax or a umax.\n+  bool isMax() const { return !isMin(getIntrinsicID()); }\n+\n   /// Min/max intrinsics are monotonic, they operate on a fixed-bitwidth values,\n   /// so there is a certain threshold value, upon reaching which,\n   /// their value can no longer change. Return said threshold.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 60da48e1d95d..07ad65c8b7d4 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -5780,6 +5780,45 @@ Instruction *InstCombinerImpl::foldICmpWithMinMax(Instruction &I,\n   return nullptr;\n }\n \n+/// Match and fold patterns like:\n+///   icmp eq/ne X, min(max(X, Lo), Hi)\n+/// which represents a range check and can be repsented as a ConstantRange.\n+///\n+/// For icmp eq, build ConstantRange [Lo, Hi + 1) and convert to:\n+///   (X - Lo) u< (Hi + 1 - Lo)\n+/// For icmp ne, build ConstantRange [Hi + 1, Lo) and convert to:\n+///   (X - (Hi + 1)) u< (Lo - (Hi + 1))\n+Instruction *InstCombinerImpl::foldICmpWithClamp(ICmpInst &I, Value *X,\n+                                                 MinMaxIntrinsic *Min) {\n+  if (!I.isEquality() || !Min->hasOneUse() || !Min->isMin())\n+    return nullptr;\n+\n+  const APInt *Lo = nullptr, *Hi = nullptr;\n+  if (Min->isSigned()) {\n+    if (!match(Min->getLHS(), m_OneUse(m_SMax(m_Specific(X), m_APInt(Lo)))) ||\n+        !match(Min->getRHS(), m_APInt(Hi)) || !Lo->slt(*Hi))\n+      return nullptr;\n+  } else {\n+    if (!match(Min->getLHS(), m_OneUse(m_UMax(m_Specific(X), m_APInt(Lo)))) ||\n+        !match(Min->getRHS(), m_APInt(Hi)) || !Lo->ult(*Hi))\n+      return nullptr;\n+  }\n+\n+  ConstantRange CR = ConstantRange::getNonEmpty(*Lo, *Hi + 1);\n+  ICmpInst::Predicate Pred;\n+  APInt C, Offset;\n+  if (I.getPredicate() == ICmpInst::ICMP_EQ)\n+    CR.getEquivalentICmp(Pred, C, Offset);\n+  else\n+    CR.inverse().getEquivalentICmp(Pred, C, Offset);\n+\n+  if (!Offset.isZero())\n+    X = Builder.CreateAdd(X, ConstantInt::get(X->getType(), Offset));\n+\n+  return replaceInstUsesWith(\n+      I, Builder.CreateICmp(Pred, X, ConstantInt::get(X->getType(), C)));\n+}\n+\n // Canonicalize checking for a power-of-2-or-zero value:\n static Instruction *foldICmpPow2Test(ICmpInst &I,\n                                      InstCombiner::BuilderTy &Builder) {\n@@ -7467,10 +7506,14 @@ Instruction *InstCombinerImpl::foldICmpCommutative(CmpPredicate Pred,\n     if (Instruction *NI = foldSelectICmp(Pred, SI, Op1, CxtI))\n       return NI;\n \n-  if (auto *MinMax = dyn_cast<MinMaxIntrinsic>(Op0))\n+  if (auto *MinMax = dyn_cast<MinMaxIntrinsic>(Op0)) {\n     if (Instruction *Res = foldICmpWithMinMax(CxtI, MinMax, Op1, Pred))\n       return Res;\n \n+    if (Instruction *Res = foldICmpWithClamp(CxtI, Op1, MinMax))\n+      return Res;\n+  }\n+\n   {\n     Value *X;\n     const APInt *C;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 4f94aa2d3854..e01c145bf5de 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -725,6 +725,7 @@ public:\n   Instruction *foldICmpBinOp(ICmpInst &Cmp, const SimplifyQuery &SQ);\n   Instruction *foldICmpWithMinMax(Instruction &I, MinMaxIntrinsic *MinMax,\n                                   Value *Z, CmpPredicate Pred);\n+  Instruction *foldICmpWithClamp(ICmpInst &Cmp, Value *X, MinMaxIntrinsic *Min);\n   Instruction *foldICmpEquality(ICmpInst &Cmp);\n   Instruction *foldIRemByPowerOfTwoToBitTest(ICmpInst &I);\n   Instruction *foldSignBitTest(ICmpInst &I);\n",
   "tests": [
     {
+      "file": "issue_body_ir.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "",
+          "source_program": "define i1 @test(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n",
+          "expect_optimized_program": "define i1 @test(i32 %arg0, i32 %arg1) {\n  %sum = add i32 %arg0, 95\n  %1 = add i32 %sum, %arg1\n  %result = icmp ult i32 %1, 256\n  ret i1 %result\n}\n",
+          "current_optimized_program": "define i1 @test(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Missed Optimization: simplify smax/smin+icmp eq to unsigned bound check",
+    "body": "```\ndefine i1 @src(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\n\ndefine i1 @tgt(i32 %arg0, i32 %arg1) {\n  %sum = add i32 %arg0, 95\n  %1 = add i32 %sum, %arg1\n  %result = icmp ult i32 %1, 256\n  ret i1 %result\n}\n```\ngodbolt: https://godbolt.org/z/a8TK65GEj\nalive2: https://alive2.llvm.org/ce/z/MPkRit\n\nPattern found in: https://github.com/dtcxzyw/llvm-opt-benchmark/blob/main/bench/ffmpeg/optimized/aacdec.ll\n",
+    "author": "Leo0506",
+    "labels": [
+      "llvm:instcombine",
+      "missed-optimization"
+    ],
+    "comments": [
+      {
+        "author": "brandonxin",
+        "body": "Hi, could I be assigned to this issue?"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "@brandonxin Please read https://llvm.org/docs/InstCombineContributorGuide.html before submitting a patch. Have fun :)\nI'd like to see a general solution for this case. `clamp(X, minc, maxc) ==/!= X` is actually a range check. Then you can use `ConstantRange::getEquivalentICmp` to convert it into the canonical form."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "dev_tests": [
+    {
       "file": "llvm/test/Transforms/InstCombine/icmp-clamp.ll",
       "commands": [
         [
@@ -208,29 +247,5 @@
         }
       ]
     }
-  ],
-  "issue": {
-    "title": "Missed Optimization: simplify smax/smin+icmp eq to unsigned bound check",
-    "body": "```\ndefine i1 @src(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\n\ndefine i1 @tgt(i32 %arg0, i32 %arg1) {\n  %sum = add i32 %arg0, 95\n  %1 = add i32 %sum, %arg1\n  %result = icmp ult i32 %1, 256\n  ret i1 %result\n}\n```\ngodbolt: https://godbolt.org/z/a8TK65GEj\nalive2: https://alive2.llvm.org/ce/z/MPkRit\n\nPattern found in: https://github.com/dtcxzyw/llvm-opt-benchmark/blob/main/bench/ffmpeg/optimized/aacdec.ll\n",
-    "author": "Leo0506",
-    "labels": [
-      "llvm:instcombine",
-      "missed-optimization"
-    ],
-    "comments": [
-      {
-        "author": "brandonxin",
-        "body": "Hi, could I be assigned to this issue?"
-      },
-      {
-        "author": "dtcxzyw",
-        "body": "@brandonxin Please read https://llvm.org/docs/InstCombineContributorGuide.html before submitting a patch. Have fun :)\nI'd like to see a general solution for this case. `clamp(X, minc, maxc) ==/!= X` is actually a range check. Then you can use `ConstantRange::getEquivalentICmp` to convert it into the canonical form."
-      }
-    ]
-  },
-  "properties": {
-    "is_single_file_fix": false,
-    "is_single_func_fix": false
-  },
-  "verified": true
+  ]
 }

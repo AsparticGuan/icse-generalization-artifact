@@ -31,10 +31,10 @@ elif [[ "$1" == "deepseek-v3.2" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
     export LAB_LLM_MODEL=deepseek/deepseek-v3.2
-elif [[ "$1" == "glm-4.7" ]]; then
+elif [[ "$1" == "glm-5" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
-    export LAB_LLM_MODEL=z-ai/glm-4.7
+    export LAB_LLM_MODEL=z-ai/glm-5
 elif [[ "$1" == "qwen-3" ]]; then
     export LAB_LLM_TOKEN=$OPENROUTER_TOKEN
     export LAB_LLM_URL=$OPENROUTER_URL
@@ -65,6 +65,9 @@ export LAB_FIX_DIR=$LAB_RESULTS_DIR/generate/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_
 export LAB_FIX_DIR_ORIG=$LAB_RESULTS_DIR/generate/fixes-$1-$LAB_PROMPT_TYPE-iter$LAB_LLM_MAX_SAMPLE_COUNT-orig
 mkdir -p "$LAB_FIX_DIR"
 mkdir -p "$LAB_FIX_DIR_ORIG"
+export LAB_MODEL_TAG=$1
+export LAB_GENERALIZE_DIR=$LAB_RESULTS_DIR/generalize/$1
+mkdir -p "$LAB_GENERALIZE_DIR"
 export LAB_LOCALIZE_DIR=$LAB_RESULTS_DIR/localize
 export LAB_LOCALIZE_OUTPUT=$LAB_LOCALIZE_DIR/$1.json
 mkdir -p "$LAB_LOCALIZE_DIR"
