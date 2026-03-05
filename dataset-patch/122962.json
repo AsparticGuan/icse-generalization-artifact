@@ -1,0 +1,340 @@
+{
+  "pr_number": 122962,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/122962",
+  "title": "[InstCombine] canonicalize sign bit checks",
+  "commit_sha": "1e39a639988de9eb70293a09c6fe436bd335cf7e",
+  "components": [
+    "IR",
+    "InstCombine",
+    "InstructionSimplify"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "IR",
+      "InstCombine",
+      "InstructionSimplify"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/IR/ConstantRange.h": [
+        [
+          128,
+          133
+        ]
+      ],
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        [
+          3783,
+          3795
+        ]
+      ],
+      "llvm/lib/IR/ConstantRange.cpp": [
+        [
+          274,
+          279
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          3133,
+          3139
+        ],
+        [
+          7025,
+          7030
+        ],
+        [
+          7397,
+          7402
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          668,
+          673
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        "simplifyICmpInst"
+      ],
+      "llvm/lib/IR/ConstantRange.cpp": [
+        "ConstantRange::icmp"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpAddConstant",
+        "InstCombinerImpl::visitICmpInst",
+        "canonicalizeICmpBool"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/IR/ConstantRange.h b/llvm/include/llvm/IR/ConstantRange.h\nindex d086c25390fd2..92e9341352c17 100644\n--- a/llvm/include/llvm/IR/ConstantRange.h\n+++ b/llvm/include/llvm/IR/ConstantRange.h\n@@ -128,6 +128,12 @@ class [[nodiscard]] ConstantRange {\n   /// NOTE: false does not mean that inverse predicate holds!\n   bool icmp(CmpInst::Predicate Pred, const ConstantRange &Other) const;\n \n+  /// Does the predicate \\p Pred or its inverse hold between ranges this and \\p\n+  /// Other? Returns `true` if the predicate always holds, `false` if the\n+  /// inverse always holds, or `std::nullopt` otherwise.\n+  std::optional<bool> icmpOrInverse(CmpInst::Predicate Pred,\n+                                    const ConstantRange &Other) const;\n+\n   /// Return true iff CR1 ult CR2 is equivalent to CR1 slt CR2.\n   /// Does not depend on strictness/direction of the predicate.\n   static bool\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex d69747e30f884..dae4f37908cf2 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -3783,13 +3783,9 @@ static Value *simplifyICmpInst(CmpPredicate Pred, Value *LHS, Value *RHS,\n   // If both operands have range metadata, use the metadata\n   // to simplify the comparison.\n   if (std::optional<ConstantRange> RhsCr = getRange(RHS, Q.IIQ))\n-    if (std::optional<ConstantRange> LhsCr = getRange(LHS, Q.IIQ)) {\n-      if (LhsCr->icmp(Pred, *RhsCr))\n-        return ConstantInt::getTrue(ITy);\n-\n-      if (LhsCr->icmp(CmpInst::getInversePredicate(Pred), *RhsCr))\n-        return ConstantInt::getFalse(ITy);\n-    }\n+    if (std::optional<ConstantRange> LhsCr = getRange(LHS, Q.IIQ))\n+      if (auto Res = LhsCr->icmpOrInverse(Pred, *RhsCr))\n+        return ConstantInt::getBool(ITy, *Res);\n \n   // Compare of cast, for example (zext X) != 0 -> X != 0\n   if (isa<CastInst>(LHS) && (isa<Constant>(RHS) || isa<CastInst>(RHS))) {\ndiff --git a/llvm/lib/IR/ConstantRange.cpp b/llvm/lib/IR/ConstantRange.cpp\nindex 3566435398992..c5380ab2ffeda 100644\n--- a/llvm/lib/IR/ConstantRange.cpp\n+++ b/llvm/lib/IR/ConstantRange.cpp\n@@ -274,6 +274,16 @@ bool ConstantRange::icmp(CmpInst::Predicate Pred,\n   }\n }\n \n+std::optional<bool>\n+ConstantRange::icmpOrInverse(CmpInst::Predicate Pred,\n+                             const ConstantRange &Other) const {\n+  if (icmp(Pred, Other))\n+    return true;\n+  if (icmp(CmpInst::getInversePredicate(Pred), Other))\n+    return false;\n+  return std::nullopt;\n+}\n+\n /// Exact mul nuw region for single element RHS.\n static ConstantRange makeExactMulNUWRegion(const APInt &V) {\n   unsigned BitWidth = V.getBitWidth();\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 2e45725759949..eb239810d625d 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -3133,7 +3133,10 @@ Instruction *InstCombinerImpl::foldICmpAddConstant(ICmpInst &Cmp,\n \n   if (ICmpInst::isUnsigned(Pred) && Add->hasNoSignedWrap() &&\n       C.isNonNegative() && (C - *C2).isNonNegative() &&\n-      computeConstantRange(X, /*ForSigned=*/true).add(*C2).isAllNonNegative())\n+      computeConstantRange(X, /*ForSigned=*/true, /*UseInstrInfo=*/true, &AC,\n+                           Add, &DT)\n+          .add(*C2)\n+          .isAllNonNegative())\n     return new ICmpInst(ICmpInst::getSignedPredicate(Pred), X,\n                         ConstantInt::get(Ty, C - *C2));\n \n@@ -7025,6 +7028,66 @@ static Instruction *canonicalizeICmpBool(ICmpInst &I,\n   }\n }\n \n+// (icmp X, Y) --> (icmp slt/sgt X, 0/-1) iff Y is outside the signed range of X\n+static ICmpInst *canonicalizeSignBitCheck(ICmpInst::Predicate Pred, Value *X,\n+                                          const ConstantRange &XRange,\n+                                          const ConstantRange &YRange) {\n+  if (XRange.isSignWrappedSet())\n+    return nullptr;\n+  unsigned BitWidth = XRange.getBitWidth();\n+  APInt SMin = APInt::getSignedMinValue(BitWidth);\n+  APInt Zero = APInt::getZero(BitWidth);\n+  auto NegResult =\n+      XRange.intersectWith(ConstantRange(SMin, Zero), ConstantRange::Signed)\n+          .icmpOrInverse(Pred, YRange);\n+  if (!NegResult)\n+    return nullptr;\n+  auto PosResult =\n+      XRange.intersectWith(ConstantRange(Zero, SMin), ConstantRange::Signed)\n+          .icmpOrInverse(Pred, YRange);\n+  if (!PosResult)\n+    return nullptr;\n+  assert(NegResult != PosResult &&\n+         \"Known result should been simplified already.\");\n+  Type *Ty = X->getType();\n+  if (*NegResult)\n+    return new ICmpInst(ICmpInst::ICMP_SLT, X, ConstantInt::getNullValue(Ty));\n+  return new ICmpInst(ICmpInst::ICMP_SGT, X, ConstantInt::getAllOnesValue(Ty));\n+}\n+\n+// Try to fold an icmp using the constant ranges of its operands.\n+Instruction *InstCombinerImpl::foldICmpUsingConstantRanges(ICmpInst &Cmp) {\n+  Value *X = Cmp.getOperand(0);\n+  if (!X->getType()->isIntOrIntVectorTy())\n+    return nullptr;\n+  Value *Y = Cmp.getOperand(1);\n+  ICmpInst::Predicate Pred = Cmp.getPredicate();\n+  ConstantRange XRange = computeConstantRange(\n+      X, ICmpInst::isSigned(Pred), /*UseInstrInfo=*/true, &AC, &Cmp, &DT);\n+  if (XRange.isFullSet())\n+    return nullptr; // early out if we don't have any information\n+  ConstantRange YRange = computeConstantRange(\n+      Y, ICmpInst::isSigned(Pred), /*UseInstrInfo=*/true, &AC, &Cmp, &DT);\n+  if (YRange.isFullSet())\n+    return nullptr; // early out if we don't have any information\n+  if (auto Res = XRange.icmpOrInverse(Pred, YRange))\n+    return replaceInstUsesWith(Cmp, ConstantInt::getBool(Cmp.getType(), *Res));\n+  if (ICmpInst::isUnsigned(Pred)) {\n+    // Check if this icmp is actually a sign bit check.\n+    const APInt *C;\n+    bool IgnoreTrueIfSigned;\n+    if (!match(Y, m_APInt(C)) ||\n+        !isSignBitCheck(Pred, *C, IgnoreTrueIfSigned)) {\n+      if (ICmpInst *Res = canonicalizeSignBitCheck(Pred, X, XRange, YRange))\n+        return Res;\n+      if (ICmpInst *Res = canonicalizeSignBitCheck(\n+              ICmpInst::getSwappedPredicate(Pred), Y, YRange, XRange))\n+        return Res;\n+    }\n+  }\n+  return nullptr;\n+}\n+\n // Transform pattern like:\n //   (1 << Y) u<= X  or  ~(-1 << Y) u<  X  or  ((1 << Y)+(-1)) u<  X\n //   (1 << Y) u>  X  or  ~(-1 << Y) u>= X  or  ((1 << Y)+(-1)) u>= X\n@@ -7397,6 +7460,9 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {\n   if (Instruction *Res = canonicalizeICmpPredicate(I))\n     return Res;\n \n+  if (Instruction *Res = foldICmpUsingConstantRanges(I))\n+    return Res;\n+\n   if (Instruction *Res = foldICmpWithConstant(I))\n     return Res;\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 83e1da98deeda..577a053e59e93 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -668,6 +668,7 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   Instruction *foldICmpWithCastOp(ICmpInst &ICmp);\n   Instruction *foldICmpWithZextOrSext(ICmpInst &ICmp);\n \n+  Instruction *foldICmpUsingConstantRanges(ICmpInst &Cmp);\n   Instruction *foldICmpUsingKnownBits(ICmpInst &Cmp);\n   Instruction *foldICmpWithDominatingICmp(ICmpInst &Cmp);\n   Instruction *foldICmpWithConstant(ICmpInst &Cmp);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/add.ll b/llvm/test/Transforms/InstCombine/add.ll\nindex 222f87fa3a5f1..495f99824652d 100644\n--- a/llvm/test/Transforms/InstCombine/add.ll\n+++ b/llvm/test/Transforms/InstCombine/add.ll\n@@ -3018,6 +3018,32 @@ define i32 @floor_sdiv_wrong_op(i32 %x, i32 %y) {\n   ret i32 %r\n }\n \n+define i32 @floor_sdiv_using_srem_by_8(i32 %x) {\n+; CHECK-LABEL: @floor_sdiv_using_srem_by_8(\n+; CHECK-NEXT:    [[F:%.*]] = ashr i32 [[X:%.*]], 3\n+; CHECK-NEXT:    ret i32 [[F]]\n+;\n+  %d = sdiv i32 %x, 8\n+  %r = srem i32 %x, 8\n+  %i = icmp ugt i32 %r, -2147483648\n+  %s = sext i1 %i to i32\n+  %f = add i32 %d, %s\n+  ret i32 %f\n+}\n+\n+define i32 @floor_sdiv_using_srem_by_2(i32 %x) {\n+; CHECK-LABEL: @floor_sdiv_using_srem_by_2(\n+; CHECK-NEXT:    [[F:%.*]] = ashr i32 [[X:%.*]], 1\n+; CHECK-NEXT:    ret i32 [[F]]\n+;\n+  %d = sdiv i32 %x, 2\n+  %r = srem i32 %x, 2\n+  %i = icmp ugt i32 %r, -2147483648\n+  %s = sext i1 %i to i32\n+  %f = add i32 %d, %s\n+  ret i32 %f\n+}\n+\n ; (X s>> (BW - 1)) + (zext (X s> 0)) --> (X s>> (BW - 1)) | (zext (X != 0))\n \n define i8 @signum_i8_i8(i8 %x) {\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-dom.ll b/llvm/test/Transforms/InstCombine/icmp-dom.ll\nindex 3cf3a7af77041..66e9e514a9022 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-dom.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-dom.ll\n@@ -381,11 +381,11 @@ falselabel:\n \n define i8 @PR48900_alt(i8 %i, ptr %p) {\n ; CHECK-LABEL: @PR48900_alt(\n-; CHECK-NEXT:    [[SMAX:%.*]] = call i8 @llvm.smax.i8(i8 [[I:%.*]], i8 -127)\n-; CHECK-NEXT:    [[I4:%.*]] = icmp ugt i8 [[SMAX]], -128\n+; CHECK-NEXT:    [[I4:%.*]] = icmp slt i8 [[I:%.*]], 0\n ; CHECK-NEXT:    br i1 [[I4]], label [[TRUELABEL:%.*]], label [[FALSELABEL:%.*]]\n ; CHECK:       truelabel:\n-; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.smin.i8(i8 [[SMAX]], i8 -126)\n+; CHECK-NEXT:    [[TMP1:%.*]] = icmp slt i8 [[I]], -126\n+; CHECK-NEXT:    [[UMIN:%.*]] = select i1 [[TMP1]], i8 -127, i8 -126\n ; CHECK-NEXT:    ret i8 [[UMIN]]\n ; CHECK:       falselabel:\n ; CHECK-NEXT:    ret i8 0\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-srem.ll b/llvm/test/Transforms/InstCombine/icmp-srem.ll\nnew file mode 100644\nindex 0000000000000..9ab92f15ae7d2\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/icmp-srem.ll\n@@ -0,0 +1,468 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 5\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+define i1 @icmp_ugt_sremsmin_smin(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smin(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[X]], -2147483648\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ugt i32 %r, -2147483648\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmin_sminp1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_sminp1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483647\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ugt i32 %r, -2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmin_smaxm1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smaxm1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483646\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ugt i32 %r, 2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmin_smax(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smax(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[X]], -2147483648\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ugt i32 %r, 2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmin_smin(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmin_smin(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ult i32 %r, -2147483648\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmin_sminp1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmin_sminp1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ult i32 %r, -2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmin_sminp2(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmin_sminp2(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483646\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ult i32 %r, -2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmin_smax(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmin_smax(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483647\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, -2147483648\n+  %c = icmp ult i32 %r, 2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_smin(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_smin(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, -2147483648\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_m5(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_m5(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, -5\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_m4(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_m4(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -4\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, -4\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_3(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_3(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 3\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, 3\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_4(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_4(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, 4\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_srem5_smaxm1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_srem5_smaxm1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ugt i32 %r, 2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_sminp1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_sminp1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, -2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_m4(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_m4(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, -4\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_m3(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_m3(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -3\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, -3\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_4(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_4(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 4\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, 4\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_5(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_5(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, 5\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_srem5_smax(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_srem5_smax(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 5\n+  %c = icmp ult i32 %r, 2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_smin(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smin(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, -2147483648\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_sminp1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_sminp1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, -2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_sminp2(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_sminp2(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483646\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, -2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_smaxm2(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smaxm2(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483645\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, 2147483645\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_smaxm1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smaxm1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, 2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ugt_sremsmax_smax(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smax(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ugt i32 %r, 2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_smin(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smin(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, -2147483648\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_sminp1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, -2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_sminp2(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp2(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, -2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_sminp3(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp3(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483645\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, -2147483645\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_smaxm1(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smaxm1(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483646\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, 2147483646\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_ult_sremsmax_smax(i32 %x) {\n+; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smax(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n+; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 2147483647\n+  %c = icmp ult i32 %r, 2147483647\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_slt_srem_pos_range(i32 %x, i32 range(i32 999, -2147483648) %y) {\n+; CHECK-LABEL: define i1 @icmp_slt_srem_pos_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 999, -2147483648) [[Y:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 1000\n+; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], [[Y]]\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp slt i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sle_srem_pos_range(i32 %x, i32 range(i32 999, -2147483648) %y) {\n+; CHECK-LABEL: define i1 @icmp_sle_srem_pos_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 999, -2147483648) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 true\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sle i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sgt_srem_pos_range(i32 %x, i32 range(i32 999, -2147483648) %y) {\n+; CHECK-LABEL: define i1 @icmp_sgt_srem_pos_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 999, -2147483648) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 false\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sgt i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sge_srem_pos_range(i32 %x, i32 range(i32 999, -2147483648) %y) {\n+; CHECK-LABEL: define i1 @icmp_sge_srem_pos_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 999, -2147483648) [[Y:%.*]]) {\n+; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 1000\n+; CHECK-NEXT:    [[C:%.*]] = icmp sge i32 [[R]], [[Y]]\n+; CHECK-NEXT:    ret i1 [[C]]\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sge i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_slt_srem_neg_range(i32 %x, i32 range(i32 -2147483648, -999) %y) {\n+; CHECK-LABEL: define i1 @icmp_slt_srem_neg_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 -2147483648, -999) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 false\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp slt i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sle_srem_neg_range(i32 %x, i32 range(i32 -2147483648, -999) %y) {\n+; CHECK-LABEL: define i1 @icmp_sle_srem_neg_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 -2147483648, -999) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 false\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sle i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sgt_srem_neg_range(i32 %x, i32 range(i32 -2147483648, -999) %y) {\n+; CHECK-LABEL: define i1 @icmp_sgt_srem_neg_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 -2147483648, -999) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 true\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sgt i32 %r, %y\n+  ret i1 %c\n+}\n+\n+define i1 @icmp_sge_srem_neg_range(i32 %x, i32 range(i32 -2147483648, -999) %y) {\n+; CHECK-LABEL: define i1 @icmp_sge_srem_neg_range(\n+; CHECK-SAME: i32 [[X:%.*]], i32 range(i32 -2147483648, -999) [[Y:%.*]]) {\n+; CHECK-NEXT:    ret i1 true\n+;\n+  %r = srem i32 %x, 1000\n+  %c = icmp sge i32 %r, %y\n+  ret i1 %c\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/smin-icmp.ll b/llvm/test/Transforms/InstCombine/smin-icmp.ll\nindex f05c1698f1a98..dda59cefbc6f1 100644\n--- a/llvm/test/Transforms/InstCombine/smin-icmp.ll\n+++ b/llvm/test/Transforms/InstCombine/smin-icmp.ll\n@@ -965,9 +965,9 @@ define void @eq_smin_v2i32_constant(<2 x i32> %y) {\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP4]])\n ; CHECK-NEXT:    [[CMP5:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 10)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP5]])\n-; CHECK-NEXT:    [[CMP6:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 11)\n+; CHECK-NEXT:    [[CMP6:%.*]] = icmp sgt <2 x i32> [[Y]], splat (i32 -1)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP6]])\n-; CHECK-NEXT:    [[CMP7:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 10)\n+; CHECK-NEXT:    [[CMP7:%.*]] = icmp slt <2 x i32> [[Y]], zeroinitializer\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP7]])\n ; CHECK-NEXT:    [[CMP8:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 9)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP8]])\n@@ -1004,18 +1004,17 @@ define void @eq_smin_v2i32_constant(<2 x i32> %y) {\n ; icmp pred smin(C1, Y), C2 where C1 < C2\n define void @slt_smin_v2i32_constant(<2 x i32> %y) {\n ; CHECK-LABEL: @slt_smin_v2i32_constant(\n-; CHECK-NEXT:    [[COND:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[Y:%.*]], <2 x i32> splat (i32 5))\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n-; CHECK-NEXT:    [[CMP5:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 10)\n+; CHECK-NEXT:    [[CMP5:%.*]] = icmp sgt <2 x i32> [[Y:%.*]], splat (i32 -1)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP5]])\n-; CHECK-NEXT:    [[CMP6:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 11)\n+; CHECK-NEXT:    [[CMP6:%.*]] = icmp sgt <2 x i32> [[Y]], splat (i32 -1)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP6]])\n-; CHECK-NEXT:    [[CMP7:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 10)\n+; CHECK-NEXT:    [[CMP7:%.*]] = icmp slt <2 x i32> [[Y]], zeroinitializer\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP7]])\n-; CHECK-NEXT:    [[CMP8:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 9)\n+; CHECK-NEXT:    [[CMP8:%.*]] = icmp slt <2 x i32> [[Y]], zeroinitializer\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP8]])\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n ; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n",
+  "source_files": [
+    "llvm/include/llvm/IR/ConstantRange.h",
+    "llvm/lib/Analysis/InstructionSimplify.cpp",
+    "llvm/lib/IR/ConstantRange.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/add.ll",
+    "llvm/test/Transforms/InstCombine/icmp-dom.ll",
+    "llvm/test/Transforms/InstCombine/icmp-srem.ll",
+    "llvm/test/Transforms/InstCombine/smin-icmp.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/add.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        [
+          "opt < %s -passes=instcombine -use-constant-int-for-fixed-length-splat -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "floor_sdiv_using_srem_by_2",
+          "test_body": "define i32 @floor_sdiv_using_srem_by_2(i32 %x) {\n; CHECK-LABEL: @floor_sdiv_using_srem_by_2(\n; CHECK-NEXT:    [[D:%.*]] = sdiv i32 [[X:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2\n; CHECK-NEXT:    [[I:%.*]] = icmp ugt i32 [[R]], -2147483648\n; CHECK-NEXT:    [[S:%.*]] = sext i1 [[I]] to i32\n; CHECK-NEXT:    [[F:%.*]] = add nsw i32 [[D]], [[S]]\n; CHECK-NEXT:    ret i32 [[F]]\n  %d = sdiv i32 %x, 2\n  %r = srem i32 %x, 2\n  %i = icmp ugt i32 %r, -2147483648\n  %s = sext i1 %i to i32\n  %f = add i32 %d, %s\n  ret i32 %f\n}",
+          "source_program": "define i32 @floor_sdiv_using_srem_by_2(i32 %x) {\n  %d = sdiv i32 %x, 2\n  %r = srem i32 %x, 2\n  %i = icmp ugt i32 %r, -2147483648\n  %s = sext i1 %i to i32\n  %f = add i32 %d, %s\n  ret i32 %f\n}\n"
+        },
+        {
+          "test_name": "floor_sdiv_using_srem_by_8",
+          "test_body": "define i32 @floor_sdiv_using_srem_by_8(i32 %x) {\n; CHECK-LABEL: @floor_sdiv_using_srem_by_8(\n; CHECK-NEXT:    [[D:%.*]] = sdiv i32 [[X:%.*]], 8\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 8\n; CHECK-NEXT:    [[I:%.*]] = icmp ugt i32 [[R]], -2147483648\n; CHECK-NEXT:    [[S:%.*]] = sext i1 [[I]] to i32\n; CHECK-NEXT:    [[F:%.*]] = add nsw i32 [[D]], [[S]]\n; CHECK-NEXT:    ret i32 [[F]]\n  %d = sdiv i32 %x, 8\n  %r = srem i32 %x, 8\n  %i = icmp ugt i32 %r, -2147483648\n  %s = sext i1 %i to i32\n  %f = add i32 %d, %s\n  ret i32 %f\n}",
+          "source_program": "define i32 @floor_sdiv_using_srem_by_8(i32 %x) {\n  %d = sdiv i32 %x, 8\n  %r = srem i32 %x, 8\n  %i = icmp ugt i32 %r, -2147483648\n  %s = sext i1 %i to i32\n  %f = add i32 %d, %s\n  ret i32 %f\n}\n"
+        },
+        {
+          "test_name": "floor_sdiv_wrong_op",
+          "test_body": "define i32 @floor_sdiv_wrong_op(i32 %x, i32 %y) {\n; CHECK-LABEL: @floor_sdiv_wrong_op(\n; CHECK-NEXT:    [[D:%.*]] = sdiv i32 [[X:%.*]], 4\n; CHECK-NEXT:    [[A:%.*]] = and i32 [[Y:%.*]], -2147483645\n; CHECK-NEXT:    [[I:%.*]] = icmp ugt i32 [[A]], -2147483648\n; CHECK-NEXT:    [[S:%.*]] = zext i1 [[I]] to i32\n; CHECK-NEXT:    [[R:%.*]] = add nsw i32 [[D]], [[S]]\n; CHECK-NEXT:    ret i32 [[R]]\n  %d = sdiv i32 %x, 4\n  %a = and i32 %y, -2147483645\n  %i = icmp ugt i32 %a, -2147483648\n  %s = zext i1 %i to i32\n  %r = add i32 %d, %s\n  ret i32 %r\n}",
+          "source_program": "define i32 @floor_sdiv_wrong_op(i32 %x, i32 %y) {\n  %d = sdiv i32 %x, 4\n  %a = and i32 %y, -2147483645\n  %i = icmp ugt i32 %a, -2147483648\n  %s = zext i1 %i to i32\n  %r = add i32 %d, %s\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i8_i8",
+          "test_body": "define i8 @signum_i8_i8(i8 %x) {\n; CHECK-LABEL: @signum_i8_i8(\n; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i8 [[X:%.*]], 7\n; CHECK-NEXT:    [[ISNOTNULL:%.*]] = icmp ne i8 [[X]], 0\n; CHECK-NEXT:    [[ISNOTNULL_ZEXT:%.*]] = zext i1 [[ISNOTNULL]] to i8\n; CHECK-NEXT:    [[R:%.*]] = or i8 [[SIGNBIT]], [[ISNOTNULL_ZEXT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %sgt0 = icmp sgt i8 %x, 0\n  %zgt0 = zext i1 %sgt0 to i8\n  %signbit = ashr i8 %x, 7\n  %r = add i8 %zgt0, %signbit\n  ret i8 %r\n}",
+          "source_program": "define i8 @signum_i8_i8(i8 %x) {\n  %sgt0 = icmp sgt i8 %x, 0\n  %zgt0 = zext i1 %sgt0 to i8\n  %signbit = ashr i8 %x, 7\n  %r = add i8 %zgt0, %signbit\n  ret i8 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-dom.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "PR48900_alt",
+          "test_body": "define i8 @PR48900_alt(i8 %i, ptr %p) {\n; CHECK-LABEL: @PR48900_alt(\n; CHECK-NEXT:    [[SMAX:%.*]] = call i8 @llvm.smax.i8(i8 [[I:%.*]], i8 -127)\n; CHECK-NEXT:    [[I4:%.*]] = icmp ugt i8 [[SMAX]], -128\n; CHECK-NEXT:    br i1 [[I4]], label [[TRUELABEL:%.*]], label [[FALSELABEL:%.*]]\n; CHECK:       truelabel:\n; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.smin.i8(i8 [[SMAX]], i8 -126)\n; CHECK-NEXT:    ret i8 [[UMIN]]\n; CHECK:       falselabel:\n; CHECK-NEXT:    ret i8 0\n  %maxcmp = icmp sgt i8 %i, -127\n  %smax = select i1 %maxcmp, i8 %i, i8 -127\n  %i4 = icmp ugt i8 %smax, -128\n  br i1 %i4, label %truelabel, label %falselabel\n\ntruelabel:                                        ; preds = %0\n  %mincmp = icmp slt i8 %smax, -126\n  %umin = select i1 %mincmp, i8 %smax, i8 -126\n  ret i8 %umin\n\nfalselabel:                                       ; preds = %0\n  ret i8 0\n}",
+          "source_program": "define i8 @PR48900_alt(i8 %i, ptr %p) {\n  %maxcmp = icmp sgt i8 %i, -127\n  %smax = select i1 %maxcmp, i8 %i, i8 -127\n  %i4 = icmp ugt i8 %smax, -128\n  br i1 %i4, label %truelabel, label %falselabel\n\ntruelabel:                                        ; preds = %0\n  %mincmp = icmp slt i8 %smax, -126\n  %umin = select i1 %mincmp, i8 %smax, i8 -126\n  ret i8 %umin\n\nfalselabel:                                       ; preds = %0\n  ret i8 0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-srem.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_ugt_srem5_3",
+          "test_body": "define i1 @icmp_ugt_srem5_3(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_3(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 3\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 3\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_3(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 3\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_srem5_4",
+          "test_body": "define i1 @icmp_ugt_srem5_4(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_4(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 4\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 4\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_4(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 4\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_srem5_m4",
+          "test_body": "define i1 @icmp_ugt_srem5_m4(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_m4(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -4\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -4\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_m4(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -4\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_srem5_m5",
+          "test_body": "define i1 @icmp_ugt_srem5_m5(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_m5(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -5\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -5\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_m5(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -5\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_srem5_smaxm1",
+          "test_body": "define i1 @icmp_ugt_srem5_smaxm1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_smaxm1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_smaxm1(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_srem5_smin",
+          "test_body": "define i1 @icmp_ugt_srem5_smin(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_srem5_smin(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483648\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_srem5_smin(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_smax",
+          "test_body": "define i1 @icmp_ugt_sremsmax_smax(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smax(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp slt i32 [[R]], 0\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_smax(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_smaxm1",
+          "test_body": "define i1 @icmp_ugt_sremsmax_smaxm1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smaxm1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_smaxm1(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_smaxm2",
+          "test_body": "define i1 @icmp_ugt_sremsmax_smaxm2(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smaxm2(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483645\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483645\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_smaxm2(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, 2147483645\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_smin",
+          "test_body": "define i1 @icmp_ugt_sremsmax_smin(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_smin(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483648\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_smin(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_sminp1",
+          "test_body": "define i1 @icmp_ugt_sremsmax_sminp1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_sminp1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_sminp1(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmax_sminp2",
+          "test_body": "define i1 @icmp_ugt_sremsmax_sminp2(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmax_sminp2(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmax_sminp2(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ugt i32 %r, -2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmin_smax",
+          "test_body": "define i1 @icmp_ugt_sremsmin_smax(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smax(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[X]], -2147483648\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, 2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmin_smax(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, 2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmin_smaxm1",
+          "test_body": "define i1 @icmp_ugt_sremsmin_smaxm1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smaxm1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], 2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmin_smaxm1(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, 2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmin_smin",
+          "test_body": "define i1 @icmp_ugt_sremsmin_smin(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_smin(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483648\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmin_smin(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, -2147483648\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_sremsmin_sminp1",
+          "test_body": "define i1 @icmp_ugt_sremsmin_sminp1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ugt_sremsmin_sminp1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ugt i32 [[R]], -2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, -2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ugt_sremsmin_sminp1(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ugt i32 %r, -2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_4",
+          "test_body": "define i1 @icmp_ult_srem5_4(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_4(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 4\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 4\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_4(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 4\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_5",
+          "test_body": "define i1 @icmp_ult_srem5_5(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_5(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 5\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 5\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_5(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 5\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_m3",
+          "test_body": "define i1 @icmp_ult_srem5_m3(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_m3(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -3\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -3\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_m3(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -3\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_m4",
+          "test_body": "define i1 @icmp_ult_srem5_m4(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_m4(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -4\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -4\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_m4(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -4\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_smax",
+          "test_body": "define i1 @icmp_ult_srem5_smax(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_smax(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_smax(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_srem5_sminp1",
+          "test_body": "define i1 @icmp_ult_srem5_sminp1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_srem5_sminp1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 5\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_srem5_sminp1(i32 %x) {\n  %r = srem i32 %x, 5\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_smax",
+          "test_body": "define i1 @icmp_ult_sremsmax_smax(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smax(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_smax(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_smaxm1",
+          "test_body": "define i1 @icmp_ult_sremsmax_smaxm1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smaxm1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, 2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_smaxm1(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, 2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_smin",
+          "test_body": "define i1 @icmp_ult_sremsmax_smin(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_smin(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483648\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_smin(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483648\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_sminp1",
+          "test_body": "define i1 @icmp_ult_sremsmax_sminp1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_sminp1(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_sminp2",
+          "test_body": "define i1 @icmp_ult_sremsmax_sminp2(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp2(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_sminp2(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483646\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmax_sminp3",
+          "test_body": "define i1 @icmp_ult_sremsmax_sminp3(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmax_sminp3(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], 2147483647\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483645\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483645\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmax_sminp3(i32 %x) {\n  %r = srem i32 %x, 2147483647\n  %c = icmp ult i32 %r, -2147483645\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmin_smax",
+          "test_body": "define i1 @icmp_ult_sremsmin_smax(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmin_smax(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], 2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmin_smax(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, 2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmin_smin",
+          "test_body": "define i1 @icmp_ult_sremsmin_smin(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmin_smin(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp sgt i32 [[R]], -1\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483648\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmin_smin(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483648\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmin_sminp1",
+          "test_body": "define i1 @icmp_ult_sremsmin_sminp1(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmin_sminp1(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483647\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmin_sminp1(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483647\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "icmp_ult_sremsmin_sminp2",
+          "test_body": "define i1 @icmp_ult_sremsmin_sminp2(i32 %x) {\n; CHECK-LABEL: define i1 @icmp_ult_sremsmin_sminp2(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[R:%.*]] = srem i32 [[X]], -2147483648\n; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[R]], -2147483646\n; CHECK-NEXT:    ret i1 [[C]]\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483646\n  ret i1 %c\n}",
+          "source_program": "define i1 @icmp_ult_sremsmin_sminp2(i32 %x) {\n  %r = srem i32 %x, -2147483648\n  %c = icmp ult i32 %r, -2147483646\n  ret i1 %c\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/smin-icmp.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "eq_smin_v2i32_constant",
+          "test_body": "declare void @use_v2i1(<2 x i1>)\n\ndefine void @eq_smin_v2i32_constant(<2 x i32> %y) {\n; CHECK-LABEL: @eq_smin_v2i32_constant(\n; CHECK-NEXT:    [[COND:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[Y:%.*]], <2 x i32> splat (i32 10))\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt <2 x i32> [[Y]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP1]])\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n; CHECK-NEXT:    [[CMP4:%.*]] = icmp sgt <2 x i32> [[Y]], splat (i32 9)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP4]])\n; CHECK-NEXT:    [[CMP5:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP5]])\n; CHECK-NEXT:    [[CMP6:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 11)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP6]])\n; CHECK-NEXT:    [[CMP7:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP7]])\n; CHECK-NEXT:    [[CMP8:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 9)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP8]])\n; CHECK-NEXT:    [[CMP9:%.*]] = icmp sgt <2 x i32> [[Y]], splat (i32 9)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP9]])\n; CHECK-NEXT:    [[CMP10:%.*]] = icmp slt <2 x i32> [[Y]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP10]])\n; CHECK-NEXT:    ret void\n  %cond = call <2 x i32> @llvm.smin.v2i32(<2 x i32> <i32 10, i32 10>, <2 x i32> %y)\n  %cmp1 = icmp slt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp1)\n  %cmp2 = icmp sle <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp2)\n  %cmp3 = icmp sgt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp3)\n  %cmp4 = icmp sge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp4)\n  %cmp5 = icmp ult <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp5)\n  %cmp6 = icmp ule <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp6)\n  %cmp7 = icmp ugt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp7)\n  %cmp8 = icmp uge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp8)\n  %cmp9 = icmp eq <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp9)\n  %cmp10 = icmp ne <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp10)\n  ret void\n}",
+          "source_program": "declare void @use_v2i1(<2 x i1>)\n\ndefine void @eq_smin_v2i32_constant(<2 x i32> %y) {\n  %cond = call <2 x i32> @llvm.smin.v2i32(<2 x i32> <i32 10, i32 10>, <2 x i32> %y)\n  %cmp1 = icmp slt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp1)\n  %cmp2 = icmp sle <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp2)\n  %cmp3 = icmp sgt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp3)\n  %cmp4 = icmp sge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp4)\n  %cmp5 = icmp ult <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp5)\n  %cmp6 = icmp ule <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp6)\n  %cmp7 = icmp ugt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp7)\n  %cmp8 = icmp uge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp8)\n  %cmp9 = icmp eq <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp9)\n  %cmp10 = icmp ne <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp10)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "slt_smin_v2i32_constant",
+          "test_body": "declare void @use_v2i1(<2 x i1>)\n\ndefine void @slt_smin_v2i32_constant(<2 x i32> %y) {\n; CHECK-LABEL: @slt_smin_v2i32_constant(\n; CHECK-NEXT:    [[COND:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[Y:%.*]], <2 x i32> splat (i32 5))\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n; CHECK-NEXT:    [[CMP5:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP5]])\n; CHECK-NEXT:    [[CMP6:%.*]] = icmp ult <2 x i32> [[COND]], splat (i32 11)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP6]])\n; CHECK-NEXT:    [[CMP7:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 10)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP7]])\n; CHECK-NEXT:    [[CMP8:%.*]] = icmp ugt <2 x i32> [[COND]], splat (i32 9)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> [[CMP8]])\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> zeroinitializer)\n; CHECK-NEXT:    call void @use_v2i1(<2 x i1> splat (i1 true))\n; CHECK-NEXT:    ret void\n  %cond = call <2 x i32> @llvm.smin.v2i32(<2 x i32> <i32 5, i32 5>, <2 x i32> %y)\n  %cmp1 = icmp slt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp1)\n  %cmp2 = icmp sle <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp2)\n  %cmp3 = icmp sgt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp3)\n  %cmp4 = icmp sge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp4)\n  %cmp5 = icmp ult <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp5)\n  %cmp6 = icmp ule <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp6)\n  %cmp7 = icmp ugt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp7)\n  %cmp8 = icmp uge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp8)\n  %cmp9 = icmp eq <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp9)\n  %cmp10 = icmp ne <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp10)\n  ret void\n}",
+          "source_program": "declare void @use_v2i1(<2 x i1>)\n\ndefine void @slt_smin_v2i32_constant(<2 x i32> %y) {\n  %cond = call <2 x i32> @llvm.smin.v2i32(<2 x i32> <i32 5, i32 5>, <2 x i32> %y)\n  %cmp1 = icmp slt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp1)\n  %cmp2 = icmp sle <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp2)\n  %cmp3 = icmp sgt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp3)\n  %cmp4 = icmp sge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp4)\n  %cmp5 = icmp ult <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp5)\n  %cmp6 = icmp ule <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp6)\n  %cmp7 = icmp ugt <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp7)\n  %cmp8 = icmp uge <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp8)\n  %cmp9 = icmp eq <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp9)\n  %cmp10 = icmp ne <2 x i32> %cond, <i32 10, i32 10>\n  call void @use_v2i1(<2 x i1> %cmp10)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

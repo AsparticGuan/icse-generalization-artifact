@@ -1,0 +1,103 @@
+{
+  "pr_number": 87230,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/87230",
+  "title": "[InstCombine] Drop poison-generating flags in `threadBinOpOverSelect`",
+  "commit_sha": "9707684e7714b1d485a31906ff3e17d6f6f94ace",
+  "components": [
+    "InstCombine",
+    "InstructionSimplify"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "InstructionSimplify"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/InstructionSimplify.h": [
+        [
+          264,
+          269
+        ]
+      ],
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        [
+          393,
+          399
+        ],
+        [
+          447,
+          452
+        ],
+        [
+          460,
+          465
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          1964,
+          1969
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/InstructionSimplify.h": [
+        "simplifyWithOpReplaced"
+      ],
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        "simplifyAssociativeBinOp",
+        "threadBinOpOverSelect"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::foldBinOpIntoSelectOrPhi"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/InstructionSimplify.h b/llvm/include/llvm/Analysis/InstructionSimplify.h\nindex 03d7ad12c12d8..eacc9a25086cb 100644\n--- a/llvm/include/llvm/Analysis/InstructionSimplify.h\n+++ b/llvm/include/llvm/Analysis/InstructionSimplify.h\n@@ -264,6 +264,17 @@ simplifyWithOpReplaced(Value *V, Value *Op, Value *RepOp,\n                        const SimplifyQuery &Q, bool AllowRefinement,\n                        SmallVectorImpl<Instruction *> *DropFlags = nullptr);\n \n+/// In the case of a binary operation with a select instruction as an operand,\n+/// try to simplify the binop by seeing whether evaluating it on both branches\n+/// of the select results in the same value. Returns the common value if so,\n+/// otherwise returns null.\n+///\n+/// If DropFlags is passed, then the result is only valid if\n+/// poison-generating flags/metadata on the instruction are dropped.\n+Value *threadBinOpOverSelect(Instruction::BinaryOps Opcode, Value *LHS,\n+                             Value *RHS, const SimplifyQuery &Q,\n+                             Instruction **DropFlags);\n+\n /// Replace all uses of 'I' with 'SimpleV' and simplify the uses recursively.\n ///\n /// This first performs a normal RAUW of I with SimpleV. It then recursively\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex 9ff3faff79902..cee84793d4326 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -393,7 +393,8 @@ static Value *simplifyAssociativeBinOp(Instruction::BinaryOps Opcode,\n /// otherwise returns null.\n static Value *threadBinOpOverSelect(Instruction::BinaryOps Opcode, Value *LHS,\n                                     Value *RHS, const SimplifyQuery &Q,\n-                                    unsigned MaxRecurse) {\n+                                    unsigned MaxRecurse,\n+                                    Instruction **DropFlags = nullptr) {\n   // Recursion is always used, so bail out at once if we already hit the limit.\n   if (!MaxRecurse--)\n     return nullptr;\n@@ -447,6 +448,13 @@ static Value *threadBinOpOverSelect(Instruction::BinaryOps Opcode, Value *LHS,\n       Value *UnsimplifiedBranch = FV ? SI->getTrueValue() : SI->getFalseValue();\n       Value *UnsimplifiedLHS = SI == LHS ? UnsimplifiedBranch : LHS;\n       Value *UnsimplifiedRHS = SI == LHS ? RHS : UnsimplifiedBranch;\n+\n+      if (Simplified->hasPoisonGeneratingFlags()) {\n+        if (!DropFlags)\n+          return nullptr;\n+        *DropFlags = Simplified;\n+      }\n+\n       if (Simplified->getOperand(0) == UnsimplifiedLHS &&\n           Simplified->getOperand(1) == UnsimplifiedRHS)\n         return Simplified;\n@@ -460,6 +468,13 @@ static Value *threadBinOpOverSelect(Instruction::BinaryOps Opcode, Value *LHS,\n   return nullptr;\n }\n \n+Value *llvm::threadBinOpOverSelect(Instruction::BinaryOps Opcode, Value *LHS,\n+                                   Value *RHS, const SimplifyQuery &Q,\n+                                   Instruction **DropFlags) {\n+  return ::threadBinOpOverSelect(Opcode, LHS, RHS, Q, RecursionLimit,\n+                                 DropFlags);\n+}\n+\n /// In the case of a comparison with a select instruction, try to simplify the\n /// comparison by seeing whether both branches of the select result in the same\n /// value. Returns the common value if so, otherwise returns null.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 7c40fb4fc8608..d3ac2762d64f4 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1964,6 +1964,15 @@ Instruction *InstCombinerImpl::foldBinOpIntoSelectOrPhi(BinaryOperator &I) {\n   if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(0))) {\n     if (Instruction *NewSel = FoldOpIntoSelect(I, Sel))\n       return NewSel;\n+\n+    const SimplifyQuery SQ = getSimplifyQuery().getWithInstruction(&I);\n+    Instruction *DropFlags = nullptr;\n+    if (Value *V = threadBinOpOverSelect(I.getOpcode(), I.getOperand(0),\n+                                         I.getOperand(1), SQ, &DropFlags)) {\n+      if (DropFlags)\n+        DropFlags->dropPoisonGeneratingFlags();\n+      return replaceInstUsesWith(I, V);\n+    }\n   } else if (auto *PN = dyn_cast<PHINode>(I.getOperand(0))) {\n     if (Instruction *NewPhi = foldOpIntoPhi(I, PN))\n       return NewPhi;\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/pr87042.ll b/llvm/test/Transforms/InstCombine/pr87042.ll\nnew file mode 100644\nindex 0000000000000..b3d6821e43c3d\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/pr87042.ll\n@@ -0,0 +1,49 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 4\n+; RUN: opt -S -passes=instcombine < %s | FileCheck %s\n+\n+define i64 @test_disjoint_or(i1 %cond, i64 %x) {\n+; CHECK-LABEL: define i64 @test_disjoint_or(\n+; CHECK-SAME: i1 [[COND:%.*]], i64 [[X:%.*]]) {\n+; CHECK-NEXT:    [[OR2:%.*]] = or i64 [[X]], 7\n+; CHECK-NEXT:    ret i64 [[OR2]]\n+;\n+  %or1 = or disjoint i64 %x, 7\n+  %sel1 = select i1 %cond, i64 %or1, i64 %x\n+  %or2 = or i64 %sel1, 7\n+  ret i64 %or2\n+}\n+\n+define i64 @test_or(i1 %cond, i64 %x) {\n+; CHECK-LABEL: define i64 @test_or(\n+; CHECK-SAME: i1 [[COND:%.*]], i64 [[X:%.*]]) {\n+; CHECK-NEXT:    [[OR2:%.*]] = or i64 [[X]], 7\n+; CHECK-NEXT:    ret i64 [[OR2]]\n+;\n+  %or1 = or i64 %x, 7\n+  %sel1 = select i1 %cond, i64 %or1, i64 %x\n+  %or2 = or i64 %sel1, 7\n+  ret i64 %or2\n+}\n+\n+define i64 @pr87042(i64 %x) {\n+; CHECK-LABEL: define i64 @pr87042(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:    [[AND1:%.*]] = and i64 [[X]], 65535\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i64 [[AND1]], 0\n+; CHECK-NEXT:    [[OR1:%.*]] = or i64 [[X]], 7\n+; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[CMP1]], i64 [[OR1]], i64 [[X]]\n+; CHECK-NEXT:    [[AND2:%.*]] = and i64 [[SEL1]], 16776960\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i64 [[AND2]], 0\n+; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[CMP2]], i64 [[OR1]], i64 [[SEL1]]\n+; CHECK-NEXT:    ret i64 [[SEL2]]\n+;\n+  %and1 = and i64 %x, 65535\n+  %cmp1 = icmp eq i64 %and1, 0\n+  %or1 = or disjoint i64 %x, 7\n+  %sel1 = select i1 %cmp1, i64 %or1, i64 %x\n+  %and2 = and i64 %sel1, 16776960\n+  %cmp2 = icmp eq i64 %and2, 0\n+  %or2 = or i64 %sel1, 7\n+  %sel2 = select i1 %cmp2, i64 %or2, i64 %sel1\n+  ret i64 %sel2\n+}\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/InstructionSimplify.h",
+    "llvm/lib/Analysis/InstructionSimplify.cpp",
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/pr87042.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr87042.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "pr87042",
+          "test_body": "define i64 @pr87042(i64 %x) {\n; CHECK-LABEL: define i64 @pr87042(\n; CHECK-SAME: i64 [[X:%.*]]) {\n; CHECK-NEXT:    [[AND1:%.*]] = and i64 [[X]], 65535\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i64 [[AND1]], 0\n; CHECK-NEXT:    [[OR1:%.*]] = or disjoint i64 [[X]], 7\n; CHECK-NEXT:    [[SEL1:%.*]] = select i1 [[CMP1]], i64 [[OR1]], i64 [[X]]\n; CHECK-NEXT:    [[AND2:%.*]] = and i64 [[SEL1]], 16776960\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i64 [[AND2]], 0\n; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[CMP2]], i64 [[OR1]], i64 [[SEL1]]\n; CHECK-NEXT:    ret i64 [[SEL2]]\n  %and1 = and i64 %x, 65535\n  %cmp1 = icmp eq i64 %and1, 0\n  %or1 = or disjoint i64 %x, 7\n  %sel1 = select i1 %cmp1, i64 %or1, i64 %x\n  %and2 = and i64 %sel1, 16776960\n  %cmp2 = icmp eq i64 %and2, 0\n  %or2 = or i64 %sel1, 7\n  %sel2 = select i1 %cmp2, i64 %or2, i64 %sel1\n  ret i64 %sel2\n}",
+          "source_program": "define i64 @pr87042(i64 %x) {\n  %and1 = and i64 %x, 65535\n  %cmp1 = icmp eq i64 %and1, 0\n  %or1 = or disjoint i64 %x, 7\n  %sel1 = select i1 %cmp1, i64 %or1, i64 %x\n  %and2 = and i64 %sel1, 16776960\n  %cmp2 = icmp eq i64 %and2, 0\n  %or2 = or i64 %sel1, 7\n  %sel2 = select i1 %cmp2, i64 %or2, i64 %sel1\n  ret i64 %sel2\n}\n"
+        },
+        {
+          "test_name": "test_disjoint_or",
+          "test_body": "define i64 @test_disjoint_or(i1 %cond, i64 %x) {\n; CHECK-LABEL: define i64 @test_disjoint_or(\n; CHECK-SAME: i1 [[COND:%.*]], i64 [[X:%.*]]) {\n; CHECK-NEXT:    [[OR2:%.*]] = or disjoint i64 [[X]], 7\n; CHECK-NEXT:    ret i64 [[OR2]]\n  %or1 = or disjoint i64 %x, 7\n  %sel1 = select i1 %cond, i64 %or1, i64 %x\n  %or2 = or i64 %sel1, 7\n  ret i64 %or2\n}",
+          "source_program": "define i64 @test_disjoint_or(i1 %cond, i64 %x) {\n  %or1 = or disjoint i64 %x, 7\n  %sel1 = select i1 %cond, i64 %or1, i64 %x\n  %or2 = or i64 %sel1, 7\n  ret i64 %or2\n}\n"
+        },
+        {
+          "test_name": "test_or",
+          "test_body": "define i64 @test_or(i1 %cond, i64 %x) {\n; CHECK-LABEL: define i64 @test_or(\n; CHECK-SAME: i1 [[COND:%.*]], i64 [[X:%.*]]) {\n; CHECK-NEXT:    [[OR2:%.*]] = or i64 [[X]], 7\n; CHECK-NEXT:    ret i64 [[OR2]]\n  %or1 = or i64 %x, 7\n  %sel1 = select i1 %cond, i64 %or1, i64 %x\n  %or2 = or i64 %sel1, 7\n  ret i64 %or2\n}",
+          "source_program": "define i64 @test_or(i1 %cond, i64 %x) {\n  %or1 = or i64 %x, 7\n  %sel1 = select i1 %cond, i64 %or1, i64 %x\n  %or2 = or i64 %sel1, 7\n  ret i64 %or2\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

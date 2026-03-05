@@ -1,0 +1,181 @@
+{
+  "pr_number": 161303,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/161303",
+  "title": "[InstCombine] Fold icmp with clamp into unsigned bound check",
+  "commit_sha": "cffbd0176cc5bdaa0f5a6d0150c548c23ca1bdfa",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/IR/IntrinsicInst.h": [
+        [
+          810,
+          815
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          5780,
+          5785
+        ],
+        [
+          7467,
+          7476
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          725,
+          730
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpCommutative",
+        "InstCombinerImpl::foldICmpWithMinMax"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/IR/IntrinsicInst.h b/llvm/include/llvm/IR/IntrinsicInst.h\nindex eb0440f500735..0622bfae2c845 100644\n--- a/llvm/include/llvm/IR/IntrinsicInst.h\n+++ b/llvm/include/llvm/IR/IntrinsicInst.h\n@@ -810,6 +810,26 @@ class MinMaxIntrinsic : public IntrinsicInst {\n   /// Whether the intrinsic is signed or unsigned.\n   bool isSigned() const { return isSigned(getIntrinsicID()); };\n \n+  /// Whether the intrinsic is a smin or umin.\n+  static bool isMin(Intrinsic::ID ID) {\n+    switch (ID) {\n+    case Intrinsic::umin:\n+    case Intrinsic::smin:\n+      return true;\n+    case Intrinsic::umax:\n+    case Intrinsic::smax:\n+      return false;\n+    default:\n+      llvm_unreachable(\"Invalid intrinsic\");\n+    }\n+  }\n+\n+  /// Whether the intrinsic is a smin or a umin.\n+  bool isMin() const { return isMin(getIntrinsicID()); }\n+\n+  /// Whether the intrinsic is a smax or a umax.\n+  bool isMax() const { return !isMin(getIntrinsicID()); }\n+\n   /// Min/max intrinsics are monotonic, they operate on a fixed-bitwidth values,\n   /// so there is a certain threshold value, upon reaching which,\n   /// their value can no longer change. Return said threshold.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex e4cb457499ef5..74f035e401bde 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -5780,6 +5780,45 @@ Instruction *InstCombinerImpl::foldICmpWithMinMax(Instruction &I,\n   return nullptr;\n }\n \n+/// Match and fold patterns like:\n+///   icmp eq/ne X, min(max(X, Lo), Hi)\n+/// which represents a range check and can be repsented as a ConstantRange.\n+///\n+/// For icmp eq, build ConstantRange [Lo, Hi + 1) and convert to:\n+///   (X - Lo) u< (Hi + 1 - Lo)\n+/// For icmp ne, build ConstantRange [Hi + 1, Lo) and convert to:\n+///   (X - (Hi + 1)) u< (Lo - (Hi + 1))\n+Instruction *InstCombinerImpl::foldICmpWithClamp(ICmpInst &I, Value *X,\n+                                                 MinMaxIntrinsic *Min) {\n+  if (!I.isEquality() || !Min->hasOneUse() || !Min->isMin())\n+    return nullptr;\n+\n+  const APInt *Lo = nullptr, *Hi = nullptr;\n+  if (Min->isSigned()) {\n+    if (!match(Min->getLHS(), m_OneUse(m_SMax(m_Specific(X), m_APInt(Lo)))) ||\n+        !match(Min->getRHS(), m_APInt(Hi)) || !Lo->slt(*Hi))\n+      return nullptr;\n+  } else {\n+    if (!match(Min->getLHS(), m_OneUse(m_UMax(m_Specific(X), m_APInt(Lo)))) ||\n+        !match(Min->getRHS(), m_APInt(Hi)) || !Lo->ult(*Hi))\n+      return nullptr;\n+  }\n+\n+  ConstantRange CR = ConstantRange::getNonEmpty(*Lo, *Hi + 1);\n+  ICmpInst::Predicate Pred;\n+  APInt C, Offset;\n+  if (I.getPredicate() == ICmpInst::ICMP_EQ)\n+    CR.getEquivalentICmp(Pred, C, Offset);\n+  else\n+    CR.inverse().getEquivalentICmp(Pred, C, Offset);\n+\n+  if (!Offset.isZero())\n+    X = Builder.CreateAdd(X, ConstantInt::get(X->getType(), Offset));\n+\n+  return replaceInstUsesWith(\n+      I, Builder.CreateICmp(Pred, X, ConstantInt::get(X->getType(), C)));\n+}\n+\n // Canonicalize checking for a power-of-2-or-zero value:\n static Instruction *foldICmpPow2Test(ICmpInst &I,\n                                      InstCombiner::BuilderTy &Builder) {\n@@ -7467,10 +7506,14 @@ Instruction *InstCombinerImpl::foldICmpCommutative(CmpPredicate Pred,\n     if (Instruction *NI = foldSelectICmp(Pred, SI, Op1, CxtI))\n       return NI;\n \n-  if (auto *MinMax = dyn_cast<MinMaxIntrinsic>(Op0))\n+  if (auto *MinMax = dyn_cast<MinMaxIntrinsic>(Op0)) {\n     if (Instruction *Res = foldICmpWithMinMax(CxtI, MinMax, Op1, Pred))\n       return Res;\n \n+    if (Instruction *Res = foldICmpWithClamp(CxtI, Op1, MinMax))\n+      return Res;\n+  }\n+\n   {\n     Value *X;\n     const APInt *C;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 4f94aa2d38541..e01c145bf5de3 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -725,6 +725,7 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   Instruction *foldICmpBinOp(ICmpInst &Cmp, const SimplifyQuery &SQ);\n   Instruction *foldICmpWithMinMax(Instruction &I, MinMaxIntrinsic *MinMax,\n                                   Value *Z, CmpPredicate Pred);\n+  Instruction *foldICmpWithClamp(ICmpInst &Cmp, Value *X, MinMaxIntrinsic *Min);\n   Instruction *foldICmpEquality(ICmpInst &Cmp);\n   Instruction *foldIRemByPowerOfTwoToBitTest(ICmpInst &I);\n   Instruction *foldSignBitTest(ICmpInst &I);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/icmp-clamp.ll b/llvm/test/Transforms/InstCombine/icmp-clamp.ll\nnew file mode 100644\nindex 0000000000000..4866dbffb567a\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/icmp-clamp.ll\n@@ -0,0 +1,295 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 6\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+declare void @use(i32)\n+\n+define i1 @test_i32_eq(i32 %x) {\n+; CHECK-LABEL: define i1 @test_i32_eq(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X]], 95\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP1]], 256\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_i32_ne(i32 %x) {\n+; CHECK-LABEL: define i1 @test_i32_ne(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X]], -161\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP1]], -256\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp ne i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_i32_eq_no_add(i32 %x) {\n+; CHECK-LABEL: define i1 @test_i32_eq_no_add(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[X]], 161\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_i32_ne_no_add(i32 %x) {\n+; CHECK-LABEL: define i1 @test_i32_ne_no_add(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i32 [[X]], 160\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp ne i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_unsigned_eq(i32 %x) {\n+; CHECK-LABEL: define i1 @test_unsigned_eq(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X]], -10\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP1]], 91\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n+  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_unsigned_ne(i32 %x) {\n+; CHECK-LABEL: define i1 @test_unsigned_ne(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X]], -101\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP1]], -91\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n+  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n+  %cmp = icmp ne i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+\n+; Different bit widths\n+define i1 @test_i8_eq(i8 %x) {\n+; CHECK-LABEL: define i1 @test_i8_eq(\n+; CHECK-SAME: i8 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i8 [[X]], 50\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i8 [[TMP1]], 101\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i8 @llvm.smax.i8(i8 %x, i8 -50)\n+  %v2 = tail call i8 @llvm.smin.i8(i8 %v1, i8 50)\n+  %cmp = icmp eq i8 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_i16_eq(i16 %x) {\n+; CHECK-LABEL: define i1 @test_i16_eq(\n+; CHECK-SAME: i16 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i16 [[X]], 1000\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i16 [[TMP1]], 2001\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i16 @llvm.smax.i16(i16 %x, i16 -1000)\n+  %v2 = tail call i16 @llvm.smin.i16(i16 %v1, i16 1000)\n+  %cmp = icmp eq i16 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+define i1 @test_i64_eq(i64 %x) {\n+; CHECK-LABEL: define i1 @test_i64_eq(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i64 [[X]], 1\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i64 [[TMP1]], -1\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i64 @llvm.smax.i64(i64 %x, i64 -1)\n+  %v2 = tail call i64 @llvm.smin.i64(i64 %v1, i64 9223372036854775806)\n+  %cmp = icmp eq i64 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Negative tests - wrong predicate\n+define i1 @test_wrong_pred_slt(i32 %x) {\n+; CHECK-LABEL: define i1 @test_wrong_pred_slt(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[X]], 160\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp slt i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+\n+; Negative tests - not a clamp pattern\n+define i1 @test_not_clamp_pattern(i32 %x, i32 %y) {\n+; CHECK-LABEL: define i1 @test_not_clamp_pattern(\n+; CHECK-SAME: i32 [[X:%.*]], i32 [[Y:%.*]]) {\n+; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[Y]], i32 -95)\n+; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %y, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Negative tests - Lo >= Hi\n+define i1 @test_invalid_range(i32 %x) {\n+; CHECK-LABEL: define i1 @test_invalid_range(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[X]], 50\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 100)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 50)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Negative tests - Lo is minimum signed value\n+define i1 @test_lo_min_signed(i32 %x) {\n+; CHECK-LABEL: define i1 @test_lo_min_signed(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i32 [[X]], 161\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Negative tests - Hi is maximum signed value\n+define i1 @test_hi_max_signed(i32 %x) {\n+; CHECK-LABEL: define i1 @test_hi_max_signed(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[X]], -96\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 2147483647)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Negative tests - Hi is maximum unsigned value\n+define i1 @test_hi_max_unsigned(i32 %x) {\n+; CHECK-LABEL: define i1 @test_hi_max_unsigned(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i32 [[X]], 9\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n+  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 4294967295)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Multi-use tests - multiple uses of max\n+define i1 @test_multi_use_max(i32 %x) {\n+; CHECK-LABEL: define i1 @test_multi_use_max(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n+; CHECK-NEXT:    call void @use(i32 [[V1]])\n+; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  call void @use(i32 %v1)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Multi-use tests - multiple uses of min\n+define i1 @test_multi_use_min(i32 %x) {\n+; CHECK-LABEL: define i1 @test_multi_use_min(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n+; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n+; CHECK-NEXT:    call void @use(i32 [[V2]])\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  call void @use(i32 %v2)\n+  %cmp = icmp eq i32 %v2, %x\n+  ret i1 %cmp\n+}\n+\n+; Commuted tests\n+define i1 @test_commuted_eq(i32 %x) {\n+; CHECK-LABEL: define i1 @test_commuted_eq(\n+; CHECK-SAME: i32 [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[X]], 95\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP1]], 256\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n+  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n+  %cmp = icmp eq i32 %x, %v2\n+  ret i1 %cmp\n+}\n+\n+\n+; Vector tests - splat constants\n+define <2 x i1> @test_vec_splat_eq(<2 x i32> %x) {\n+; CHECK-LABEL: define <2 x i1> @test_vec_splat_eq(\n+; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n+; CHECK-NEXT:    [[TMP1:%.*]] = add <2 x i32> [[X]], splat (i32 50)\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult <2 x i32> [[TMP1]], splat (i32 101)\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -50>)\n+  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 50>)\n+  %cmp = icmp eq <2 x i32> %v2, %x\n+  ret <2 x i1> %cmp\n+}\n+\n+; Vector tests - poison elements\n+define <2 x i1> @test_vec_poison_eq(<2 x i32> %x) {\n+; CHECK-LABEL: define <2 x i1> @test_vec_poison_eq(\n+; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n+; CHECK-NEXT:    [[V1:%.*]] = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> [[X]], <2 x i32> <i32 -50, i32 poison>)\n+; CHECK-NEXT:    [[V2:%.*]] = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[V1]], <2 x i32> <i32 50, i32 poison>)\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[V2]], [[X]]\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 poison>)\n+  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 poison>)\n+  %cmp = icmp eq <2 x i32> %v2, %x\n+  ret <2 x i1> %cmp\n+}\n+\n+; Vector tests - non-splat\n+define <2 x i1> @test_vec_non_splat_eq(<2 x i32> %x) {\n+; CHECK-LABEL: define <2 x i1> @test_vec_non_splat_eq(\n+; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n+; CHECK-NEXT:    [[V1:%.*]] = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> [[X]], <2 x i32> <i32 -50, i32 -30>)\n+; CHECK-NEXT:    [[V2:%.*]] = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[V1]], <2 x i32> <i32 50, i32 70>)\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[V2]], [[X]]\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -30>)\n+  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 70>)\n+  %cmp = icmp eq <2 x i32> %v2, %x\n+  ret <2 x i1> %cmp\n+}\n",
+  "source_files": [
+    "llvm/include/llvm/IR/IntrinsicInst.h",
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/icmp-clamp.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-clamp.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_commuted_eq",
+          "test_body": "define i1 @test_commuted_eq(i32 %x) {\n; CHECK-LABEL: define i1 @test_commuted_eq(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[X]], [[V2]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %x, %v2\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_commuted_eq(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %x, %v2\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_hi_max_signed",
+          "test_body": "define i1 @test_hi_max_signed(i32 %x) {\n; CHECK-LABEL: define i1 @test_hi_max_signed(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[X]], -96\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 2147483647)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_hi_max_signed(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 2147483647)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_hi_max_unsigned",
+          "test_body": "define i1 @test_hi_max_unsigned(i32 %x) {\n; CHECK-LABEL: define i1 @test_hi_max_unsigned(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ugt i32 [[X]], 9\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 -1)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_hi_max_unsigned(i32 %x) {\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 -1)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i16_eq",
+          "test_body": "define i1 @test_i16_eq(i16 %x) {\n; CHECK-LABEL: define i1 @test_i16_eq(\n; CHECK-SAME: i16 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i16 @llvm.smax.i16(i16 [[X]], i16 -1000)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i16 @llvm.smin.i16(i16 [[V1]], i16 1000)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i16 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i16 @llvm.smax.i16(i16 %x, i16 -1000)\n  %v2 = tail call i16 @llvm.smin.i16(i16 %v1, i16 1000)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i16_eq(i16 %x) {\n  %v1 = tail call i16 @llvm.smax.i16(i16 %x, i16 -1000)\n  %v2 = tail call i16 @llvm.smin.i16(i16 %v1, i16 1000)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i32_eq",
+          "test_body": "define i1 @test_i32_eq(i32 %x) {\n; CHECK-LABEL: define i1 @test_i32_eq(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i32_eq(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i32_eq_no_add",
+          "test_body": "define i1 @test_i32_eq_no_add(i32 %x) {\n; CHECK-LABEL: define i1 @test_i32_eq_no_add(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 0)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i32_eq_no_add(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i32_ne",
+          "test_body": "define i1 @test_i32_ne(i32 %x) {\n; CHECK-LABEL: define i1 @test_i32_ne(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i32_ne(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i32_ne_no_add",
+          "test_body": "define i1 @test_i32_ne_no_add(i32 %x) {\n; CHECK-LABEL: define i1 @test_i32_ne_no_add(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 0)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i32_ne_no_add(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 0)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i64_eq",
+          "test_body": "define i1 @test_i64_eq(i64 %x) {\n; CHECK-LABEL: define i1 @test_i64_eq(\n; CHECK-SAME: i64 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i64 @llvm.smax.i64(i64 [[X]], i64 -1)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i64 @llvm.smin.i64(i64 [[V1]], i64 9223372036854775806)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i64 @llvm.smax.i64(i64 %x, i64 -1)\n  %v2 = tail call i64 @llvm.smin.i64(i64 %v1, i64 9223372036854775806)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i64_eq(i64 %x) {\n  %v1 = tail call i64 @llvm.smax.i64(i64 %x, i64 -1)\n  %v2 = tail call i64 @llvm.smin.i64(i64 %v1, i64 9223372036854775806)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_i8_eq",
+          "test_body": "define i1 @test_i8_eq(i8 %x) {\n; CHECK-LABEL: define i1 @test_i8_eq(\n; CHECK-SAME: i8 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i8 @llvm.smax.i8(i8 [[X]], i8 -50)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i8 @llvm.smin.i8(i8 [[V1]], i8 50)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = tail call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_i8_eq(i8 %x) {\n  %v1 = tail call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = tail call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_invalid_range",
+          "test_body": "define i1 @test_invalid_range(i32 %x) {\n; CHECK-LABEL: define i1 @test_invalid_range(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[X]], 50\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 50)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_invalid_range(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 50)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_lo_min_signed",
+          "test_body": "define i1 @test_lo_min_signed(i32 %x) {\n; CHECK-LABEL: define i1 @test_lo_min_signed(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i32 [[X]], 161\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_lo_min_signed(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_multi_use_max",
+          "test_body": "declare void @use(i32)\n\ndefine i1 @test_multi_use_max(i32 %x) {\n; CHECK-LABEL: define i1 @test_multi_use_max(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n; CHECK-NEXT:    call void @use(i32 [[V1]])\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  call void @use(i32 %v1)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "declare void @use(i32)\n\ndefine i1 @test_multi_use_max(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  call void @use(i32 %v1)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_multi_use_min",
+          "test_body": "declare void @use(i32)\n\ndefine i1 @test_multi_use_min(i32 %x) {\n; CHECK-LABEL: define i1 @test_multi_use_min(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[X]], i32 -95)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    call void @use(i32 [[V2]])\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  call void @use(i32 %v2)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "declare void @use(i32)\n\ndefine i1 @test_multi_use_min(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  call void @use(i32 %v2)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_not_clamp_pattern",
+          "test_body": "define i1 @test_not_clamp_pattern(i32 %x, i32 %y) {\n; CHECK-LABEL: define i1 @test_not_clamp_pattern(\n; CHECK-SAME: i32 [[X:%.*]], i32 [[Y:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.smax.i32(i32 [[Y]], i32 -95)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.smin.i32(i32 [[V1]], i32 160)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %y, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_not_clamp_pattern(i32 %x, i32 %y) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %y, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_unsigned_eq",
+          "test_body": "define i1 @test_unsigned_eq(i32 %x) {\n; CHECK-LABEL: define i1 @test_unsigned_eq(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.umax.i32(i32 [[X]], i32 10)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.umin.i32(i32 [[V1]], i32 100)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_unsigned_eq(i32 %x) {\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_unsigned_ne",
+          "test_body": "define i1 @test_unsigned_ne(i32 %x) {\n; CHECK-LABEL: define i1 @test_unsigned_ne(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call i32 @llvm.umax.i32(i32 [[X]], i32 10)\n; CHECK-NEXT:    [[V2:%.*]] = tail call i32 @llvm.umin.i32(i32 [[V1]], i32 100)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i32 [[V2]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_unsigned_ne(i32 %x) {\n  %v1 = tail call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 100)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_vec_non_splat_eq",
+          "test_body": "define <2 x i1> @test_vec_non_splat_eq(<2 x i32> %x) {\n; CHECK-LABEL: define <2 x i1> @test_vec_non_splat_eq(\n; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> [[X]], <2 x i32> <i32 -50, i32 -30>)\n; CHECK-NEXT:    [[V2:%.*]] = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[V1]], <2 x i32> <i32 50, i32 70>)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[V2]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -30>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 70>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @test_vec_non_splat_eq(<2 x i32> %x) {\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -30>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 70>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "test_vec_poison_eq",
+          "test_body": "define <2 x i1> @test_vec_poison_eq(<2 x i32> %x) {\n; CHECK-LABEL: define <2 x i1> @test_vec_poison_eq(\n; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> [[X]], <2 x i32> <i32 -50, i32 poison>)\n; CHECK-NEXT:    [[V2:%.*]] = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[V1]], <2 x i32> <i32 50, i32 poison>)\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[V2]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 poison>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 poison>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @test_vec_poison_eq(<2 x i32> %x) {\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 poison>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 poison>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "test_vec_splat_eq",
+          "test_body": "define <2 x i1> @test_vec_splat_eq(<2 x i32> %x) {\n; CHECK-LABEL: define <2 x i1> @test_vec_splat_eq(\n; CHECK-SAME: <2 x i32> [[X:%.*]]) {\n; CHECK-NEXT:    [[V1:%.*]] = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> [[X]], <2 x i32> splat (i32 -50))\n; CHECK-NEXT:    [[V2:%.*]] = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[V1]], <2 x i32> splat (i32 50))\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i32> [[V2]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -50>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 50>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @test_vec_splat_eq(<2 x i32> %x) {\n  %v1 = tail call <2 x i32> @llvm.smax.v2i32(<2 x i32> %x, <2 x i32> <i32 -50, i32 -50>)\n  %v2 = tail call <2 x i32> @llvm.smin.v2i32(<2 x i32> %v1, <2 x i32> <i32 50, i32 50>)\n  %cmp = icmp eq <2 x i32> %v2, %x\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "test_wrong_pred_slt",
+          "test_body": "define i1 @test_wrong_pred_slt(i32 %x) {\n; CHECK-LABEL: define i1 @test_wrong_pred_slt(\n; CHECK-SAME: i32 [[X:%.*]]) {\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[X]], 160\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp slt i32 %v2, %x\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_wrong_pred_slt(i32 %x) {\n  %v1 = tail call i32 @llvm.smax.i32(i32 %x, i32 -95)\n  %v2 = tail call i32 @llvm.smin.i32(i32 %v1, i32 160)\n  %cmp = icmp slt i32 %v2, %x\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

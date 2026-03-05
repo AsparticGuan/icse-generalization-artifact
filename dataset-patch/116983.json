@@ -1,0 +1,54 @@
+{
+  "pr_number": 116983,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/116983",
+  "title": "[InstCombine] Convert logical and/or with `icmp samesign` into bitwise ops",
+  "commit_sha": "3dec6fee0b966db002b3800e29af0cd3bd67f477",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          3115,
+          3120
+        ],
+        [
+          3136,
+          3148
+        ],
+        [
+          3178,
+          3190
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::foldSelectOfBools",
+        "foldNestedSelects"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 010b77548c152..6f0ec66420a51 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3115,6 +3115,39 @@ static Instruction *foldNestedSelects(SelectInst &OuterSelVal,\n                             !IsAndVariant ? SelInner : InnerSel.FalseVal);\n }\n \n+/// Return true if V is poison or \\p Expected given that ValAssumedPoison is\n+/// already poison. For example, if ValAssumedPoison is `icmp samesign X, 10`\n+/// and V is `icmp ne X, 5`, impliesPoisonOrCond returns true.\n+static bool impliesPoisonOrCond(const Value *ValAssumedPoison, const Value *V,\n+                                bool Expected) {\n+  if (impliesPoison(ValAssumedPoison, V))\n+    return true;\n+\n+  // Handle the case that ValAssumedPoison is `icmp samesign pred X, C1` and V\n+  // is `icmp pred X, C2`, where C1 is well-defined.\n+  if (auto *ICmp = dyn_cast<ICmpInst>(ValAssumedPoison)) {\n+    Value *LHS = ICmp->getOperand(0);\n+    const APInt *RHSC1;\n+    const APInt *RHSC2;\n+    ICmpInst::Predicate Pred;\n+    if (ICmp->hasSameSign() &&\n+        match(ICmp->getOperand(1), m_APIntForbidPoison(RHSC1)) &&\n+        match(V, m_ICmp(Pred, m_Specific(LHS), m_APIntAllowPoison(RHSC2)))) {\n+      unsigned BitWidth = RHSC1->getBitWidth();\n+      ConstantRange CRX =\n+          RHSC1->isNonNegative()\n+              ? ConstantRange(APInt::getSignedMinValue(BitWidth),\n+                              APInt::getZero(BitWidth))\n+              : ConstantRange(APInt::getZero(BitWidth),\n+                              APInt::getSignedMinValue(BitWidth));\n+      return CRX.icmp(Expected ? Pred : ICmpInst::getInversePredicate(Pred),\n+                      *RHSC2);\n+    }\n+  }\n+\n+  return false;\n+}\n+\n Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   Value *CondVal = SI.getCondition();\n   Value *TrueVal = SI.getTrueValue();\n@@ -3136,13 +3169,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   // checks whether folding it does not convert a well-defined value into\n   // poison.\n   if (match(TrueVal, m_One())) {\n-    if (impliesPoison(FalseVal, CondVal)) {\n+    if (impliesPoisonOrCond(FalseVal, CondVal, /*Expected=*/false)) {\n       // Change: A = select B, true, C --> A = or B, C\n       return BinaryOperator::CreateOr(CondVal, FalseVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_One(), m_Value(B)))) &&\n-        impliesPoison(FalseVal, B)) {\n+        impliesPoisonOrCond(FalseVal, B, /*Expected=*/false)) {\n       // (A || B) || C --> A || (B | C)\n       return replaceInstUsesWith(\n           SI, Builder.CreateLogicalOr(A, Builder.CreateOr(B, FalseVal)));\n@@ -3178,13 +3211,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   }\n \n   if (match(FalseVal, m_Zero())) {\n-    if (impliesPoison(TrueVal, CondVal)) {\n+    if (impliesPoisonOrCond(TrueVal, CondVal, /*Expected=*/true)) {\n       // Change: A = select B, C, false --> A = and B, C\n       return BinaryOperator::CreateAnd(CondVal, TrueVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_Value(B), m_Zero()))) &&\n-        impliesPoison(TrueVal, B)) {\n+        impliesPoisonOrCond(TrueVal, B, /*Expected=*/true)) {\n       // (A && B) && C --> A && (B & C)\n       return replaceInstUsesWith(\n           SI, Builder.CreateLogicalAnd(A, Builder.CreateAnd(B, TrueVal)));\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/logical-select.ll b/llvm/test/Transforms/InstCombine/logical-select.ll\nindex 1b6e816d2e624..050a53406a9c5 100644\n--- a/llvm/test/Transforms/InstCombine/logical-select.ll\n+++ b/llvm/test/Transforms/InstCombine/logical-select.ll\n@@ -1521,3 +1521,121 @@ bb:\n   %and2 = or i1 %and1, %cmp\n   ret i1 %and2\n }\n+\n+define i1 @test_logical_and_icmp_samesign(i8 %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_samesign(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp ne i8 [[X:%.*]], 9\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult i8 [[X]], 11\n+; CHECK-NEXT:    [[AND:%.*]] = and i1 [[CMP1]], [[CMP2]]\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %cmp1 = icmp ne i8 %x, 9\n+  %cmp2 = icmp samesign ult i8 %x, 11\n+  %and = select i1 %cmp1, i1 %cmp2, i1 false\n+  ret i1 %and\n+}\n+\n+define i1 @test_logical_or_icmp_samesign(i8 %x) {\n+; CHECK-LABEL: @test_logical_or_icmp_samesign(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i8 [[X:%.*]], -9\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult i8 [[X]], -11\n+; CHECK-NEXT:    [[OR:%.*]] = or i1 [[CMP1]], [[CMP2]]\n+; CHECK-NEXT:    ret i1 [[OR]]\n+;\n+  %cmp1 = icmp eq i8 %x, -9\n+  %cmp2 = icmp samesign ult i8 %x, -11\n+  %or = select i1 %cmp1, i1 true, i1 %cmp2\n+  ret i1 %or\n+}\n+\n+define i1 @test_double_logical_and_icmp_samesign1(i1 %cond, i32 %y) {\n+; CHECK-LABEL: @test_double_logical_and_icmp_samesign1(\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult i32 [[Y:%.*]], 4\n+; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[SEL1:%.*]], i1 [[CMP2]], i1 false\n+; CHECK-NEXT:    ret i1 [[SEL2]]\n+;\n+  %cmp1 = icmp ne i32 %y, 5\n+  %sel1 = select i1 %cond, i1 %cmp1, i1 false\n+  %cmp2 = icmp samesign ult i32 %y, 4\n+  %sel2 = select i1 %sel1, i1 %cmp2, i1 false\n+  ret i1 %sel2\n+}\n+\n+define i1 @test_double_logical_and_icmp_samesign2(i1 %cond, i32 %y) {\n+; CHECK-LABEL: @test_double_logical_and_icmp_samesign2(\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i32 [[Y:%.*]], -65536\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp ult i32 [[TMP1]], 1048576\n+; CHECK-NEXT:    [[SEL2:%.*]] = select i1 [[SEL1:%.*]], i1 [[CMP2]], i1 false\n+; CHECK-NEXT:    ret i1 [[SEL2]]\n+;\n+  %cmp1 = icmp samesign ugt i32 %y, 65535\n+  %sel1 = select i1 %cond, i1 %cmp1, i1 false\n+  %cmp2 = icmp samesign ult i32 %y, 1114112\n+  %sel2 = select i1 %sel1, i1 %cmp2, i1 false\n+  ret i1 %sel2\n+}\n+\n+define <2 x i1> @test_logical_and_icmp_samesign_vec(<2 x i8> %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_samesign_vec(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp ne <2 x i8> [[X:%.*]], splat (i8 9)\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult <2 x i8> [[X]], splat (i8 11)\n+; CHECK-NEXT:    [[AND:%.*]] = and <2 x i1> [[CMP1]], [[CMP2]]\n+; CHECK-NEXT:    ret <2 x i1> [[AND]]\n+;\n+  %cmp1 = icmp ne <2 x i8> %x, splat(i8 9)\n+  %cmp2 = icmp samesign ult <2 x i8> %x, splat(i8 11)\n+  %and = select <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i1> zeroinitializer\n+  ret <2 x i1> %and\n+}\n+\n+define <2 x i1> @test_logical_and_icmp_samesign_vec_with_poison_cond(<2 x i8> %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_samesign_vec_with_poison_cond(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp ne <2 x i8> [[X:%.*]], <i8 9, i8 poison>\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult <2 x i8> [[X]], splat (i8 11)\n+; CHECK-NEXT:    [[AND:%.*]] = and <2 x i1> [[CMP1]], [[CMP2]]\n+; CHECK-NEXT:    ret <2 x i1> [[AND]]\n+;\n+  %cmp1 = icmp ne <2 x i8> %x, <i8 9, i8 poison>\n+  %cmp2 = icmp samesign ult <2 x i8> %x, splat(i8 11)\n+  %and = select <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i1> zeroinitializer\n+  ret <2 x i1> %and\n+}\n+\n+define i1 @test_logical_and_icmp_samesign_do_not_imply(i8 %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_samesign_do_not_imply(\n+; CHECK-NEXT:    [[AND:%.*]] = icmp ult i8 [[X:%.*]], 11\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %cmp1 = icmp ne i8 %x, -9\n+  %cmp2 = icmp samesign ult i8 %x, 11\n+  %and = select i1 %cmp1, i1 %cmp2, i1 false\n+  ret i1 %and\n+}\n+\n+define i1 @test_logical_and_icmp_no_samesign(i8 %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_no_samesign(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp ne i8 [[X:%.*]], 9\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp ult i8 [[X]], 11\n+; CHECK-NEXT:    [[AND:%.*]] = and i1 [[CMP1]], [[CMP2]]\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %cmp1 = icmp ne i8 %x, 9\n+  %cmp2 = icmp ult i8 %x, 11\n+  %and = select i1 %cmp1, i1 %cmp2, i1 false\n+  ret i1 %and\n+}\n+\n+; Negative tests\n+\n+define <2 x i1> @test_logical_and_icmp_samesign_vec_with_poison_tv(<2 x i8> %x) {\n+; CHECK-LABEL: @test_logical_and_icmp_samesign_vec_with_poison_tv(\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp ne <2 x i8> [[X:%.*]], splat (i8 9)\n+; CHECK-NEXT:    [[CMP2:%.*]] = icmp samesign ult <2 x i8> [[X]], <i8 11, i8 poison>\n+; CHECK-NEXT:    [[AND:%.*]] = select <2 x i1> [[CMP1]], <2 x i1> [[CMP2]], <2 x i1> zeroinitializer\n+; CHECK-NEXT:    ret <2 x i1> [[AND]]\n+;\n+  %cmp1 = icmp ne <2 x i8> %x, splat(i8 9)\n+  %cmp2 = icmp samesign ult <2 x i8> %x, <i8 11, i8 poison>\n+  %and = select <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i1> zeroinitializer\n+  ret <2 x i1> %and\n+}\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/logical-select.ll"
+  ],
+  "tests": [],
+  "has_test_changes": false,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "pr_number": 121899,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/121899",
+  "title": "[InstCombine] Simplify FMF propagation. NFC.",
+  "commit_sha": "937528e56aed53be4286172b26ed219e20f64bac",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        [
+          1672,
+          1683
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          2500,
+          2512
+        ],
+        [
+          2601,
+          2613
+        ],
+        [
+          2634,
+          2644
+        ],
+        [
+          2732,
+          2739
+        ],
+        [
+          2840,
+          2855
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        "reassociateFCmps"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitCallInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex f82a557e5760c..fb09a7b75f058 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -1672,12 +1672,9 @@ static Instruction *reassociateFCmps(BinaryOperator &BO,\n \n   // and (fcmp ord X, 0), (and (fcmp ord Y, 0), Z) --> and (fcmp ord X, Y), Z\n   // or  (fcmp uno X, 0), (or  (fcmp uno Y, 0), Z) --> or  (fcmp uno X, Y), Z\n-  Value *NewFCmp = Builder.CreateFCmp(NanPred, X, Y);\n-  if (auto *NewFCmpInst = dyn_cast<FCmpInst>(NewFCmp)) {\n-    // Intersect FMF from the 2 source fcmps.\n-    NewFCmpInst->copyIRFlags(Op0);\n-    NewFCmpInst->andIRFlags(BO10);\n-  }\n+  // Intersect FMF from the 2 source fcmps.\n+  Value *NewFCmp =\n+      Builder.CreateFCmpFMF(NanPred, X, Y, FMFSource::intersect(Op0, BO10));\n   return BinaryOperator::Create(Opcode, NewFCmp, BO11);\n }\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex c55c40c88bc84..98ea3720e2200 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -2500,13 +2500,12 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         default:\n           llvm_unreachable(\"unexpected intrinsic ID\");\n         }\n-        Value *V = Builder.CreateBinaryIntrinsic(\n-            IID, X, ConstantFP::get(Arg0->getType(), Res), II);\n         // TODO: Conservatively intersecting FMF. If Res == C2, the transform\n         //       was a simplification (so Arg0 and its original flags could\n         //       propagate?)\n-        if (auto *CI = dyn_cast<CallInst>(V))\n-          CI->andIRFlags(M);\n+        Value *V = Builder.CreateBinaryIntrinsic(\n+            IID, X, ConstantFP::get(Arg0->getType(), Res),\n+            FMFSource::intersect(II, M));\n         return replaceInstUsesWith(*II, V);\n       }\n     }\n@@ -2601,13 +2600,11 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n   }\n   case Intrinsic::fmuladd: {\n     // Try to simplify the underlying FMul.\n-    if (Value *V = simplifyFMulInst(II->getArgOperand(0), II->getArgOperand(1),\n-                                    II->getFastMathFlags(),\n-                                    SQ.getWithInstruction(II))) {\n-      auto *FAdd = BinaryOperator::CreateFAdd(V, II->getArgOperand(2));\n-      FAdd->copyFastMathFlags(II);\n-      return FAdd;\n-    }\n+    if (Value *V =\n+            simplifyFMulInst(II->getArgOperand(0), II->getArgOperand(1),\n+                             II->getFastMathFlags(), SQ.getWithInstruction(II)))\n+      return BinaryOperator::CreateFAddFMF(V, II->getArgOperand(2),\n+                                           II->getFastMathFlags());\n \n     [[fallthrough]];\n   }\n@@ -2634,11 +2631,8 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n     // Try to simplify the underlying FMul. We can only apply simplifications\n     // that do not require rounding.\n     if (Value *V = simplifyFMAFMul(Src0, Src1, II->getFastMathFlags(),\n-                                   SQ.getWithInstruction(II))) {\n-      auto *FAdd = BinaryOperator::CreateFAdd(V, Src2);\n-      FAdd->copyFastMathFlags(II);\n-      return FAdd;\n-    }\n+                                   SQ.getWithInstruction(II)))\n+      return BinaryOperator::CreateFAddFMF(V, Src2, II->getFastMathFlags());\n \n     // fma x, y, 0 -> fmul x, y\n     // This is always valid for -0.0, but requires nsz for +0.0 as\n@@ -2732,8 +2726,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n               m_CopySign(m_Value(Magnitude), m_Value(Sign)))) {\n       // fabs (copysign x, y) -> (fabs x)\n       CallInst *AbsSign =\n-          Builder.CreateCall(II->getCalledFunction(), {Magnitude});\n-      AbsSign->copyFastMathFlags(II);\n+          Builder.CreateUnaryIntrinsic(Intrinsic::fabs, Magnitude, II);\n       return replaceInstUsesWith(*II, AbsSign);\n     }\n \n@@ -2840,16 +2833,15 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       Value *NewLdexp = nullptr;\n       Value *Select = nullptr;\n       if (match(SelectRHS, m_ZeroInt())) {\n-        NewLdexp = Builder.CreateLdexp(Src, SelectLHS);\n+        NewLdexp = Builder.CreateLdexp(Src, SelectLHS, II);\n         Select = Builder.CreateSelect(SelectCond, NewLdexp, Src);\n       } else if (match(SelectLHS, m_ZeroInt())) {\n-        NewLdexp = Builder.CreateLdexp(Src, SelectRHS);\n+        NewLdexp = Builder.CreateLdexp(Src, SelectRHS, II);\n         Select = Builder.CreateSelect(SelectCond, Src, NewLdexp);\n       }\n \n       if (NewLdexp) {\n         Select->takeName(II);\n-        cast<Instruction>(NewLdexp)->copyFastMathFlags(II);\n         return replaceInstUsesWith(*II, Select);\n       }\n     }\n",
+  "test_patch": "",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp"
+  ],
+  "test_files": [],
+  "tests": [],
+  "has_test_changes": false,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

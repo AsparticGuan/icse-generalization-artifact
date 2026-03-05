@@ -1,0 +1,305 @@
+{
+  "pr_number": 67758,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/67758",
+  "title": "[InstCombine][ValueTracking] Improve logic for shift flags.",
+  "commit_sha": "89be352fb842f6f514d0087d80596a4724908ae6",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Analysis/ValueTracking",
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/InstSimplify"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          2048,
+          2067
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+        [
+          941,
+          946
+        ],
+        [
+          1121,
+          1142
+        ],
+        [
+          1427,
+          1441
+        ],
+        [
+          1594,
+          1608
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "isKnownToBeAPowerOfTwo"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+        "InstCombinerImpl::foldLShrOverflowBit",
+        "InstCombinerImpl::visitAShr",
+        "InstCombinerImpl::visitLShr",
+        "InstCombinerImpl::visitShl"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 11b39751b542f..55d48d7722a0c 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -2048,20 +2048,19 @@ bool isKnownToBeAPowerOfTwo(const Value *V, bool OrZero, unsigned Depth,\n       return isKnownToBeAPowerOfTwo(I->getOperand(0), OrZero, Depth, Q);\n     return false;\n   case Instruction::Mul:\n-    return OrZero &&\n-           isKnownToBeAPowerOfTwo(I->getOperand(1), OrZero, Depth, Q) &&\n-           isKnownToBeAPowerOfTwo(I->getOperand(0), OrZero, Depth, Q);\n+    return isKnownToBeAPowerOfTwo(I->getOperand(1), OrZero, Depth, Q) &&\n+           isKnownToBeAPowerOfTwo(I->getOperand(0), OrZero, Depth, Q) &&\n+           (OrZero || isKnownNonZero(I, Depth, Q));\n   case Instruction::And:\n-    if (OrZero) {\n-      // A power of two and'd with anything is a power of two or zero.\n-      if (isKnownToBeAPowerOfTwo(I->getOperand(1), /*OrZero*/ true, Depth, Q) ||\n-          isKnownToBeAPowerOfTwo(I->getOperand(0), /*OrZero*/ true, Depth, Q))\n-        return true;\n-      // X & (-X) is always a power of two or zero.\n-      if (match(I->getOperand(0), m_Neg(m_Specific(I->getOperand(1)))) ||\n-          match(I->getOperand(1), m_Neg(m_Specific(I->getOperand(0)))))\n-        return true;\n-    }\n+    // A power of two and'd with anything is a power of two or zero.\n+    if (OrZero &&\n+        (isKnownToBeAPowerOfTwo(I->getOperand(1), /*OrZero*/ true, Depth, Q) ||\n+         isKnownToBeAPowerOfTwo(I->getOperand(0), /*OrZero*/ true, Depth, Q)))\n+      return true;\n+    // X & (-X) is always a power of two or zero.\n+    if (match(I->getOperand(0), m_Neg(m_Specific(I->getOperand(1)))) ||\n+        match(I->getOperand(1), m_Neg(m_Specific(I->getOperand(0)))))\n+      return OrZero || isKnownNonZero(I->getOperand(0), Depth, Q);\n     return false;\n   case Instruction::Add: {\n     // Adding a power-of-two or zero to the same power-of-two or zero yields\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\nindex 83defd5816f59..94fa9f14ffb95 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n@@ -941,6 +941,60 @@ Instruction *InstCombinerImpl::foldLShrOverflowBit(BinaryOperator &I) {\n   return new ZExtInst(Overflow, Ty);\n }\n \n+// Try to set nuw/nsw flags on shl or exact flag on lshr/ashr using knownbits.\n+static bool setShiftFlags(BinaryOperator &I, const SimplifyQuery &Q) {\n+  assert(I.isShift() && \"Expected a shift as input\");\n+  // We already have all the flags.\n+  if (I.getOpcode() == Instruction::Shl) {\n+    if (I.hasNoUnsignedWrap() && I.hasNoSignedWrap())\n+      return false;\n+  } else {\n+    if (I.isExact())\n+      return false;\n+  }\n+\n+  // Compute what we know about shift count.\n+  KnownBits KnownCnt =\n+      computeKnownBits(I.getOperand(1), Q.DL, /*Depth*/ 0, Q.AC, Q.CxtI, Q.DT);\n+  // If we know nothing about shift count or its a poison shift, we won't be\n+  // able to prove anything so return before computing shift amount.\n+  if (KnownCnt.isUnknown())\n+    return false;\n+  unsigned BitWidth = KnownCnt.getBitWidth();\n+  APInt MaxCnt = KnownCnt.getMaxValue();\n+  if (MaxCnt.uge(BitWidth))\n+    return false;\n+\n+  KnownBits KnownAmt =\n+      computeKnownBits(I.getOperand(0), Q.DL, /*Depth*/ 0, Q.AC, Q.CxtI, Q.DT);\n+  bool Changed = false;\n+\n+  if (I.getOpcode() == Instruction::Shl) {\n+    // If we have as many leading zeros than maximum shift cnt we have nuw.\n+    if (!I.hasNoUnsignedWrap() && MaxCnt.ule(KnownAmt.countMinLeadingZeros())) {\n+      I.setHasNoUnsignedWrap();\n+      Changed = true;\n+    }\n+    // If we have more sign bits than maximum shift cnt we have nsw.\n+    if (!I.hasNoSignedWrap()) {\n+      if (MaxCnt.ult(KnownAmt.countMinSignBits()) ||\n+          MaxCnt.ult(ComputeNumSignBits(I.getOperand(0), Q.DL, /*Depth*/ 0,\n+                                        Q.AC, Q.CxtI, Q.DT))) {\n+        I.setHasNoSignedWrap();\n+        Changed = true;\n+      }\n+    }\n+    return Changed;\n+  }\n+  if (!I.isExact()) {\n+    // If we have at least as many trailing zeros as maximum count then we have\n+    // exact.\n+    Changed = MaxCnt.ule(KnownAmt.countMinTrailingZeros());\n+    I.setIsExact(Changed);\n+  }\n+  return Changed;\n+}\n+\n Instruction *InstCombinerImpl::visitShl(BinaryOperator &I) {\n   const SimplifyQuery Q = SQ.getWithInstruction(&I);\n \n@@ -1121,22 +1175,11 @@ Instruction *InstCombinerImpl::visitShl(BinaryOperator &I) {\n       Value *NewShift = Builder.CreateShl(X, Op1);\n       return BinaryOperator::CreateSub(NewLHS, NewShift);\n     }\n-\n-    // If the shifted-out value is known-zero, then this is a NUW shift.\n-    if (!I.hasNoUnsignedWrap() &&\n-        MaskedValueIsZero(Op0, APInt::getHighBitsSet(BitWidth, ShAmtC), 0,\n-                          &I)) {\n-      I.setHasNoUnsignedWrap();\n-      return &I;\n-    }\n-\n-    // If the shifted-out value is all signbits, then this is a NSW shift.\n-    if (!I.hasNoSignedWrap() && ComputeNumSignBits(Op0, 0, &I) > ShAmtC) {\n-      I.setHasNoSignedWrap();\n-      return &I;\n-    }\n   }\n \n+  if (setShiftFlags(I, Q))\n+    return &I;\n+\n   // Transform  (x >> y) << y  to  x & (-1 << y)\n   // Valid for any type of right-shift.\n   Value *X;\n@@ -1427,15 +1470,12 @@ Instruction *InstCombinerImpl::visitLShr(BinaryOperator &I) {\n       Value *And = Builder.CreateAnd(BoolX, BoolY);\n       return new ZExtInst(And, Ty);\n     }\n-\n-    // If the shifted-out value is known-zero, then this is an exact shift.\n-    if (!I.isExact() &&\n-        MaskedValueIsZero(Op0, APInt::getLowBitsSet(BitWidth, ShAmtC), 0, &I)) {\n-      I.setIsExact();\n-      return &I;\n-    }\n   }\n \n+  const SimplifyQuery Q = SQ.getWithInstruction(&I);\n+  if (setShiftFlags(I, Q))\n+    return &I;\n+\n   // Transform  (x << y) >> y  to  x & (-1 >> y)\n   if (match(Op0, m_OneUse(m_Shl(m_Value(X), m_Specific(Op1))))) {\n     Constant *AllOnes = ConstantInt::getAllOnesValue(Ty);\n@@ -1594,15 +1634,12 @@ Instruction *InstCombinerImpl::visitAShr(BinaryOperator &I) {\n       if (match(Op0, m_OneUse(m_NSWSub(m_Value(X), m_Value(Y)))))\n         return new SExtInst(Builder.CreateICmpSLT(X, Y), Ty);\n     }\n-\n-    // If the shifted-out value is known-zero, then this is an exact shift.\n-    if (!I.isExact() &&\n-        MaskedValueIsZero(Op0, APInt::getLowBitsSet(BitWidth, ShAmt), 0, &I)) {\n-      I.setIsExact();\n-      return &I;\n-    }\n   }\n \n+  const SimplifyQuery Q = SQ.getWithInstruction(&I);\n+  if (setShiftFlags(I, Q))\n+    return &I;\n+\n   // Prefer `-(x & 1)` over `(x << (bitwidth(x)-1)) a>> (bitwidth(x)-1)`\n   // as the pattern to splat the lowest bit.\n   // FIXME: iff X is already masked, we don't need the one-use check.\n",
+  "test_patch": "diff --git a/llvm/test/Analysis/ValueTracking/known-power-of-two.ll b/llvm/test/Analysis/ValueTracking/known-power-of-two.ll\nindex b86cf59fa2046..7bcf96065a69d 100644\n--- a/llvm/test/Analysis/ValueTracking/known-power-of-two.ll\n+++ b/llvm/test/Analysis/ValueTracking/known-power-of-two.ll\n@@ -413,11 +413,11 @@ define i1 @mul_is_pow2(i16 %x, i16 %y, i16 %z) {\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 3\n ; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 3\n-; CHECK-NEXT:    [[XP2:%.*]] = shl i16 4, [[XSMALL]]\n-; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n-; CHECK-NEXT:    [[XX:%.*]] = mul nuw nsw i16 [[XP2]], [[ZP2]]\n+; CHECK-NEXT:    [[ZP2:%.*]] = shl nuw nsw i16 2, [[ZSMALL]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i16 [[XSMALL]], 2\n+; CHECK-NEXT:    [[XX:%.*]] = shl nuw nsw i16 [[ZP2]], [[TMP1]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i16 [[AND]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %xsmall = and i16 %x, 3\n@@ -436,9 +436,9 @@ define i1 @mul_is_pow2_fail(i16 %x, i16 %y, i16 %z) {\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n ; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 7\n-; CHECK-NEXT:    [[XP2:%.*]] = shl i16 4, [[XSMALL]]\n-; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n-; CHECK-NEXT:    [[XX:%.*]] = mul i16 [[XP2]], [[ZP2]]\n+; CHECK-NEXT:    [[ZP2:%.*]] = shl nuw nsw i16 2, [[ZSMALL]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i16 [[XSMALL]], 2\n+; CHECK-NEXT:    [[XX:%.*]] = shl i16 [[ZP2]], [[TMP1]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n ; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n ; CHECK-NEXT:    ret i1 [[R]]\n@@ -459,9 +459,9 @@ define i1 @mul_is_pow2_fail2(i16 %x, i16 %y, i16 %z) {\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 3\n ; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 3\n-; CHECK-NEXT:    [[XP2:%.*]] = shl i16 3, [[XSMALL]]\n-; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n-; CHECK-NEXT:    [[XX:%.*]] = mul nuw nsw i16 [[XP2]], [[ZP2]]\n+; CHECK-NEXT:    [[XP2:%.*]] = shl nuw nsw i16 3, [[XSMALL]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i16 [[ZSMALL]], 1\n+; CHECK-NEXT:    [[XX:%.*]] = shl nuw nsw i16 [[XP2]], [[TMP1]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n ; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n ; CHECK-NEXT:    ret i1 [[R]]\n@@ -481,9 +481,9 @@ define i1 @shl_is_pow2(i16 %x, i16 %y) {\n ; CHECK-LABEL: define i1 @shl_is_pow2\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n-; CHECK-NEXT:    [[XX:%.*]] = shl i16 4, [[XSMALL]]\n+; CHECK-NEXT:    [[XX:%.*]] = shl nuw nsw i16 4, [[XSMALL]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i16 [[AND]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %xsmall = and i16 %x, 7\n@@ -515,7 +515,7 @@ define i1 @shl_is_pow2_fail2(i16 %x, i16 %y) {\n ; CHECK-LABEL: define i1 @shl_is_pow2_fail2\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n-; CHECK-NEXT:    [[XX:%.*]] = shl i16 5, [[XSMALL]]\n+; CHECK-NEXT:    [[XX:%.*]] = shl nuw nsw i16 5, [[XSMALL]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n ; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n ; CHECK-NEXT:    ret i1 [[R]]\n@@ -532,9 +532,9 @@ define i1 @lshr_is_pow2(i16 %x, i16 %y) {\n ; CHECK-LABEL: define i1 @lshr_is_pow2\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n ; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n-; CHECK-NEXT:    [[XX:%.*]] = lshr i16 512, [[XSMALL]]\n+; CHECK-NEXT:    [[XX:%.*]] = lshr exact i16 512, [[XSMALL]]\n ; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i16 [[AND]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %xsmall = and i16 %x, 7\n@@ -584,9 +584,9 @@ define i1 @and_is_pow2(i16 %x, i16 %y) {\n ; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n ; CHECK-NEXT:    [[XNZ:%.*]] = or i16 [[X]], 4\n ; CHECK-NEXT:    [[X_NEG:%.*]] = sub nsw i16 0, [[XNZ]]\n-; CHECK-NEXT:    [[XX:%.*]] = and i16 [[XNZ]], [[X_NEG]]\n-; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i16 [[X_NEG]], [[Y]]\n+; CHECK-NEXT:    [[AND:%.*]] = and i16 [[TMP1]], [[XNZ]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i16 [[AND]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %xnz = or i16 %x, 4\ndiff --git a/llvm/test/Transforms/InstCombine/and-add-shl.ll b/llvm/test/Transforms/InstCombine/and-add-shl.ll\nindex 28778f34137e0..92b3a8144d62c 100644\n--- a/llvm/test/Transforms/InstCombine/and-add-shl.ll\n+++ b/llvm/test/Transforms/InstCombine/and-add-shl.ll\n@@ -29,7 +29,7 @@ define i8 @and_not_shl(i8 %x) {\n ; CHECK-SAME: (i8 [[X:%.*]]) {\n ; CHECK-NEXT:    [[OP1_P2:%.*]] = icmp ult i8 [[X]], 6\n ; CHECK-NEXT:    call void @llvm.assume(i1 [[OP1_P2]])\n-; CHECK-NEXT:    [[SHIFT:%.*]] = shl i8 -1, [[X]]\n+; CHECK-NEXT:    [[SHIFT:%.*]] = shl nsw i8 -1, [[X]]\n ; CHECK-NEXT:    [[NOT:%.*]] = and i8 [[SHIFT]], 32\n ; CHECK-NEXT:    [[R:%.*]] = xor i8 [[NOT]], 32\n ; CHECK-NEXT:    ret i8 [[R]]\ndiff --git a/llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll b/llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll\nindex 96dc6c68f4d4f..b06a90e2cd99b 100644\n--- a/llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll\n+++ b/llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll\n@@ -5,10 +5,10 @@\n define i32 @src(i1 %x2) {\n ; CHECK-LABEL: @src(\n ; CHECK-NEXT:    [[X13:%.*]] = zext i1 [[X2:%.*]] to i32\n-; CHECK-NEXT:    [[_7:%.*]] = shl i32 -1, [[X13]]\n+; CHECK-NEXT:    [[_7:%.*]] = shl nsw i32 -1, [[X13]]\n ; CHECK-NEXT:    [[MASK:%.*]] = xor i32 [[_7]], -1\n ; CHECK-NEXT:    [[_8:%.*]] = and i32 [[MASK]], [[X13]]\n-; CHECK-NEXT:    [[_9:%.*]] = shl i32 [[_8]], [[X13]]\n+; CHECK-NEXT:    [[_9:%.*]] = shl nuw nsw i32 [[_8]], [[X13]]\n ; CHECK-NEXT:    ret i32 [[_9]]\n ;\n   %x13 = zext i1 %x2 to i32\ndiff --git a/llvm/test/Transforms/InstCombine/rotate.ll b/llvm/test/Transforms/InstCombine/rotate.ll\nindex fece47534819e..ed5145255b2f0 100644\n--- a/llvm/test/Transforms/InstCombine/rotate.ll\n+++ b/llvm/test/Transforms/InstCombine/rotate.ll\n@@ -705,7 +705,7 @@ define i9 @rotateleft_9_neg_mask_wide_amount_commute(i9 %v, i33 %shamt) {\n ; CHECK-NEXT:    [[LSHAMT:%.*]] = and i33 [[SHAMT]], 8\n ; CHECK-NEXT:    [[RSHAMT:%.*]] = and i33 [[NEG]], 8\n ; CHECK-NEXT:    [[CONV:%.*]] = zext i9 [[V:%.*]] to i33\n-; CHECK-NEXT:    [[SHL:%.*]] = shl i33 [[CONV]], [[LSHAMT]]\n+; CHECK-NEXT:    [[SHL:%.*]] = shl nuw nsw i33 [[CONV]], [[LSHAMT]]\n ; CHECK-NEXT:    [[SHR:%.*]] = lshr i33 [[CONV]], [[RSHAMT]]\n ; CHECK-NEXT:    [[OR:%.*]] = or i33 [[SHL]], [[SHR]]\n ; CHECK-NEXT:    [[RET:%.*]] = trunc i33 [[OR]] to i9\ndiff --git a/llvm/test/Transforms/InstCombine/shift-flags.ll b/llvm/test/Transforms/InstCombine/shift-flags.ll\nnew file mode 100644\nindex 0000000000000..08cf4821d85b4\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/shift-flags.ll\n@@ -0,0 +1,119 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+define i8 @shl_add_nuw(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @shl_add_nuw(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 63\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = shl nuw i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, 63\n+  %cnt = and i8 %cnt_in, 2\n+  %r = shl i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @shl_add_nuw_fail(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @shl_add_nuw_fail(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 63\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 3\n+; CHECK-NEXT:    [[R:%.*]] = shl i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, 63\n+  %cnt = and i8 %cnt_in, 3\n+  %r = shl i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @shl_add_nuw_and_nsw(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @shl_add_nuw_and_nsw(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 31\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = shl nuw nsw i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, 31\n+  %cnt = and i8 %cnt_in, 2\n+  %r = shl i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @shl_add_nsw(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @shl_add_nsw(\n+; CHECK-NEXT:    [[AMT:%.*]] = or i8 [[AMT_IN:%.*]], -32\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = shl nsw i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = or i8 %amt_in, 224\n+  %cnt = and i8 %cnt_in, 2\n+  %r = shl i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @shl_add_nsw_fail(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @shl_add_nsw_fail(\n+; CHECK-NEXT:    [[AMT:%.*]] = or i8 [[AMT_IN:%.*]], -64\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = shl i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = or i8 %amt_in, 192\n+  %cnt = and i8 %cnt_in, 2\n+  %r = shl i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @lshr_add_exact(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @lshr_add_exact(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -4\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = lshr exact i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, -4\n+  %cnt = and i8 %cnt_in, 2\n+  %r = lshr i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @lshr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @lshr_add_exact_fail(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -7\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = lshr i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, -7\n+  %cnt = and i8 %cnt_in, 2\n+  %r = lshr i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @ashr_add_exact(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @ashr_add_exact(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -14\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 1\n+; CHECK-NEXT:    [[R:%.*]] = ashr exact i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, -14\n+  %cnt = and i8 %cnt_in, 1\n+  %r = ashr i8 %amt, %cnt\n+  ret i8 %r\n+}\n+\n+define i8 @ashr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n+; CHECK-LABEL: @ashr_add_exact_fail(\n+; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -14\n+; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n+; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[AMT]], [[CNT]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %amt = and i8 %amt_in, -14\n+  %cnt = and i8 %cnt_in, 2\n+  %r = ashr i8 %amt, %cnt\n+  ret i8 %r\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll b/llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll\nindex ac0115a0f5715..b5dcb9b67d676 100644\n--- a/llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll\n+++ b/llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll\n@@ -345,7 +345,7 @@ define i64 @test11(i32 %A, i32 %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext i32 [[A:%.*]] to i64\n ; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[B:%.*]], 31\n ; CHECK-NEXT:    [[E:%.*]] = zext i32 [[TMP1]] to i64\n-; CHECK-NEXT:    [[F:%.*]] = shl i64 [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw i64 [[C]], [[E]]\n ; CHECK-NEXT:    ret i64 [[F]]\n ;\n   %C = zext i32 %A to i128\n@@ -361,7 +361,7 @@ define <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 31>\n ; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n-; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw <2 x i64> [[C]], [[E]]\n ; CHECK-NEXT:    ret <2 x i64> [[F]]\n ;\n   %C = zext <2 x i32> %A to <2 x i128>\n@@ -377,7 +377,7 @@ define <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 15>\n ; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n-; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw <2 x i64> [[C]], [[E]]\n ; CHECK-NEXT:    ret <2 x i64> [[F]]\n ;\n   %C = zext <2 x i32> %A to <2 x i128>\ndiff --git a/llvm/test/Transforms/InstCombine/trunc.ll b/llvm/test/Transforms/InstCombine/trunc.ll\nindex e04bcaf073b64..33baee858493a 100644\n--- a/llvm/test/Transforms/InstCombine/trunc.ll\n+++ b/llvm/test/Transforms/InstCombine/trunc.ll\n@@ -345,7 +345,7 @@ define i64 @test11(i32 %A, i32 %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext i32 [[A:%.*]] to i64\n ; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[B:%.*]], 31\n ; CHECK-NEXT:    [[E:%.*]] = zext i32 [[TMP1]] to i64\n-; CHECK-NEXT:    [[F:%.*]] = shl i64 [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw i64 [[C]], [[E]]\n ; CHECK-NEXT:    ret i64 [[F]]\n ;\n   %C = zext i32 %A to i128\n@@ -361,7 +361,7 @@ define <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 31>\n ; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n-; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw <2 x i64> [[C]], [[E]]\n ; CHECK-NEXT:    ret <2 x i64> [[F]]\n ;\n   %C = zext <2 x i32> %A to <2 x i128>\n@@ -377,7 +377,7 @@ define <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n ; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 15>\n ; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n-; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n+; CHECK-NEXT:    [[F:%.*]] = shl nuw nsw <2 x i64> [[C]], [[E]]\n ; CHECK-NEXT:    ret <2 x i64> [[F]]\n ;\n   %C = zext <2 x i32> %A to <2 x i128>\ndiff --git a/llvm/test/Transforms/InstSimplify/ctpop-pow2.ll b/llvm/test/Transforms/InstSimplify/ctpop-pow2.ll\nindex eae368f03ca7e..48cc8895aebbc 100644\n--- a/llvm/test/Transforms/InstSimplify/ctpop-pow2.ll\n+++ b/llvm/test/Transforms/InstSimplify/ctpop-pow2.ll\n@@ -41,10 +41,7 @@ define i16 @ctpop_x_and_negx(i16 %x) {\n \n define i8 @ctpop_x_nz_and_negx(i8 %x) {\n ; CHECK-LABEL: @ctpop_x_nz_and_negx(\n-; CHECK-NEXT:    [[X1:%.*]] = or i8 [[X:%.*]], 1\n-; CHECK-NEXT:    [[V0:%.*]] = sub i8 0, [[X1]]\n-; CHECK-NEXT:    [[V1:%.*]] = and i8 [[X1]], [[V0]]\n-; CHECK-NEXT:    ret i8 [[V1]]\n+; CHECK-NEXT:    ret i8 1\n ;\n   %x1 = or i8 %x, 1\n   %v0 = sub i8 0, %x1\n",
+  "source_files": [
+    "llvm/lib/Analysis/ValueTracking.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Analysis/ValueTracking/known-power-of-two.ll",
+    "llvm/test/Transforms/InstCombine/and-add-shl.ll",
+    "llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll",
+    "llvm/test/Transforms/InstCombine/rotate.ll",
+    "llvm/test/Transforms/InstCombine/shift-flags.ll",
+    "llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll",
+    "llvm/test/Transforms/InstCombine/trunc.ll",
+    "llvm/test/Transforms/InstSimplify/ctpop-pow2.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/ValueTracking/known-power-of-two.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "and_is_pow2",
+          "test_body": "define i1 @and_is_pow2(i16 %x, i16 %y) {\n; CHECK-LABEL: define i1 @and_is_pow2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n; CHECK-NEXT:    [[XNZ:%.*]] = or i16 [[X]], 4\n; CHECK-NEXT:    [[X_NEG:%.*]] = sub nsw i16 0, [[XNZ]]\n; CHECK-NEXT:    [[TMP1:%.*]] = and i16 [[X_NEG]], [[Y]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[TMP1]], [[XNZ]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i16 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %xnz = or i16 %x, 4\n  %x_neg = sub i16 0, %xnz\n  %xx = and i16 %xnz, %x_neg\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @and_is_pow2(i16 %x, i16 %y) {\n  %xnz = or i16 %x, 4\n  %x_neg = sub i16 0, %xnz\n  %xx = and i16 %xnz, %x_neg\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "lshr_is_pow2",
+          "test_body": "define i1 @lshr_is_pow2(i16 %x, i16 %y) {\n; CHECK-LABEL: define i1 @lshr_is_pow2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n; CHECK-NEXT:    [[XX:%.*]] = lshr i16 512, [[XSMALL]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 7\n  %xx = lshr i16 512, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @lshr_is_pow2(i16 %x, i16 %y) {\n  %xsmall = and i16 %x, 7\n  %xx = lshr i16 512, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "mul_is_pow2",
+          "test_body": "define i1 @mul_is_pow2(i16 %x, i16 %y, i16 %z) {\n; CHECK-LABEL: define i1 @mul_is_pow2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 3\n; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 3\n; CHECK-NEXT:    [[XP2:%.*]] = shl i16 4, [[XSMALL]]\n; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n; CHECK-NEXT:    [[XX:%.*]] = mul nuw nsw i16 [[XP2]], [[ZP2]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 3\n  %zsmall = and i16 %z, 3\n  %xp2 = shl i16 4, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @mul_is_pow2(i16 %x, i16 %y, i16 %z) {\n  %xsmall = and i16 %x, 3\n  %zsmall = and i16 %z, 3\n  %xp2 = shl i16 4, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "mul_is_pow2_fail",
+          "test_body": "define i1 @mul_is_pow2_fail(i16 %x, i16 %y, i16 %z) {\n; CHECK-LABEL: define i1 @mul_is_pow2_fail\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 7\n; CHECK-NEXT:    [[XP2:%.*]] = shl i16 4, [[XSMALL]]\n; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n; CHECK-NEXT:    [[XX:%.*]] = mul i16 [[XP2]], [[ZP2]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 7\n  %zsmall = and i16 %z, 7\n  %xp2 = shl i16 4, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @mul_is_pow2_fail(i16 %x, i16 %y, i16 %z) {\n  %xsmall = and i16 %x, 7\n  %zsmall = and i16 %z, 7\n  %xp2 = shl i16 4, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "mul_is_pow2_fail2",
+          "test_body": "define i1 @mul_is_pow2_fail2(i16 %x, i16 %y, i16 %z) {\n; CHECK-LABEL: define i1 @mul_is_pow2_fail2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]], i16 [[Z:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 3\n; CHECK-NEXT:    [[ZSMALL:%.*]] = and i16 [[Z]], 3\n; CHECK-NEXT:    [[XP2:%.*]] = shl i16 3, [[XSMALL]]\n; CHECK-NEXT:    [[ZP2:%.*]] = shl i16 2, [[ZSMALL]]\n; CHECK-NEXT:    [[XX:%.*]] = mul nuw nsw i16 [[XP2]], [[ZP2]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 3\n  %zsmall = and i16 %z, 3\n  %xp2 = shl i16 3, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @mul_is_pow2_fail2(i16 %x, i16 %y, i16 %z) {\n  %xsmall = and i16 %x, 3\n  %zsmall = and i16 %z, 3\n  %xp2 = shl i16 3, %xsmall\n  %zp2 = shl i16 2, %zsmall\n  %xx = mul i16 %xp2, %zp2\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "shl_is_pow2",
+          "test_body": "define i1 @shl_is_pow2(i16 %x, i16 %y) {\n; CHECK-LABEL: define i1 @shl_is_pow2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n; CHECK-NEXT:    [[XX:%.*]] = shl i16 4, [[XSMALL]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 7\n  %xx = shl i16 4, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @shl_is_pow2(i16 %x, i16 %y) {\n  %xsmall = and i16 %x, 7\n  %xx = shl i16 4, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "shl_is_pow2_fail2",
+          "test_body": "define i1 @shl_is_pow2_fail2(i16 %x, i16 %y) {\n; CHECK-LABEL: define i1 @shl_is_pow2_fail2\n; CHECK-SAME: (i16 [[X:%.*]], i16 [[Y:%.*]]) {\n; CHECK-NEXT:    [[XSMALL:%.*]] = and i16 [[X]], 7\n; CHECK-NEXT:    [[XX:%.*]] = shl i16 5, [[XSMALL]]\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[XX]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[XX]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %xsmall = and i16 %x, 7\n  %xx = shl i16 5, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}",
+          "source_program": "define i1 @shl_is_pow2_fail2(i16 %x, i16 %y) {\n  %xsmall = and i16 %x, 7\n  %xx = shl i16 5, %xsmall\n  %and = and i16 %y, %xx\n  %r = icmp eq i16 %and, %xx\n  ret i1 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/and-add-shl.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "and_not_shl",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i8 @and_not_shl(i8 %x) {\n; CHECK-LABEL: define i8 @and_not_shl\n; CHECK-SAME: (i8 [[X:%.*]]) {\n; CHECK-NEXT:    [[OP1_P2:%.*]] = icmp ult i8 [[X]], 6\n; CHECK-NEXT:    call void @llvm.assume(i1 [[OP1_P2]])\n; CHECK-NEXT:    [[SHIFT:%.*]] = shl i8 -1, [[X]]\n; CHECK-NEXT:    [[NOT:%.*]] = and i8 [[SHIFT]], 32\n; CHECK-NEXT:    [[R:%.*]] = xor i8 [[NOT]], 32\n; CHECK-NEXT:    ret i8 [[R]]\n  %op1_p2 = icmp ule i8 %x, 5\n  call void @llvm.assume(i1 %op1_p2)\n  %shift = shl i8 -1, %x\n  %not = xor i8 %shift, -1\n  %r = and i8 %not, 32\n  ret i8 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i8 @and_not_shl(i8 %x) {\n  %op1_p2 = icmp ule i8 %x, 5\n  call void @llvm.assume(i1 %op1_p2)\n  %shift = shl i8 -1, %x\n  %not = xor i8 %shift, -1\n  %r = and i8 %not, 32\n  ret i8 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/redundant-left-shift-input-masking-pr49778.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "src",
+          "test_body": "define i32 @src(i1 %x2) {\n; CHECK-LABEL: @src(\n; CHECK-NEXT:    [[X13:%.*]] = zext i1 [[X2:%.*]] to i32\n; CHECK-NEXT:    [[_7:%.*]] = shl i32 -1, [[X13]]\n; CHECK-NEXT:    [[MASK:%.*]] = xor i32 [[_7]], -1\n; CHECK-NEXT:    [[_8:%.*]] = and i32 [[MASK]], [[X13]]\n; CHECK-NEXT:    [[_9:%.*]] = shl i32 [[_8]], [[X13]]\n; CHECK-NEXT:    ret i32 [[_9]]\n  %x13 = zext i1 %x2 to i32\n  %_7 = shl i32 -1, %x13\n  %mask = xor i32 %_7, -1\n  %_8 = and i32 %mask, %x13\n  %_9 = shl i32 %_8, %x13\n  ret i32 %_9\n}",
+          "source_program": "define i32 @src(i1 %x2) {\n  %x13 = zext i1 %x2 to i32\n  %_7 = shl i32 -1, %x13\n  %mask = xor i32 %_7, -1\n  %_8 = and i32 %mask, %x13\n  %_9 = shl i32 %_8, %x13\n  ret i32 %_9\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/rotate.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "rotateleft_9_neg_mask_wide_amount_commute",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\ndefine i9 @rotateleft_9_neg_mask_wide_amount_commute(i9 %v, i33 %shamt) {\n; CHECK-LABEL: @rotateleft_9_neg_mask_wide_amount_commute(\n; CHECK-NEXT:    [[NEG:%.*]] = sub i33 0, [[SHAMT:%.*]]\n; CHECK-NEXT:    [[LSHAMT:%.*]] = and i33 [[SHAMT]], 8\n; CHECK-NEXT:    [[RSHAMT:%.*]] = and i33 [[NEG]], 8\n; CHECK-NEXT:    [[CONV:%.*]] = zext i9 [[V:%.*]] to i33\n; CHECK-NEXT:    [[SHL:%.*]] = shl i33 [[CONV]], [[LSHAMT]]\n; CHECK-NEXT:    [[SHR:%.*]] = lshr i33 [[CONV]], [[RSHAMT]]\n; CHECK-NEXT:    [[OR:%.*]] = or i33 [[SHL]], [[SHR]]\n; CHECK-NEXT:    [[RET:%.*]] = trunc i33 [[OR]] to i9\n; CHECK-NEXT:    ret i9 [[RET]]\n  %neg = sub i33 0, %shamt\n  %lshamt = and i33 %shamt, 8\n  %rshamt = and i33 %neg, 8\n  %conv = zext i9 %v to i33\n  %shl = shl i33 %conv, %lshamt\n  %shr = lshr i33 %conv, %rshamt\n  %or = or i33 %shl, %shr\n  %ret = trunc i33 %or to i9\n  ret i9 %ret\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\ndefine i9 @rotateleft_9_neg_mask_wide_amount_commute(i9 %v, i33 %shamt) {\n  %neg = sub i33 0, %shamt\n  %lshamt = and i33 %shamt, 8\n  %rshamt = and i33 %neg, 8\n  %conv = zext i9 %v to i33\n  %shl = shl i33 %conv, %lshamt\n  %shr = lshr i33 %conv, %rshamt\n  %or = or i33 %shl, %shr\n  %ret = trunc i33 %or to i9\n  ret i9 %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shift-flags.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "ashr_add_exact",
+          "test_body": "define i8 @ashr_add_exact(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @ashr_add_exact(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -14\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 1\n; CHECK-NEXT:    [[R:%.*]] = ashr exact i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, -14\n  %cnt = and i8 %cnt_in, 1\n  %r = ashr i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @ashr_add_exact(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, -14\n  %cnt = and i8 %cnt_in, 1\n  %r = ashr i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "ashr_add_exact_fail",
+          "test_body": "define i8 @ashr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @ashr_add_exact_fail(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -14\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, -14\n  %cnt = and i8 %cnt_in, 2\n  %r = ashr i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @ashr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, -14\n  %cnt = and i8 %cnt_in, 2\n  %r = ashr i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "lshr_add_exact",
+          "test_body": "define i8 @lshr_add_exact(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @lshr_add_exact(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -4\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = lshr exact i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, -4\n  %cnt = and i8 %cnt_in, 2\n  %r = lshr i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @lshr_add_exact(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, -4\n  %cnt = and i8 %cnt_in, 2\n  %r = lshr i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "lshr_add_exact_fail",
+          "test_body": "define i8 @lshr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @lshr_add_exact_fail(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], -7\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = lshr i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, -7\n  %cnt = and i8 %cnt_in, 2\n  %r = lshr i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @lshr_add_exact_fail(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, -7\n  %cnt = and i8 %cnt_in, 2\n  %r = lshr i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "shl_add_nsw",
+          "test_body": "define i8 @shl_add_nsw(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @shl_add_nsw(\n; CHECK-NEXT:    [[AMT:%.*]] = or i8 [[AMT_IN:%.*]], -32\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = shl nsw i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = or i8 %amt_in, -32\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @shl_add_nsw(i8 %amt_in, i8 %cnt_in) {\n  %amt = or i8 %amt_in, -32\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "shl_add_nsw_fail",
+          "test_body": "define i8 @shl_add_nsw_fail(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @shl_add_nsw_fail(\n; CHECK-NEXT:    [[AMT:%.*]] = or i8 [[AMT_IN:%.*]], -64\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = shl i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = or i8 %amt_in, -64\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @shl_add_nsw_fail(i8 %amt_in, i8 %cnt_in) {\n  %amt = or i8 %amt_in, -64\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "shl_add_nuw",
+          "test_body": "define i8 @shl_add_nuw(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @shl_add_nuw(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 63\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = shl nuw i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, 63\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @shl_add_nuw(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, 63\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "shl_add_nuw_and_nsw",
+          "test_body": "define i8 @shl_add_nuw_and_nsw(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @shl_add_nuw_and_nsw(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 31\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 2\n; CHECK-NEXT:    [[R:%.*]] = shl nuw nsw i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, 31\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @shl_add_nuw_and_nsw(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, 31\n  %cnt = and i8 %cnt_in, 2\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "shl_add_nuw_fail",
+          "test_body": "define i8 @shl_add_nuw_fail(i8 %amt_in, i8 %cnt_in) {\n; CHECK-LABEL: @shl_add_nuw_fail(\n; CHECK-NEXT:    [[AMT:%.*]] = and i8 [[AMT_IN:%.*]], 63\n; CHECK-NEXT:    [[CNT:%.*]] = and i8 [[CNT_IN:%.*]], 3\n; CHECK-NEXT:    [[R:%.*]] = shl i8 [[AMT]], [[CNT]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %amt = and i8 %amt_in, 63\n  %cnt = and i8 %cnt_in, 3\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}",
+          "source_program": "define i8 @shl_add_nuw_fail(i8 %amt_in, i8 %cnt_in) {\n  %amt = and i8 %amt_in, 63\n  %cnt = and i8 %cnt_in, 3\n  %r = shl i8 %amt, %cnt\n  ret i8 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/trunc-inseltpoison.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test11",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i64 @test11(i32 %A, i32 %B) {\n; CHECK-LABEL: @test11(\n; CHECK-NEXT:    [[C:%.*]] = zext i32 [[A:%.*]] to i64\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[B:%.*]], 31\n; CHECK-NEXT:    [[E:%.*]] = zext i32 [[TMP1]] to i64\n; CHECK-NEXT:    [[F:%.*]] = shl i64 [[C]], [[E]]\n; CHECK-NEXT:    ret i64 [[F]]\n  %C = zext i32 %A to i128\n  %D = zext i32 %B to i128\n  %E = and i128 %D, 31\n  %F = shl i128 %C, %E\n  %G = trunc i128 %F to i64\n  ret i64 %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i64 @test11(i32 %A, i32 %B) {\n  %C = zext i32 %A to i128\n  %D = zext i32 %B to i128\n  %E = and i128 %D, 31\n  %F = shl i128 %C, %E\n  %G = trunc i128 %F to i64\n  ret i64 %G\n}\n"
+        },
+        {
+          "test_name": "test11_vec",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n; CHECK-LABEL: @test11_vec(\n; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 31>\n; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n; CHECK-NEXT:    ret <2 x i64> [[F]]\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 31>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 31>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}\n"
+        },
+        {
+          "test_name": "test11_vec_nonuniform",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n; CHECK-LABEL: @test11_vec_nonuniform(\n; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 15>\n; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n; CHECK-NEXT:    ret <2 x i64> [[F]]\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 15>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 15>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/trunc.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test11",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i64 @test11(i32 %A, i32 %B) {\n; CHECK-LABEL: @test11(\n; CHECK-NEXT:    [[C:%.*]] = zext i32 [[A:%.*]] to i64\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[B:%.*]], 31\n; CHECK-NEXT:    [[E:%.*]] = zext i32 [[TMP1]] to i64\n; CHECK-NEXT:    [[F:%.*]] = shl i64 [[C]], [[E]]\n; CHECK-NEXT:    ret i64 [[F]]\n  %C = zext i32 %A to i128\n  %D = zext i32 %B to i128\n  %E = and i128 %D, 31\n  %F = shl i128 %C, %E\n  %G = trunc i128 %F to i64\n  ret i64 %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i64 @test11(i32 %A, i32 %B) {\n  %C = zext i32 %A to i128\n  %D = zext i32 %B to i128\n  %E = and i128 %D, 31\n  %F = shl i128 %C, %E\n  %G = trunc i128 %F to i64\n  ret i64 %G\n}\n"
+        },
+        {
+          "test_name": "test11_vec",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n; CHECK-LABEL: @test11_vec(\n; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 31>\n; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n; CHECK-NEXT:    ret <2 x i64> [[F]]\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 31>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec(<2 x i32> %A, <2 x i32> %B) {\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 31>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}\n"
+        },
+        {
+          "test_name": "test11_vec_nonuniform",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n; CHECK-LABEL: @test11_vec_nonuniform(\n; CHECK-NEXT:    [[C:%.*]] = zext <2 x i32> [[A:%.*]] to <2 x i64>\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i32> [[B:%.*]], <i32 31, i32 15>\n; CHECK-NEXT:    [[E:%.*]] = zext <2 x i32> [[TMP1]] to <2 x i64>\n; CHECK-NEXT:    [[F:%.*]] = shl <2 x i64> [[C]], [[E]]\n; CHECK-NEXT:    ret <2 x i64> [[F]]\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 15>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i64> @test11_vec_nonuniform(<2 x i32> %A, <2 x i32> %B) {\n  %C = zext <2 x i32> %A to <2 x i128>\n  %D = zext <2 x i32> %B to <2 x i128>\n  %E = and <2 x i128> %D, <i128 31, i128 15>\n  %F = shl <2 x i128> %C, %E\n  %G = trunc <2 x i128> %F to <2 x i64>\n  ret <2 x i64> %G\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstSimplify/ctpop-pow2.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instsimplify -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "ctpop_x_and_negx",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.ctpop.i16(i16) #0\n\ndefine i16 @ctpop_x_and_negx(i16 %x) {\n; CHECK-LABEL: @ctpop_x_and_negx(\n; CHECK-NEXT:    [[V0:%.*]] = sub i16 0, [[X:%.*]]\n; CHECK-NEXT:    [[V1:%.*]] = and i16 [[X]], [[V0]]\n; CHECK-NEXT:    [[CNT:%.*]] = call i16 @llvm.ctpop.i16(i16 [[V1]])\n; CHECK-NEXT:    ret i16 [[CNT]]\n  %v0 = sub i16 0, %x\n  %v1 = and i16 %x, %v0\n  %cnt = call i16 @llvm.ctpop.i16(i16 %v1)\n  ret i16 %cnt\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.ctpop.i16(i16) #0\n\ndefine i16 @ctpop_x_and_negx(i16 %x) {\n  %v0 = sub i16 0, %x\n  %v1 = and i16 %x, %v0\n  %cnt = call i16 @llvm.ctpop.i16(i16 %v1)\n  ret i16 %cnt\n}\n"
+        },
+        {
+          "test_name": "ctpop_x_nz_and_negx",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.ctpop.i8(i8) #0\n\ndefine i8 @ctpop_x_nz_and_negx(i8 %x) {\n; CHECK-LABEL: @ctpop_x_nz_and_negx(\n; CHECK-NEXT:    ret i8 1\n  %x1 = or i8 %x, 1\n  %v0 = sub i8 0, %x1\n  %v1 = and i8 %x1, %v0\n  %cnt = call i8 @llvm.ctpop.i8(i8 %v1)\n  ret i8 %cnt\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.ctpop.i8(i8) #0\n\ndefine i8 @ctpop_x_nz_and_negx(i8 %x) {\n  %x1 = or i8 %x, 1\n  %v0 = sub i8 0, %x1\n  %v1 = and i8 %x1, %v0\n  %cnt = call i8 @llvm.ctpop.i8(i8 %v1)\n  ret i8 %cnt\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

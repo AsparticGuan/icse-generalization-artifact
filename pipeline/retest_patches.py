@@ -10,7 +10,7 @@ Default behavior:
   - If full_check_pass == false, use fast_full_mismatch_patch
   - If full_check_pass == true, use patch
   - For each patch (e.g., 85250-orig.json), use dataset/85250.json if present
-  - Apply patch, then run env.check_fast() to verify
+  - Apply patch, then run tests from dataset/issue_id.json "dev_tests" to verify
 
 Usage:
   python pipeline/retest_patches.py
@@ -33,7 +33,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
 DEFAULT_PATCH_DIR = os.environ.get(
     "LAB_PATCH_DIR",
     os.path.join(
-        _PROJECT_ROOT, "results", "generate", "fixes-glm-5-cot-iter4-orig"
+        _PROJECT_ROOT, "results", "generate", "fixes-deepseek-v3.2-cot-iter4-orig-single"
     ),
 )
 DEFAULT_RETEST_DIR = os.environ.get(
@@ -42,7 +42,7 @@ DEFAULT_RETEST_DIR = os.environ.get(
         _PROJECT_ROOT,
         "results",
         "generate",
-        "retest-fixes-glm-5-cot-iter4-orig",
+        "retest-fixes-deepseek-v3.2-cot-iter4-orig-single",
     ),
 )
 
@@ -246,6 +246,33 @@ def retest_patch(
         )
         return
 
+    dataset_path = os.path.join(DATASET_DIR, f"{test_issue_id}.json")
+    try:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            dataset_data = json.load(f)
+    except Exception as e:
+        write_json(
+            out_path,
+            {
+                "error": f"Failed to load dataset: {e}",
+                "patch_issue_id": patch_issue_id,
+                "test_issue_id": test_issue_id,
+            },
+        )
+        return
+
+    dev_tests = dataset_data.get("dev_tests") or []
+    if not dev_tests:
+        write_json(
+            out_path,
+            {
+                "error": "No dev_tests in dataset",
+                "patch_issue_id": patch_issue_id,
+                "test_issue_id": test_issue_id,
+            },
+        )
+        return
+
     issue_llvm_dir = ensure_llvm_clone_for_issue(test_issue_id)
     llvm_helper.llvm_dir = issue_llvm_dir
     os.environ["LAB_LLVM_DIR"] = issue_llvm_dir
@@ -286,7 +313,16 @@ def retest_patch(
         check_more_log = None
         if apply_ok:
             try:
-                check_more_res, check_more_log = env.check_fast(skip_build=False)
+                res_build, reason_build = env.build()
+                if not res_build:
+                    check_more_res = False
+                    check_more_log = reason_build
+                else:
+                    check_more_res, check_more_log = llvm_helper.verify_test_group(
+                        repro=False,
+                        input=dev_tests,
+                        type=dataset_data["bug_type"],
+                    )
             except Exception as e:
                 check_more_res = False
                 check_more_log = str(e)

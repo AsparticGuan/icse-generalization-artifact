@@ -1,0 +1,190 @@
+{
+  "pr_number": 128365,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/128365",
+  "title": "[InstCombine] Add support for GEPs in `simplifyNonNullOperand`",
+  "commit_sha": "a202d77920da574f0e3df9d47091abb34b9bc99d",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/PhaseOrdering"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          3996,
+          4003
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          457,
+          463
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+        [
+          982,
+          989
+        ],
+        [
+          992,
+          997
+        ],
+        [
+          1076,
+          1082
+        ],
+        [
+          1444,
+          1450
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          3593,
+          3602
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitCallBase"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+        "InstCombinerImpl::simplifyNonNullOperand",
+        "InstCombinerImpl::visitLoadInst",
+        "InstCombinerImpl::visitStoreInst",
+        "canSimplifyNullLoadOrGEP"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::visitReturnInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 54f777ab20a7a..63f2fd0a733ce 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3996,8 +3996,12 @@ Instruction *InstCombinerImpl::visitCallBase(CallBase &Call) {\n     if (V->getType()->isPointerTy()) {\n       // Simplify the nonnull operand if the parameter is known to be nonnull.\n       // Otherwise, try to infer nonnull for it.\n-      if (Call.paramHasNonNullAttr(ArgNo, /*AllowUndefOrPoison=*/true)) {\n-        if (Value *Res = simplifyNonNullOperand(V)) {\n+      bool HasDereferenceable = Call.getParamDereferenceableBytes(ArgNo) > 0;\n+      if (Call.paramHasAttr(ArgNo, Attribute::NonNull) ||\n+          (HasDereferenceable &&\n+           !NullPointerIsDefined(Call.getFunction(),\n+                                 V->getType()->getPointerAddressSpace()))) {\n+        if (Value *Res = simplifyNonNullOperand(V, HasDereferenceable)) {\n           replaceOperand(Call, ArgNo, Res);\n           Changed = true;\n         }\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 71c80d4c401f8..5b2af39e69f2c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -457,7 +457,10 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n \n   /// Simplify \\p V given that it is known to be non-null.\n   /// Returns the simplified value if possible, otherwise returns nullptr.\n-  Value *simplifyNonNullOperand(Value *V);\n+  /// If \\p HasDereferenceable is true, the simplification will not perform\n+  /// same object checks.\n+  Value *simplifyNonNullOperand(Value *V, bool HasDereferenceable,\n+                                unsigned Depth = 0);\n \n public:\n   /// Create and insert the idiom we use to indicate a block is unreachable\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\nindex 89fc1051b18dc..622884ea1eb46 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n@@ -982,8 +982,9 @@ static bool canSimplifyNullLoadOrGEP(LoadInst &LI, Value *Op) {\n   return false;\n }\n \n-/// TODO: Recursively simplify nonnull value to handle one-use inbounds GEPs.\n-Value *InstCombinerImpl::simplifyNonNullOperand(Value *V) {\n+Value *InstCombinerImpl::simplifyNonNullOperand(Value *V,\n+                                                bool HasDereferenceable,\n+                                                unsigned Depth) {\n   if (auto *Sel = dyn_cast<SelectInst>(V)) {\n     if (isa<ConstantPointerNull>(Sel->getOperand(1)))\n       return Sel->getOperand(2);\n@@ -992,6 +993,23 @@ Value *InstCombinerImpl::simplifyNonNullOperand(Value *V) {\n       return Sel->getOperand(1);\n   }\n \n+  if (!V->hasOneUse())\n+    return nullptr;\n+\n+  if (Depth == 1)\n+    return nullptr;\n+\n+  if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {\n+    if (HasDereferenceable || GEP->isInBounds()) {\n+      if (auto *Res = simplifyNonNullOperand(GEP->getPointerOperand(),\n+                                             HasDereferenceable, Depth + 1)) {\n+        replaceOperand(*GEP, 0, Res);\n+        addToWorklist(GEP);\n+        return nullptr;\n+      }\n+    }\n+  }\n+\n   return nullptr;\n }\n \n@@ -1076,7 +1094,7 @@ Instruction *InstCombinerImpl::visitLoadInst(LoadInst &LI) {\n   }\n \n   if (!NullPointerIsDefined(LI.getFunction(), LI.getPointerAddressSpace()))\n-    if (Value *V = simplifyNonNullOperand(Op))\n+    if (Value *V = simplifyNonNullOperand(Op, /*HasDereferenceable=*/true))\n       return replaceOperand(LI, 0, V);\n \n   return nullptr;\n@@ -1444,7 +1462,7 @@ Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {\n     return eraseInstFromFunction(SI);\n \n   if (!NullPointerIsDefined(SI.getFunction(), SI.getPointerAddressSpace()))\n-    if (Value *V = simplifyNonNullOperand(Ptr))\n+    if (Value *V = simplifyNonNullOperand(Ptr, /*HasDereferenceable=*/true))\n       return replaceOperand(SI, 1, V);\n \n   return nullptr;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex b7748f59a0cfc..81b057c10b484 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -3593,10 +3593,12 @@ Instruction *InstCombinerImpl::visitReturnInst(ReturnInst &RI) {\n   Function *F = RI.getFunction();\n   Type *RetTy = RetVal->getType();\n   if (RetTy->isPointerTy()) {\n+    bool HasDereferenceable =\n+        F->getAttributes().getRetDereferenceableBytes() > 0;\n     if (F->hasRetAttribute(Attribute::NonNull) ||\n-        (F->getAttributes().getRetDereferenceableBytes() > 0 &&\n+        (HasDereferenceable &&\n          !NullPointerIsDefined(F, RetTy->getPointerAddressSpace()))) {\n-      if (Value *V = simplifyNonNullOperand(RetVal))\n+      if (Value *V = simplifyNonNullOperand(RetVal, HasDereferenceable))\n         return replaceOperand(RI, 0, V);\n     }\n   }\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/load.ll b/llvm/test/Transforms/InstCombine/load.ll\nindex 6c087aa87845f..a5ad1e0c21526 100644\n--- a/llvm/test/Transforms/InstCombine/load.ll\n+++ b/llvm/test/Transforms/InstCombine/load.ll\n@@ -439,3 +439,15 @@ define i4 @test_vector_load_i4_non_byte_sized() {\n   %res0 = load i4, ptr %ptr0, align 1\n   ret i4 %res0\n }\n+\n+define i32 @load_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @load_select_with_null_gep(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[SEL:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    [[RES:%.*]] = load i32, ptr [[GEP]], align 4\n+; CHECK-NEXT:    ret i32 [[RES]]\n+;\n+  %sel = select i1 %cond, ptr %p, ptr null\n+  %gep = getelementptr i8, ptr %sel, i64 %off\n+  %res = load i32, ptr %gep, align 4\n+  ret i32 %res\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/nonnull-select.ll b/llvm/test/Transforms/InstCombine/nonnull-select.ll\nindex cc000b4c88164..929919f9c42c7 100644\n--- a/llvm/test/Transforms/InstCombine/nonnull-select.ll\n+++ b/llvm/test/Transforms/InstCombine/nonnull-select.ll\n@@ -86,4 +86,102 @@ define void @nonnull_noundef_call2(i1 %cond, ptr %p) {\n   ret void\n }\n \n+define void @nonnull_call_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_call_gep(\n+; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n+; CHECK-NEXT:    ret void\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr i8, ptr %ptr, i64 %off\n+  call void @f(ptr nonnull %gep)\n+  ret void\n+}\n+\n+define void @nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_call_gep_multiuse(\n+; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n+; CHECK-NEXT:    call void @f(ptr [[GEP]])\n+; CHECK-NEXT:    ret void\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n+  call void @f(ptr nonnull %gep)\n+  call void @f(ptr %gep)\n+  ret void\n+}\n+\n+define void @all_nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @all_nonnull_call_gep_multiuse(\n+; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n+; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n+; CHECK-NEXT:    ret void\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n+  call void @f(ptr nonnull %gep)\n+  call void @f(ptr nonnull %gep)\n+  ret void\n+}\n+\n+define void @nonnull_call_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_call_gep_inbounds(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n+; CHECK-NEXT:    ret void\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n+  call void @f(ptr nonnull %gep)\n+  ret void\n+}\n+\n+define void @nonnull_dereferenceable_call_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_dereferenceable_call_gep(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    call void @f(ptr dereferenceable(1) [[GEP]])\n+; CHECK-NEXT:    ret void\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr i8, ptr %ptr, i64 %off\n+  call void @f(ptr dereferenceable(1) %gep)\n+  ret void\n+}\n+\n+define nonnull ptr @nonnull_ret_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_ret_gep(\n+; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr i8, ptr %ptr, i64 %off\n+  ret ptr %gep\n+}\n+\n+define nonnull ptr @nonnull_ret_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_ret_gep_inbounds(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n+  ret ptr %gep\n+}\n+\n+define dereferenceable(1) ptr @nonnull_dereferenceable_ret_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @nonnull_dereferenceable_ret_gep(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+  %ptr = select i1 %cond, ptr null, ptr %p\n+  %gep = getelementptr i8, ptr %ptr, i64 %off\n+  ret ptr %gep\n+}\n+\n declare void @f(ptr)\ndiff --git a/llvm/test/Transforms/InstCombine/store.ll b/llvm/test/Transforms/InstCombine/store.ll\nindex 0a2b0a5ee7987..daa40da1828b5 100644\n--- a/llvm/test/Transforms/InstCombine/store.ll\n+++ b/llvm/test/Transforms/InstCombine/store.ll\n@@ -387,6 +387,18 @@ define void @store_select_with_unknown(i1 %cond, ptr %p, ptr %p2) {\n   ret void\n }\n \n+define void @store_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n+; CHECK-LABEL: @store_select_with_null_gep(\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[SEL:%.*]], i64 [[OFF:%.*]]\n+; CHECK-NEXT:    store i32 0, ptr [[GEP]], align 4\n+; CHECK-NEXT:    ret void\n+;\n+  %sel = select i1 %cond, ptr %p, ptr null\n+  %gep = getelementptr i8, ptr %sel, i64 %off\n+  store i32 0, ptr %gep, align 4\n+  ret void\n+}\n+\n !0 = !{!4, !4, i64 0}\n !1 = !{!\"omnipotent char\", !2}\n !2 = !{!\"Simple C/C++ TBAA\"}\ndiff --git a/llvm/test/Transforms/PhaseOrdering/memset-combine.ll b/llvm/test/Transforms/PhaseOrdering/memset-combine.ll\nindex d1de11258ed91..b1a5881bcaa9c 100644\n--- a/llvm/test/Transforms/PhaseOrdering/memset-combine.ll\n+++ b/llvm/test/Transforms/PhaseOrdering/memset-combine.ll\n@@ -6,10 +6,8 @@\n define void @merge_memset(ptr %p, i1 %cond) {\n ; CHECK-LABEL: define void @merge_memset(\n ; CHECK-SAME: ptr [[P:%.*]], i1 [[COND:%.*]]) {\n-; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND]], ptr null, ptr [[P]]\n-; CHECK-NEXT:    tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(4096) [[P]], i8 0, i64 4096, i1 false)\n-; CHECK-NEXT:    [[OFF:%.*]] = getelementptr inbounds nuw i8, ptr [[SEL]], i64 4096\n-; CHECK-NEXT:    tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(768) [[OFF]], i8 0, i64 768, i1 false)\n+; CHECK-NEXT:    [[OFF:%.*]] = getelementptr inbounds nuw i8, ptr [[P]], i64 4096\n+; CHECK-NEXT:    call void @llvm.memset.p0.i64(ptr align 1 [[P]], i8 0, i64 4864, i1 false)\n ; CHECK-NEXT:    ret void\n ;\n   %sel = select i1 %cond, ptr null, ptr %p\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h",
+    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp",
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/load.ll",
+    "llvm/test/Transforms/InstCombine/nonnull-select.ll",
+    "llvm/test/Transforms/InstCombine/store.ll",
+    "llvm/test/Transforms/PhaseOrdering/memset-combine.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/load.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -S < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "load_select_with_null_gep",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1\"\n\ndefine i32 @load_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @load_select_with_null_gep(\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], ptr [[P:%.*]], ptr null\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[SEL]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    [[RES:%.*]] = load i32, ptr [[GEP]], align 4\n; CHECK-NEXT:    ret i32 [[RES]]\n  %sel = select i1 %cond, ptr %p, ptr null\n  %gep = getelementptr i8, ptr %sel, i64 %off\n  %res = load i32, ptr %gep, align 4\n  ret i32 %res\n}",
+          "source_program": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1\"\n\ndefine i32 @load_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n  %sel = select i1 %cond, ptr %p, ptr null\n  %gep = getelementptr i8, ptr %sel, i64 %off\n  %res = load i32, ptr %gep, align 4\n  ret i32 %res\n}\n"
+        },
+        {
+          "test_name": "test_vector_load_i4_non_byte_sized",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1\"\n\n@foo = external constant <2 x i4>, align 8\n\ndefine i4 @test_vector_load_i4_non_byte_sized() {\n; CHECK-LABEL: @test_vector_load_i4_non_byte_sized(\n; CHECK-NEXT:    [[RES0:%.*]] = load i4, ptr @foo, align 1\n; CHECK-NEXT:    ret i4 [[RES0]]\n  %ptr0 = getelementptr i8, ptr @foo, i64 0\n  %res0 = load i4, ptr %ptr0, align 1\n  ret i4 %res0\n}",
+          "source_program": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1\"\n\n@foo = external constant <2 x i4>, align 8\n\ndefine i4 @test_vector_load_i4_non_byte_sized() {\n  %ptr0 = getelementptr i8, ptr @foo, i64 0\n  %res0 = load i4, ptr %ptr0, align 1\n  ret i4 %res0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/nonnull-select.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "all_nonnull_call_gep_multiuse",
+          "test_body": "define void @all_nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @all_nonnull_call_gep_multiuse(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n; CHECK-NEXT:    ret void\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  call void @f(ptr nonnull %gep)\n  ret void\n}",
+          "source_program": "define void @all_nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  call void @f(ptr nonnull %gep)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_call_gep",
+          "test_body": "define void @nonnull_call_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_call_gep(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n; CHECK-NEXT:    ret void\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  ret void\n}",
+          "source_program": "define void @nonnull_call_gep(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_call_gep_inbounds",
+          "test_body": "define void @nonnull_call_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_call_gep_inbounds(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n; CHECK-NEXT:    ret void\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  ret void\n}",
+          "source_program": "define void @nonnull_call_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_call_gep_multiuse",
+          "test_body": "define void @nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_call_gep_multiuse(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    call void @f(ptr nonnull [[GEP]])\n; CHECK-NEXT:    call void @f(ptr [[GEP]])\n; CHECK-NEXT:    ret void\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  call void @f(ptr %gep)\n  ret void\n}",
+          "source_program": "define void @nonnull_call_gep_multiuse(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  call void @f(ptr nonnull %gep)\n  call void @f(ptr %gep)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_dereferenceable_call_gep",
+          "test_body": "define void @nonnull_dereferenceable_call_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_dereferenceable_call_gep(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    call void @f(ptr dereferenceable(1) [[GEP]])\n; CHECK-NEXT:    ret void\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  call void @f(ptr dereferenceable(1) %gep)\n  ret void\n}",
+          "source_program": "define void @nonnull_dereferenceable_call_gep(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  call void @f(ptr dereferenceable(1) %gep)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_dereferenceable_ret_gep",
+          "test_body": "define dereferenceable(1) ptr @nonnull_dereferenceable_ret_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_dereferenceable_ret_gep(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    ret ptr [[GEP]]\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}",
+          "source_program": "define dereferenceable(1) ptr @nonnull_dereferenceable_ret_gep(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}\n"
+        },
+        {
+          "test_name": "nonnull_noundef_call2",
+          "test_body": "define void @nonnull_noundef_call2(i1 %cond, ptr %p) {\n; CHECK-LABEL: @nonnull_noundef_call2(\n; CHECK-NEXT:    call void @f(ptr noundef nonnull [[RES:%.*]])\n; CHECK-NEXT:    ret void\n  %res = select i1 %cond, ptr null, ptr %p\n  call void @f(ptr noundef nonnull %res)\n  ret void\n}",
+          "source_program": "define void @nonnull_noundef_call2(i1 %cond, ptr %p) {\n  %res = select i1 %cond, ptr null, ptr %p\n  call void @f(ptr noundef nonnull %res)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonnull_ret_gep",
+          "test_body": "define nonnull ptr @nonnull_ret_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_ret_gep(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    ret ptr [[GEP]]\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}",
+          "source_program": "define nonnull ptr @nonnull_ret_gep(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}\n"
+        },
+        {
+          "test_name": "nonnull_ret_gep_inbounds",
+          "test_body": "define nonnull ptr @nonnull_ret_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @nonnull_ret_gep_inbounds(\n; CHECK-NEXT:    [[PTR:%.*]] = select i1 [[COND:%.*]], ptr null, ptr [[P:%.*]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds i8, ptr [[PTR]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    ret ptr [[GEP]]\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}",
+          "source_program": "define nonnull ptr @nonnull_ret_gep_inbounds(i1 %cond, ptr %p, i64 %off) {\n  %ptr = select i1 %cond, ptr null, ptr %p\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %off\n  ret ptr %gep\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/store.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "store_select_with_null_gep",
+          "test_body": "define void @store_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n; CHECK-LABEL: @store_select_with_null_gep(\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], ptr [[P:%.*]], ptr null\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[SEL]], i64 [[OFF:%.*]]\n; CHECK-NEXT:    store i32 0, ptr [[GEP]], align 4\n; CHECK-NEXT:    ret void\n  %sel = select i1 %cond, ptr %p, ptr null\n  %gep = getelementptr i8, ptr %sel, i64 %off\n  store i32 0, ptr %gep, align 4\n  ret void\n}",
+          "source_program": "define void @store_select_with_null_gep(i1 %cond, ptr %p, i64 %off) {\n  %sel = select i1 %cond, ptr %p, ptr null\n  %gep = getelementptr i8, ptr %sel, i64 %off\n  store i32 0, ptr %gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "store_select_with_unknown",
+          "test_body": "define void @store_select_with_unknown(i1 %cond, ptr %p, ptr %p2) {\n; CHECK-LABEL: @store_select_with_unknown(\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], ptr [[P:%.*]], ptr [[P2:%.*]]\n; CHECK-NEXT:    store i32 0, ptr [[SEL]], align 4\n; CHECK-NEXT:    ret void\n  %sel = select i1 %cond, ptr %p, ptr %p2\n  store i32 0, ptr %sel, align 4\n  ret void\n}",
+          "source_program": "define void @store_select_with_unknown(i1 %cond, ptr %p, ptr %p2) {\n  %sel = select i1 %cond, ptr %p, ptr %p2\n  store i32 0, ptr %sel, align 4\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

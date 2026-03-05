@@ -777,10 +777,21 @@ def get_hunk_from_func(env: Env, file_path: str, func_name: str) -> tuple[str, s
     return None
 
 
+def get_functions_from_hint(bug_funcs: dict) -> list[tuple[str, str]]:
+    """Build (file_path, func_name) list from dataset hint (gold_funcs)."""
+    if not bug_funcs:
+        return []
+    return [
+        (file_path, func_name)
+        for file_path, func_list in bug_funcs.items()
+        for func_name in func_list
+    ]
+
+
 def get_functions_to_try(issue_id: str) -> list[tuple[str, str]]:
     pred_funcs, gold_funcs, gold_file = load_func_info_from_json(issue_id)
     
-    # If no pred_funcs found, return empty list (will fall back to original method)
+    # If no pred_funcs found, return empty list (caller may fall back to gold/hint)
     if not pred_funcs:
         return []
     
@@ -1346,8 +1357,12 @@ def fix_issue(issue_id):
     # # Some case can pass check fast directly, these test cases are skipped.
     # assert not res, "Could pass check fast directly without fix."
     
-    # Get functions to try from JSON
+    # Get functions to try from JSON (localization); fall back to gold/hint if not found
     functions_to_try = get_functions_to_try(issue_id)
+    if not functions_to_try:
+        functions_to_try = get_functions_from_hint(bug_funcs)
+        if functions_to_try:
+            print(f"Using gold/hint functions for {issue_id} (no localization file)")
     
     if len(functions_to_try) != 1:
         print(f"Skipping {issue_id}: expected exactly 1 candidate function, got {len(functions_to_try)}")
@@ -1506,38 +1521,20 @@ if not _cli_positional:
             [
                 f
                 for f in os.listdir(llvm_helper.dataset_dir)
-                if f.endswith(".json") and "orig" in f
+                if f.endswith(".json")
             ],
         )
     )
 else:
-    input_id = _cli_positional[0].strip()
+    input_id = _cli_positional[0].strip().removesuffix(".json")
     if input_id:
-        if input_id.endswith("-orig"):
-            cand = input_id
-            cand_file = cand + ".json"
-            cand_path = os.path.join(llvm_helper.dataset_dir, cand_file)
-            if os.path.exists(cand_path):
-                task_list = [cand]
-            else:
-                print(f"[WARN] {cand_file} not found in {llvm_helper.dataset_dir}, skipping")
-                task_list = []
+        cand_file = input_id + ".json"
+        cand_path = os.path.join(llvm_helper.dataset_dir, cand_file)
+        if os.path.exists(cand_path):
+            task_list = [input_id]
         else:
-            orig_cand = f"{input_id}-orig"
-            orig_file = orig_cand + ".json"
-            orig_path = os.path.join(llvm_helper.dataset_dir, orig_file)
-            plain_path = os.path.join(llvm_helper.dataset_dir, input_id + ".json")
-            if os.path.exists(orig_path) and os.path.exists(plain_path):
-                print(
-                    f"[WARN] Found {orig_file}; skip {input_id}. "
-                    "Please pass the -orig id to avoid duplicates."
-                )
-                task_list = []
-            elif os.path.exists(orig_path):
-                task_list = [orig_cand]
-            else:
-                print(f"[WARN] {orig_file} not found in {llvm_helper.dataset_dir}, skipping")
-                task_list = []
+            print(f"[WARN] {cand_file} not found in {llvm_helper.dataset_dir}, skipping")
+            task_list = []
 
 if DEBUG:
     task_list = [issue_id_debug]

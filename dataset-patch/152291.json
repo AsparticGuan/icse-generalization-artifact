@@ -1,0 +1,75 @@
+{
+  "pr_number": 152291,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/152291",
+  "title": "[InstCombine] optimize unnecessary sext instruction with add + cmp",
+  "commit_sha": "9248064baf7bb9bce0d214d7a6fe94bc207a15d2",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          6381,
+          6386
+        ],
+        [
+          7727,
+          7732
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          744,
+          749
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpWithZextOrSext",
+        "InstCombinerImpl::visitICmpInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex cf94d28100488..f170d8ba2512a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -6381,6 +6381,107 @@ Instruction *InstCombinerImpl::foldICmpWithZextOrSext(ICmpInst &ICmp) {\n   return new ICmpInst(CmpInst::ICMP_SLT, X, Constant::getNullValue(SrcTy));\n }\n \n+Instruction *InstCombinerImpl::foldICmpWithSextAndAdd(ICmpInst &ICmp) {\n+  Value *X;\n+  Value *Y, *Z;\n+  // Match the pattern: icmp ult (add (sext X), Y), Z\n+  // where X is a value, Y and Z are integer constants\n+  // icmp ult (add(sext(X), Y)), Z  -> icmp ult (add(X, Y)), Z\n+  if (match(&ICmp, m_SpecificICmp(CmpInst::ICMP_ULT,\n+                                  m_Add(m_SExt(m_Value(X)), m_Value(Y)),\n+                                  m_Value(Z)))) {\n+    Type *XType = X->getType();\n+    if (!XType->isIntegerTy())\n+      return nullptr;\n+\n+    unsigned XBitWidth = XType->getIntegerBitWidth();\n+    auto ExtractValue = [&](Value *V, Type *TargetType,\n+                            int64_t &OutValue) -> Value * {\n+      if (auto *C = dyn_cast<ConstantInt>(V)) {\n+        OutValue = C->getSExtValue();\n+        return ConstantInt::get(TargetType, OutValue);\n+      }\n+      if (match(V, m_SExt(m_Value()))) {\n+        Value *Src = cast<SExtInst>(V)->getOperand(0);\n+        if (Src->getType() == TargetType)\n+          return Src;\n+      }\n+      return nullptr;\n+    };\n+\n+    int64_t YValue, ZValue;\n+    Value *NewY = ExtractValue(Y, XType, YValue);\n+    Value *NewZ = ExtractValue(Z, XType, ZValue);\n+    if (!NewY || !NewZ)\n+      return nullptr;\n+\n+    bool IsYVariable = match(Y, m_SExt(m_Value()));\n+    bool IsYOrZVariable =\n+        match(Y, m_SExt(m_Value())) || match(Z, m_SExt(m_Value()));\n+    if (IsYOrZVariable) {\n+      bool FoundCondition = false;\n+      BasicBlock *BB = ICmp.getParent();\n+      for (Instruction &I : *BB) {\n+        if (auto *Assume = dyn_cast<IntrinsicInst>(&I)) {\n+          if (Assume->getIntrinsicID() == Intrinsic::assume) {\n+            Value *Cond = Assume->getOperand(0);\n+            ConstantInt *C, *C2;\n+            unsigned CommonWidth = Z->getType()->getIntegerBitWidth();\n+            APInt MaxValue(CommonWidth, 1);\n+            MaxValue <<= (XBitWidth - 1);\n+            APInt Limit = MaxValue;\n+            Limit += 1;\n+            // if both \"Y\" and \"Z\" are variables, Op would be \"Sub\"\n+            if (match(Cond, m_SpecificICmp(\n+                                CmpInst::ICMP_ULT,\n+                                m_Sub(m_SExt(m_Value(Y)), m_SExt(m_Value(Z))),\n+                                m_ConstantInt(C))) ||\n+                match(Cond,\n+                      m_SpecificICmp(CmpInst::ICMP_ULT,\n+                                     m_Add(m_SExt(m_Value(Y)), m_Value(Z)),\n+                                     m_ConstantInt(C)))) {\n+              if (C->getValue().ugt(Limit))\n+                return nullptr;\n+\n+              FoundCondition = true;\n+              if (Assume->use_empty()) {\n+                eraseInstFromFunction(*Assume);\n+              }\n+              break;\n+            }\n+            if (!IsYVariable &&\n+                match(Cond, m_SpecificICmp(CmpInst::ICMP_ULT,\n+                                           m_Add(m_Value(Z), m_ConstantInt(C2)),\n+                                           m_ConstantInt(C)))) {\n+              auto *K = llvm::dyn_cast<llvm::ConstantInt>(Y);\n+              if ((C2->getValue().sextOrTrunc(CommonWidth) -\n+                   C->getValue().sextOrTrunc(CommonWidth))\n+                      .slt(K->getValue() - Limit))\n+                return nullptr;\n+\n+              FoundCondition = true;\n+              if (Assume->use_empty()) {\n+                eraseInstFromFunction(*Assume);\n+              }\n+              break;\n+            }\n+          }\n+        }\n+      }\n+      if (!FoundCondition)\n+        return nullptr;\n+    } else {\n+      auto MaxValue = (1LL << (XBitWidth - 1));\n+      if (YValue - ZValue > MaxValue || YValue - ZValue < -MaxValue)\n+        return nullptr;\n+    }\n+\n+    Value *NewAdd = Builder.CreateAdd(X, NewY);\n+    return new ICmpInst(CmpInst::ICMP_ULT, NewAdd, NewZ);\n+  }\n+  return nullptr;\n+}\n+\n /// Handle icmp (cast x), (cast or constant).\n Instruction *InstCombinerImpl::foldICmpWithCastOp(ICmpInst &ICmp) {\n   // If any operand of ICmp is a inttoptr roundtrip cast then remove it as\n@@ -7727,6 +7828,10 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {\n     }\n   }\n \n+  if (Instruction *Res = foldICmpWithSextAndAdd(I)) {\n+    return Res;\n+  }\n+\n   // In case of a comparison with two select instructions having the same\n   // condition, check whether one of the resulting branches can be simplified.\n   // If so, just compare the other branch and select the appropriate result.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex c67e27e5b3e7c..ed652720f0dac 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -744,6 +744,7 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n                                      const APInt &C);\n   Instruction *foldICmpTruncWithTruncOrExt(ICmpInst &Cmp,\n                                            const SimplifyQuery &Q);\n+  Instruction *foldICmpWithSextAndAdd(ICmpInst &ICmp);\n   Instruction *foldICmpAndConstant(ICmpInst &Cmp, BinaryOperator *And,\n                                    const APInt &C);\n   Instruction *foldICmpXorConstant(ICmpInst &Cmp, BinaryOperator *Xor,\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/icmp-add.ll b/llvm/test/Transforms/InstCombine/icmp-add.ll\nindex 1a41c1f3e1045..df85f5a3caa65 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-add.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-add.ll\n@@ -3259,9 +3259,8 @@ define i1 @zext_range_check_mergable(i8 %x) {\n define i1 @sext_range_check_ult(i8 %x) {\n ; CHECK-LABEL: @sext_range_check_ult(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[CONV:%.*]] = sext i8 [[X:%.*]] to i32\n-; CHECK-NEXT:    [[ADD:%.*]] = add nsw i32 [[CONV]], -4\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[ADD]], 3\n+; CHECK-NEXT:    [[TMP0:%.*]] = add i8 [[X:%.*]], -4\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i8 [[TMP0]], 3\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n entry:\ndiff --git a/llvm/test/Transforms/InstCombine/sext_for_add_cmp.ll b/llvm/test/Transforms/InstCombine/sext_for_add_cmp.ll\nnew file mode 100644\nindex 0000000000000..b8617df750abb\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/sext_for_add_cmp.ll\n@@ -0,0 +1,16 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 5\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+define i1 @sext_add_cmp_to_add_cmp(i16 noundef %x) {\n+; CHECK-LABEL: define i1 @sext_add_cmp_to_add_cmp(\n+; CHECK-SAME: i16 noundef [[X:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[TMP0:%.*]] = add i16 [[X]], 128\n+; CHECK-NEXT:    [[OR_COND_I:%.*]] = icmp ult i16 [[TMP0]], 256\n+; CHECK-NEXT:    ret i1 [[OR_COND_I]]\n+;\n+entry:\n+  %conv = sext i16 %x to i128\n+  %add = add i128 %conv, 128\n+  %or.cond.i = icmp ult i128 %add, 256\n+  ret i1 %or.cond.i\n+}\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/icmp-add.ll",
+    "llvm/test/Transforms/InstCombine/sext_for_add_cmp.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/sext_for_add_cmp.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "sext_add_cmp_to_add_cmp",
+          "test_body": "define i1 @sext_add_cmp_to_add_cmp(i16 noundef %x) {\n; CHECK-LABEL: define i1 @sext_add_cmp_to_add_cmp(\n; CHECK-SAME: i16 noundef [[X:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[CONV:%.*]] = sext i16 [[X]] to i128\n; CHECK-NEXT:    [[ADD:%.*]] = add nsw i128 [[CONV]], 128\n; CHECK-NEXT:    [[OR_COND_I:%.*]] = icmp ult i128 [[ADD]], 256\n; CHECK-NEXT:    ret i1 [[OR_COND_I]]\nentry:\n  %conv = sext i16 %x to i128\n  %add = add i128 %conv, 128\n  %or.cond.i = icmp ult i128 %add, 256\n  ret i1 %or.cond.i\n}",
+          "source_program": "define i1 @sext_add_cmp_to_add_cmp(i16 noundef %x) {\nentry:\n  %conv = sext i16 %x to i128\n  %add = add i128 %conv, 128\n  %or.cond.i = icmp ult i128 %add, 256\n  ret i1 %or.cond.i\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

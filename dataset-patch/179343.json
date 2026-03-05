@@ -1,0 +1,125 @@
+{
+  "pr_number": 179343,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179343",
+  "title": "[InstCombine] Extend canonicalization of addition to positive numbers",
+  "commit_sha": "4a4d8590383f7d60cc1a37b82316d97e28c7f348",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          1147,
+          1185
+        ],
+        [
+          1187,
+          1197
+        ],
+        [
+          1205,
+          1217
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "canonicalizeSaturatedAddSigned"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex fb30a4545cffe..62ace0474ed7c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1147,39 +1147,48 @@ static Value *canonicalizeSaturatedAddSigned(ICmpInst *Cmp, Value *TVal,\n   Value *Cmp0 = Cmp->getOperand(0);\n   Value *Cmp1 = Cmp->getOperand(1);\n   ICmpInst::Predicate Pred = Cmp->getPredicate();\n-  Value *X;\n-  const APInt *C;\n \n-  // Canonicalize INT_MAX to true value of the select.\n-  if (match(FVal, m_MaxSignedValue())) {\n+  // Canonicalize TVal to be the saturation constant.\n+  if (match(FVal, m_MaxSignedValue()) || match(FVal, m_SignMask())) {\n     std::swap(TVal, FVal);\n     Pred = CmpInst::getInversePredicate(Pred);\n   }\n \n-  if (!match(TVal, m_MaxSignedValue()))\n+  const APInt *SatC;\n+  if (!match(TVal, m_APInt(SatC)) ||\n+      !(SatC->isMaxSignedValue() || SatC->isSignMask()))\n     return nullptr;\n \n+  bool IsMax = SatC->isMaxSignedValue();\n+\n   // sge maximum signed value is canonicalized to eq maximum signed value and\n-  // requires special handling (a == INT_MAX) ? INT_MAX : a + 1 -> sadd.sat(a,\n-  // 1)\n-  if (Pred == ICmpInst::ICMP_EQ) {\n-    if (match(FVal, m_Add(m_Specific(Cmp0), m_One())) && Cmp1 == TVal) {\n+  // requires special handling. sle minimum signed value is similarly\n+  // canonicalized to eq minimum signed value.\n+  if (Pred == ICmpInst::ICMP_EQ && Cmp1 == TVal) {\n+    // (a == INT_MAX) ? INT_MAX : a + 1 -> sadd.sat(a, 1)\n+    if (IsMax && match(FVal, m_Add(m_Specific(Cmp0), m_One()))) {\n       return Builder.CreateBinaryIntrinsic(\n           Intrinsic::sadd_sat, Cmp0, ConstantInt::get(Cmp0->getType(), 1));\n     }\n+\n+    // (a == INT_MIN) ? INT_MIN : a + -1 -> sadd.sat(a, -1)\n+    if (!IsMax && match(FVal, m_Add(m_Specific(Cmp0), m_AllOnes()))) {\n+      return Builder.CreateBinaryIntrinsic(\n+          Intrinsic::sadd_sat, Cmp0,\n+          ConstantInt::getAllOnesValue(Cmp0->getType()));\n+    }\n     return nullptr;\n   }\n \n+  const APInt *C;\n+\n   // (X > Y) ? INT_MAX : (X + C) --> sadd.sat(X, C)\n   // (X >= Y) ? INT_MAX : (X + C) --> sadd.sat(X, C)\n-  // where Y is INT_MAX - C or INT_MAX - C - 1, and C > 0\n-  if ((Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE) &&\n+  // where C > 0 and Y is INT_MAX - C or INT_MAX - C - 1\n+  if (IsMax && (Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE) &&\n       isa<Constant>(Cmp1) &&\n       match(FVal, m_Add(m_Specific(Cmp0), m_StrictlyPositive(C)))) {\n-    APInt IntMax =\n-        APInt::getSignedMaxValue(Cmp1->getType()->getScalarSizeInBits());\n-\n-    // For SGE, try to flip to SGT to normalize the comparison constant.\n+    // Normalize SGE to SGT for threshold comparison.\n     if (Pred == ICmpInst::ICMP_SGE) {\n       if (auto Flipped = getFlippedStrictnessPredicateAndConstant(\n               Pred, cast<Constant>(Cmp1))) {\n@@ -1187,11 +1196,35 @@ static Value *canonicalizeSaturatedAddSigned(ICmpInst *Cmp, Value *TVal,\n         Cmp1 = Flipped->second;\n       }\n     }\n-\n-    // Check the pattern: X > INT_MAX - C or X > INT_MAX - C - 1\n+    // Check: X > INT_MAX - C or X > INT_MAX - C - 1\n+    APInt Threshold = *SatC - *C;\n     if (Pred == ICmpInst::ICMP_SGT &&\n-        (match(Cmp1, m_SpecificIntAllowPoison(IntMax - *C)) ||\n-         match(Cmp1, m_SpecificIntAllowPoison(IntMax - *C - 1))))\n+        (match(Cmp1, m_SpecificIntAllowPoison(Threshold)) ||\n+         match(Cmp1, m_SpecificIntAllowPoison(Threshold - 1))))\n+      return Builder.CreateBinaryIntrinsic(\n+          Intrinsic::sadd_sat, Cmp0, ConstantInt::get(Cmp0->getType(), *C));\n+  }\n+\n+  // (X < Y) ? INT_MIN : (X + C) --> sadd.sat(X, C)\n+  // (X <= Y) ? INT_MIN : (X + C) --> sadd.sat(X, C)\n+  // where C < 0 and Y is INT_MIN - C or INT_MIN - C + 1\n+  if (!IsMax && (Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE) &&\n+      isa<Constant>(Cmp1) &&\n+      match(FVal, m_Add(m_Specific(Cmp0), m_Negative(C)))) {\n+    // Normalize SLE to SLT for threshold comparison.\n+    if (Pred == ICmpInst::ICMP_SLE) {\n+      if (auto Flipped = getFlippedStrictnessPredicateAndConstant(\n+              Pred, cast<Constant>(Cmp1))) {\n+        Pred = Flipped->first;\n+        Cmp1 = Flipped->second;\n+      }\n+    }\n+    // Check: X < INT_MIN - C or X < INT_MIN - C + 1\n+    // INT_MIN - C for negative C is like INT_MIN + |C|\n+    APInt Threshold = *SatC - *C;\n+    if (Pred == ICmpInst::ICMP_SLT &&\n+        (match(Cmp1, m_SpecificIntAllowPoison(Threshold)) ||\n+         match(Cmp1, m_SpecificIntAllowPoison(Threshold + 1))))\n       return Builder.CreateBinaryIntrinsic(\n           Intrinsic::sadd_sat, Cmp0, ConstantInt::get(Cmp0->getType(), *C));\n   }\n@@ -1205,13 +1238,24 @@ static Value *canonicalizeSaturatedAddSigned(ICmpInst *Cmp, Value *TVal,\n   if (Pred != ICmpInst::ICMP_SLT && Pred != ICmpInst::ICMP_SLE)\n     return nullptr;\n \n-  if (match(Cmp0, m_NSWSub(m_MaxSignedValue(), m_Value(X))) &&\n+  Value *X;\n+\n+  // (INT_MAX - X s< Y) ? INT_MAX : (X + Y) --> sadd.sat(X, Y)\n+  // (INT_MAX - X s< Y) ? INT_MAX : (Y + X) --> sadd.sat(X, Y)\n+  if (IsMax && match(Cmp0, m_NSWSub(m_SpecificInt(*SatC), m_Value(X))) &&\n       match(FVal, m_c_Add(m_Specific(X), m_Specific(Cmp1)))) {\n-    // (INT_MAX - X s< Y) ? INT_MAX : (X + Y) --> sadd.sat(X, Y)\n-    // (INT_MAX - X s< Y) ? INT_MAX : (Y + X) --> sadd.sat(X, Y)\n     return Builder.CreateBinaryIntrinsic(Intrinsic::sadd_sat, X, Cmp1);\n   }\n \n+  // (INT_MIN - X s> Y) ? INT_MIN : (X + Y) --> sadd.sat(X, Y)\n+  // (INT_MIN - X s> Y) ? INT_MIN : (Y + X) --> sadd.sat(X, Y)\n+  // After swapping operands from the SGT/SGE canonicalization above,\n+  // this becomes (Y s< INT_MIN - X).\n+  if (!IsMax && match(Cmp1, m_NSWSub(m_SpecificInt(*SatC), m_Value(X))) &&\n+      match(FVal, m_c_Add(m_Specific(X), m_Specific(Cmp0)))) {\n+    return Builder.CreateBinaryIntrinsic(Intrinsic::sadd_sat, X, Cmp0);\n+  }\n+\n   return nullptr;\n }\n \n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/saturating-add-sub.ll b/llvm/test/Transforms/InstCombine/saturating-add-sub.ll\nindex 80676de47f193..efa89db4af61a 100644\n--- a/llvm/test/Transforms/InstCombine/saturating-add-sub.ll\n+++ b/llvm/test/Transforms/InstCombine/saturating-add-sub.ll\n@@ -2708,6 +2708,141 @@ define i8 @neg_neg_constant(i8 %x, i8 %y) {\n   ret i8 %s\n }\n \n+;\n+; Negative constant signed saturated add - saturates to INT_MIN\n+;\n+\n+; Basic pattern: (x <= threshold) ? INT_MIN : (x + C) where C < 0\n+; threshold should be INT_MIN - C or INT_MIN - C + 1\n+\n+; (x <= -119) ? -128 : (x + -10) --> sadd.sat(x, -10)\n+define i8 @sadd_sat_neg_constant(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -10)\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sle i8 %x, -119\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; (x < -118) ? -128 : (x + -10) --> sadd.sat(x, -10)\n+define i8 @sadd_sat_neg_constant_slt(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_slt(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -10)\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp slt i8 %x, -118\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; Commuted select: (x >= threshold) ? (x + C) : INT_MIN --> sadd.sat(x, C)\n+define i8 @sadd_sat_neg_constant_commuted_select(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_commuted_select(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -10)\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sge i8 %x, -118\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 %add, i8 -128\n+  ret i8 %r\n+}\n+\n+; sle minimum signed value is canonicalized to eq and requires special handling\n+; (x == INT_MIN) ? INT_MIN : x + -1 --> sadd.sat(x, -1)\n+define i8 @sadd_sat_eq_int_min(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_eq_int_min(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -1)\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp eq i8 %x, -128\n+  %add = add i8 %x, -1\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; Vector version of negative constant pattern\n+define <2 x i8> @sadd_sat_neg_constant_vector(<2 x i8> %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_vector(\n+; CHECK-NEXT:    [[R:%.*]] = call <2 x i8> @llvm.sadd.sat.v2i8(<2 x i8> [[X:%.*]], <2 x i8> splat (i8 -10))\n+; CHECK-NEXT:    ret <2 x i8> [[R]]\n+;\n+  %cmp = icmp sle <2 x i8> %x, <i8 -119, i8 -119>\n+  %add = add <2 x i8> %x, <i8 -10, i8 -10>\n+  %r = select <2 x i1> %cmp, <2 x i8> <i8 -128, i8 -128>, <2 x i8> %add\n+  ret <2 x i8> %r\n+}\n+\n+; Pattern with variable: (INT_MIN - X > Y) ? INT_MIN : (X + Y) with nsw sub\n+define i8 @sadd_sat_int_min_minus_x_nsw(i8 %x, i8 %y) {\n+; CHECK-LABEL: @sadd_sat_int_min_minus_x_nsw(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 [[Y:%.*]])\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %sub = sub nsw i8 -128, %x\n+  %cmp = icmp sgt i8 %sub, %y\n+  %add = add i8 %x, %y\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; Negative test: wrong saturation value\n+define i8 @sadd_sat_neg_constant_wrong_sat_value(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_wrong_sat_value(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -118\n+; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], -10\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -127, i8 [[ADD]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sle i8 %x, -119\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 -127, i8 %add\n+  ret i8 %r\n+}\n+\n+; Boundary case: threshold allows exact match at the saturation limit\n+define i8 @sadd_sat_neg_constant_boundary(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_boundary(\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -10)\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sle i8 %x, -118\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; Negative test: threshold too high\n+define i8 @sadd_sat_neg_constant_wrong_threshold(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_constant_wrong_threshold(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -116\n+; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], -10\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sle i8 %x, -117\n+  %add = add i8 %x, -10\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n+; Negative test: positive constant (should use INT_MAX saturation, not INT_MIN)\n+define i8 @sadd_sat_neg_pattern_positive_constant(i8 %x) {\n+; CHECK-LABEL: @sadd_sat_neg_pattern_positive_constant(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -118\n+; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], 10\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %cmp = icmp sle i8 %x, -119\n+  %add = add i8 %x, 10\n+  %r = select i1 %cmp, i8 -128, i8 %add\n+  ret i8 %r\n+}\n+\n ; Make sure we don't crash in this case.\n define i32 @pr153053_strict_pred_with_nonconstant_rhs(i32 %x, i32 %y) {\n ; CHECK-LABEL: @pr153053_strict_pred_with_nonconstant_rhs(\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/saturating-add-sub.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/saturating-add-sub.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "neg_neg_constant",
+          "test_body": "define i8 @neg_neg_constant(i8 %x, i8 %y) {\n; CHECK-LABEL: @neg_neg_constant(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.smin.i8(i8 [[X:%.*]], i8 -1)\n; CHECK-NEXT:    [[S:%.*]] = and i8 [[TMP1]], 127\n; CHECK-NEXT:    ret i8 [[S]]\n  %cmp = icmp sgt i8 %x, -2\n  %d = add i8 %x, -128\n  %s = select i1 %cmp, i8 127, i8 %d\n  ret i8 %s\n}",
+          "source_program": "define i8 @neg_neg_constant(i8 %x, i8 %y) {\n  %cmp = icmp sgt i8 %x, -2\n  %d = add i8 %x, -128\n  %s = select i1 %cmp, i8 127, i8 %d\n  ret i8 %s\n}\n"
+        },
+        {
+          "test_name": "pr153053_strict_pred_with_nonconstant_rhs",
+          "test_body": "define i32 @pr153053_strict_pred_with_nonconstant_rhs(i32 %x, i32 %y) {\n; CHECK-LABEL: @pr153053_strict_pred_with_nonconstant_rhs(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[X]], 1\n; CHECK-NEXT:    [[RES:%.*]] = select i1 [[CMP]], i32 [[ADD]], i32 2147483647\n; CHECK-NEXT:    ret i32 [[RES]]\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %add = add i32 %x, 1\n  %res = select i1 %cmp, i32 %add, i32 2147483647\n  ret i32 %res\n}",
+          "source_program": "define i32 @pr153053_strict_pred_with_nonconstant_rhs(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %add = add i32 %x, 1\n  %res = select i1 %cmp, i32 %add, i32 2147483647\n  ret i32 %res\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_eq_int_min",
+          "test_body": "define i8 @sadd_sat_eq_int_min(i8 %x) {\n; CHECK-LABEL: @sadd_sat_eq_int_min(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[X:%.*]], -128\n; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], -1\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp eq i8 %x, -128\n  %add = add i8 %x, -1\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_eq_int_min(i8 %x) {\n  %cmp = icmp eq i8 %x, -128\n  %add = add i8 %x, -1\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_int_min_minus_x_nsw",
+          "test_body": "define i8 @sadd_sat_int_min_minus_x_nsw(i8 %x, i8 %y) {\n; CHECK-LABEL: @sadd_sat_int_min_minus_x_nsw(\n; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 -128, [[X:%.*]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[SUB]], [[Y:%.*]]\n; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], [[Y]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %sub = sub nsw i8 -128, %x\n  %cmp = icmp sgt i8 %sub, %y\n  %add = add i8 %x, %y\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_int_min_minus_x_nsw(i8 %x, i8 %y) {\n  %sub = sub nsw i8 -128, %x\n  %cmp = icmp sgt i8 %sub, %y\n  %add = add i8 %x, %y\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant",
+          "test_body": "define i8 @sadd_sat_neg_constant(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.smax.i8(i8 [[X:%.*]], i8 -118)\n; CHECK-NEXT:    [[R:%.*]] = add nsw i8 [[TMP1]], -10\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant(i8 %x) {\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_boundary",
+          "test_body": "define i8 @sadd_sat_neg_constant_boundary(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_boundary(\n; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.sadd.sat.i8(i8 [[X:%.*]], i8 -10)\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sle i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant_boundary(i8 %x) {\n  %cmp = icmp sle i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_commuted_select",
+          "test_body": "define i8 @sadd_sat_neg_constant_commuted_select(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_commuted_select(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.smax.i8(i8 [[X:%.*]], i8 -118)\n; CHECK-NEXT:    [[R:%.*]] = add nsw i8 [[TMP1]], -10\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sge i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 %add, i8 -128\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant_commuted_select(i8 %x) {\n  %cmp = icmp sge i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 %add, i8 -128\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_slt",
+          "test_body": "define i8 @sadd_sat_neg_constant_slt(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_slt(\n; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.smax.i8(i8 [[X:%.*]], i8 -118)\n; CHECK-NEXT:    [[R:%.*]] = add nsw i8 [[TMP1]], -10\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp slt i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant_slt(i8 %x) {\n  %cmp = icmp slt i8 %x, -118\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_vector",
+          "test_body": "define <2 x i8> @sadd_sat_neg_constant_vector(<2 x i8> %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_vector(\n; CHECK-NEXT:    [[TMP1:%.*]] = call <2 x i8> @llvm.smax.v2i8(<2 x i8> [[X:%.*]], <2 x i8> splat (i8 -118))\n; CHECK-NEXT:    [[R:%.*]] = add nsw <2 x i8> [[TMP1]], splat (i8 -10)\n; CHECK-NEXT:    ret <2 x i8> [[R]]\n  %cmp = icmp sle <2 x i8> %x, <i8 -119, i8 -119>\n  %add = add <2 x i8> %x, <i8 -10, i8 -10>\n  %r = select <2 x i1> %cmp, <2 x i8> <i8 -128, i8 -128>, <2 x i8> %add\n  ret <2 x i8> %r\n}",
+          "source_program": "define <2 x i8> @sadd_sat_neg_constant_vector(<2 x i8> %x) {\n  %cmp = icmp sle <2 x i8> %x, <i8 -119, i8 -119>\n  %add = add <2 x i8> %x, <i8 -10, i8 -10>\n  %r = select <2 x i1> %cmp, <2 x i8> <i8 -128, i8 -128>, <2 x i8> %add\n  ret <2 x i8> %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_wrong_sat_value",
+          "test_body": "define i8 @sadd_sat_neg_constant_wrong_sat_value(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_wrong_sat_value(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -118\n; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], -10\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -127, i8 [[ADD]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -127, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant_wrong_sat_value(i8 %x) {\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -127, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_constant_wrong_threshold",
+          "test_body": "define i8 @sadd_sat_neg_constant_wrong_threshold(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_constant_wrong_threshold(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -116\n; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], -10\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sle i8 %x, -117\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_constant_wrong_threshold(i8 %x) {\n  %cmp = icmp sle i8 %x, -117\n  %add = add i8 %x, -10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_neg_pattern_positive_constant",
+          "test_body": "define i8 @sadd_sat_neg_pattern_positive_constant(i8 %x) {\n; CHECK-LABEL: @sadd_sat_neg_pattern_positive_constant(\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X:%.*]], -118\n; CHECK-NEXT:    [[ADD:%.*]] = add i8 [[X]], 10\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[CMP]], i8 -128, i8 [[ADD]]\n; CHECK-NEXT:    ret i8 [[R]]\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, 10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}",
+          "source_program": "define i8 @sadd_sat_neg_pattern_positive_constant(i8 %x) {\n  %cmp = icmp sle i8 %x, -119\n  %add = add i8 %x, 10\n  %r = select i1 %cmp, i8 -128, i8 %add\n  ret i8 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

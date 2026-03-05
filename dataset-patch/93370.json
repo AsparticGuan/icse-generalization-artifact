@@ -1,0 +1,77 @@
+{
+  "pr_number": 93370,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/93370",
+  "title": "[InstCombine] Canonicalize manual signed mul overflows",
+  "commit_sha": "74da1ef6cae597da7f12d9c6133f94cab9473afe",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          6286,
+          6291
+        ],
+        [
+          7531,
+          7536
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::visitICmpInst",
+        "processUMulZExtIdiom"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex abadf54a96767..1224ddd7ee6e5 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -6286,6 +6286,172 @@ static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n   return ExtractValueInst::Create(Call, 1);\n }\n \n+/// Recognize and process idiom involving test for multiplication\n+/// overflow.\n+///\n+/// The caller has matched a pattern of the form:\n+///   I = cmp u add (mul(sext A, sext B), V, W\n+/// The function checks if this is a test for overflow and if so replaces\n+/// multiplication with call to 'mul.with.overflow' intrinsic.\n+///\n+/// \\param I Compare instruction.\n+/// \\param MulVal Result of 'mult' instruction.  It is one of the arguments of\n+///               the compare instruction.  Must be of integer type.\n+/// \\param OtherVal The other argument of compare instruction.\n+/// \\returns Instruction which must replace the compare instruction, NULL if no\n+///          replacement required.\n+static Instruction *processSMulSExtIdiom(ICmpInst &I, Value *MulVal,\n+                                         const APInt *AddVal,\n+                                         const APInt *OtherVal,\n+                                         InstCombinerImpl &IC) {\n+  // Don't bother doing this transformation for pointers, don't do it for\n+  // vectors.\n+  if (!isa<IntegerType>(MulVal->getType()))\n+    return nullptr;\n+\n+  auto *MulInstr = dyn_cast<Instruction>(MulVal);\n+  if (!MulInstr)\n+    return nullptr;\n+  assert(MulInstr->getOpcode() == Instruction::Mul);\n+\n+  auto *LHS = cast<SExtInst>(MulInstr->getOperand(0)),\n+       *RHS = cast<SExtInst>(MulInstr->getOperand(1));\n+  assert(LHS->getOpcode() == Instruction::SExt);\n+  assert(RHS->getOpcode() == Instruction::SExt);\n+  Value *A = LHS->getOperand(0), *B = RHS->getOperand(0);\n+\n+  // Calculate type and width of the result produced by mul.with.overflow.\n+  Type *TyA = A->getType(), *TyB = B->getType();\n+  unsigned WidthA = TyA->getPrimitiveSizeInBits(),\n+           WidthB = TyB->getPrimitiveSizeInBits();\n+  unsigned MulWidth;\n+  Type *MulType;\n+  if (WidthB > WidthA) {\n+    MulWidth = WidthB;\n+    MulType = TyB;\n+  } else {\n+    MulWidth = WidthA;\n+    MulType = TyA;\n+  }\n+\n+  // In order to replace the original mul with a narrower mul.with.overflow,\n+  // all uses must ignore upper bits of the product.  The number of used low\n+  // bits must be not greater than the width of mul.with.overflow.\n+  if (MulVal->hasNUsesOrMore(2))\n+    for (User *U : MulVal->users()) {\n+      if (U == &I)\n+        continue;\n+      if (TruncInst *TI = dyn_cast<TruncInst>(U)) {\n+        // Check if truncation ignores bits above MulWidth.\n+        unsigned TruncWidth = TI->getType()->getPrimitiveSizeInBits();\n+        if (TruncWidth > MulWidth)\n+          return nullptr;\n+      } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(U)) {\n+        // Check if AND ignores bits above MulWidth.\n+        if (BO->getOpcode() != Instruction::And)\n+          return nullptr;\n+        if (ConstantInt *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {\n+          const APInt &CVal = CI->getValue();\n+          if (CVal.getBitWidth() - CVal.countl_zero() > MulWidth)\n+            return nullptr;\n+        } else {\n+          // In this case we could have the operand of the binary operation\n+          // being defined in another block, and performing the replacement\n+          // could break the dominance relation.\n+          return nullptr;\n+        }\n+      } else {\n+        // Other uses prohibit this transformation.\n+        return nullptr;\n+      }\n+    }\n+\n+  // Recognize patterns\n+  bool IsInverse = false;\n+  switch (I.getPredicate()) {\n+  case ICmpInst::ICMP_ULT: {\n+    // Recognize pattern:\n+    //   mulval = mul(sext A, sext B)\n+    //   addval = add (mulval, min)\n+    //   cmp ult addval, -min * 2 + 1\n+    APInt MinVal = APInt::getSignedMinValue(MulWidth);\n+    MinVal = MinVal.sext(OtherVal->getBitWidth());\n+    APInt MinMinVal = APInt::getSignedMinValue(MulWidth + 1);\n+    MinMinVal = MinMinVal.sext(OtherVal->getBitWidth());\n+    if (MinVal.eq(*AddVal) && MinMinVal.eq(*OtherVal))\n+      break; // Recognized\n+\n+    // Recognize pattern:\n+    //   mulval = mul(sext A, sext B)\n+    //   addval = add (mulval, signedMax)\n+    //   cmp ult addval, unsignedMax\n+    APInt MaxVal = APInt::getSignedMaxValue(MulWidth);\n+    MaxVal = MaxVal.zext(OtherVal->getBitWidth()) + 1;\n+    APInt MaxMaxVal = APInt::getMaxValue(MulWidth);\n+    MaxMaxVal = MaxMaxVal.zext(OtherVal->getBitWidth()) + 1;\n+    if (MaxVal.eq(*AddVal) && MaxMaxVal.eq(*OtherVal)) {\n+      IsInverse = true;\n+      break; // Recognized\n+    }\n+    return nullptr;\n+  }\n+\n+  default:\n+    return nullptr;\n+  }\n+\n+  InstCombiner::BuilderTy &Builder = IC.Builder;\n+  Builder.SetInsertPoint(MulInstr);\n+\n+  // Replace: mul(sext A, sext B) --> mul.with.overflow(A, B)\n+  Value *MulA = A, *MulB = B;\n+  if (WidthA < MulWidth)\n+    MulA = Builder.CreateSExt(A, MulType);\n+  if (WidthB < MulWidth)\n+    MulB = Builder.CreateSExt(B, MulType);\n+  Function *F = Intrinsic::getDeclaration(\n+      I.getModule(), Intrinsic::smul_with_overflow, MulType);\n+  CallInst *Call = Builder.CreateCall(F, {MulA, MulB}, \"smul\");\n+  IC.addToWorklist(MulInstr);\n+\n+  // If there are uses of mul result other than the comparison, we know that\n+  // they are truncation or binary AND. Change them to use result of\n+  // mul.with.overflow and adjust properly mask/size.\n+  if (MulVal->hasNUsesOrMore(2)) {\n+    Value *Mul = Builder.CreateExtractValue(Call, 0, \"smul.value\");\n+    for (User *U : make_early_inc_range(MulVal->users())) {\n+      if (U == &I)\n+        continue;\n+      if (TruncInst *TI = dyn_cast<TruncInst>(U)) {\n+        if (TI->getType()->getPrimitiveSizeInBits() == MulWidth)\n+          IC.replaceInstUsesWith(*TI, Mul);\n+        else\n+          TI->setOperand(0, Mul);\n+      } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(U)) {\n+        assert(BO->getOpcode() == Instruction::And);\n+        // Replace (mul & mask) --> zext (mul.with.overflow & short_mask)\n+        ConstantInt *CI = cast<ConstantInt>(BO->getOperand(1));\n+        APInt ShortMask = CI->getValue().trunc(MulWidth);\n+        Value *ShortAnd = Builder.CreateAnd(Mul, ShortMask);\n+        Value *Zext = Builder.CreateZExt(ShortAnd, BO->getType());\n+        IC.replaceInstUsesWith(*BO, Zext);\n+      } else {\n+        llvm_unreachable(\"Unexpected Binary operation\");\n+      }\n+      IC.addToWorklist(cast<Instruction>(U));\n+    }\n+  }\n+\n+  // The original icmp gets replaced with the overflow value, maybe inverted\n+  // depending on predicate.\n+  if (IsInverse) {\n+    Value *Res = Builder.CreateExtractValue(Call, 1);\n+    return BinaryOperator::CreateNot(Res);\n+  }\n+\n+  return ExtractValueInst::Create(Call, 1);\n+}\n+\n /// When performing a comparison against a constant, it is possible that not all\n /// the bits in the LHS are demanded. This helper method computes the mask that\n /// IS demanded.\n@@ -7531,6 +7697,16 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {\n         return R;\n     }\n \n+    // (sext X) * (sext Y)  --> llvm.smul.with.overflow.\n+    const APInt *C1;\n+    if (match(Op0, m_Add(m_NSWMul(m_SExt(m_Value(X)), m_SExt(m_Value(Y))),\n+                         m_APInt(C))) &&\n+        match(Op1, m_APInt(C1))) {\n+      if (Instruction *R = processSMulSExtIdiom(\n+              I, cast<Instruction>(Op0)->getOperand(0), C, C1, *this))\n+        return R;\n+    }\n+\n     // Signbit test folds\n     // Fold (X u>> BitWidth - 1 Pred ZExt(i1))  -->  X s< 0 Pred i1\n     // Fold (X s>> BitWidth - 1 Pred SExt(i1))  -->  X s< 0 Pred i1\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/overflow-mul.ll b/llvm/test/Transforms/InstCombine/overflow-mul.ll\nindex 6b5a65c03ee10..582697b3d81e8 100644\n--- a/llvm/test/Transforms/InstCombine/overflow-mul.ll\n+++ b/llvm/test/Transforms/InstCombine/overflow-mul.ll\n@@ -343,3 +343,37 @@ define i32 @extra_and_use_mask_too_large(i32 %x, i32 %y) {\n   %retval = zext i1 %overflow to i32\n   ret i32 %retval\n }\n+\n+define i32 @smul(i32 %a, i32 %b) {\n+; CHECK-LABEL: @smul(\n+; CHECK-NEXT:    [[SMUL:%.*]] = call { i32, i1 } @llvm.smul.with.overflow.i32(i32 [[B:%.*]], i32 [[A:%.*]])\n+; CHECK-NEXT:    [[TMP1:%.*]] = extractvalue { i32, i1 } [[SMUL]], 1\n+; CHECK-NEXT:    [[CONV3:%.*]] = zext i1 [[TMP1]] to i32\n+; CHECK-NEXT:    ret i32 [[CONV3]]\n+;\n+  %conv = sext i32 %a to i64\n+  %conv1 = sext i32 %b to i64\n+  %mul = mul nsw i64 %conv1, %conv\n+  %1 = add nsw i64 %mul, -2147483648\n+  %2 = icmp ult i64 %1, -4294967296\n+  %conv3 = zext i1 %2 to i32\n+  ret i32 %conv3\n+}\n+\n+define i32 @smul2(i32 %a, i32 %b) {\n+; CHECK-LABEL: @smul2(\n+; CHECK-NEXT:    [[SMUL:%.*]] = call { i32, i1 } @llvm.smul.with.overflow.i32(i32 [[B:%.*]], i32 [[A:%.*]])\n+; CHECK-NEXT:    [[TMP1:%.*]] = extractvalue { i32, i1 } [[SMUL]], 1\n+; CHECK-NEXT:    [[TMP2:%.*]] = xor i1 [[TMP1]], true\n+; CHECK-NEXT:    [[CONV3:%.*]] = zext i1 [[TMP2]] to i32\n+; CHECK-NEXT:    ret i32 [[CONV3]]\n+;\n+  %conv = sext i32 %a to i64\n+  %conv1 = sext i32 %b to i64\n+  %mul = mul nsw i64 %conv1, %conv\n+  %cmp = icmp sle i64 %mul, 2147483647\n+  %cmp2 = icmp sge i64 %mul, -2147483648\n+  %1 = select i1 %cmp, i1 %cmp2, i1 false\n+  %conv3 = zext i1 %1 to i32\n+  ret i32 %conv3\n+}\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/overflow-mul.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/overflow-mul.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "extra_and_use_mask_too_large",
+          "test_body": "target datalayout = \"i32:8:8\"\n\ndeclare void @use.i64(i64)\n\ndefine i32 @extra_and_use_mask_too_large(i32 %x, i32 %y) {\n; CHECK-LABEL: @extra_and_use_mask_too_large(\n; CHECK-NEXT:    [[L:%.*]] = zext i32 [[X:%.*]] to i64\n; CHECK-NEXT:    [[R:%.*]] = zext i32 [[Y:%.*]] to i64\n; CHECK-NEXT:    [[MUL64:%.*]] = mul nuw i64 [[L]], [[R]]\n; CHECK-NEXT:    [[OVERFLOW:%.*]] = icmp ugt i64 [[MUL64]], 4294967295\n; CHECK-NEXT:    [[AND:%.*]] = and i64 [[MUL64]], 68719476735\n; CHECK-NEXT:    call void @use.i64(i64 [[AND]])\n; CHECK-NEXT:    [[RETVAL:%.*]] = zext i1 [[OVERFLOW]] to i32\n; CHECK-NEXT:    ret i32 [[RETVAL]]\n  %l = zext i32 %x to i64\n  %r = zext i32 %y to i64\n  %mul64 = mul i64 %l, %r\n  %overflow = icmp ugt i64 %mul64, 4294967295\n  %and = and i64 %mul64, 68719476735\n  call void @use.i64(i64 %and)\n  %retval = zext i1 %overflow to i32\n  ret i32 %retval\n}",
+          "source_program": "target datalayout = \"i32:8:8\"\n\ndeclare void @use.i64(i64)\n\ndefine i32 @extra_and_use_mask_too_large(i32 %x, i32 %y) {\n  %l = zext i32 %x to i64\n  %r = zext i32 %y to i64\n  %mul64 = mul i64 %l, %r\n  %overflow = icmp ugt i64 %mul64, 4294967295\n  %and = and i64 %mul64, 68719476735\n  call void @use.i64(i64 %and)\n  %retval = zext i1 %overflow to i32\n  ret i32 %retval\n}\n"
+        },
+        {
+          "test_name": "smul",
+          "test_body": "target datalayout = \"i32:8:8\"\n\ndefine i32 @smul(i32 %a, i32 %b) {\n; CHECK-LABEL: @smul(\n; CHECK-NEXT:    [[CONV:%.*]] = sext i32 [[A:%.*]] to i64\n; CHECK-NEXT:    [[CONV1:%.*]] = sext i32 [[B:%.*]] to i64\n; CHECK-NEXT:    [[MUL:%.*]] = mul nsw i64 [[CONV1]], [[CONV]]\n; CHECK-NEXT:    [[TMP1:%.*]] = add nsw i64 [[MUL]], -2147483648\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i64 [[TMP1]], -4294967296\n; CHECK-NEXT:    [[CONV3:%.*]] = zext i1 [[TMP2]] to i32\n; CHECK-NEXT:    ret i32 [[CONV3]]\n  %conv = sext i32 %a to i64\n  %conv1 = sext i32 %b to i64\n  %mul = mul nsw i64 %conv1, %conv\n  %1 = add nsw i64 %mul, -2147483648\n  %2 = icmp ult i64 %1, -4294967296\n  %conv3 = zext i1 %2 to i32\n  ret i32 %conv3\n}",
+          "source_program": "target datalayout = \"i32:8:8\"\n\ndefine i32 @smul(i32 %a, i32 %b) {\n  %conv = sext i32 %a to i64\n  %conv1 = sext i32 %b to i64\n  %mul = mul nsw i64 %conv1, %conv\n  %1 = add nsw i64 %mul, -2147483648\n  %2 = icmp ult i64 %1, -4294967296\n  %conv3 = zext i1 %2 to i32\n  ret i32 %conv3\n}\n"
+        },
+        {
+          "test_name": "smul2",
+          "test_body": "target datalayout = \"i32:8:8\"\n\ndefine i32 @smul2(i32 %a, i32 %b) {\n; CHECK-LABEL: @smul2(\n; CHECK-NEXT:    [[CONV:%.*]] = sext i32 [[A:%.*]] to i64\n; CHECK-NEXT:    [[CONV1:%.*]] = sext i32 [[B:%.*]] to i64\n; CHECK-NEXT:    [[MUL:%.*]] = mul nsw i64 [[CONV1]], [[CONV]]\n; CHECK-NEXT:    [[TMP1:%.*]] = add i64 [[MUL]], 2147483647\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i64 [[TMP1]], 4294967295\n; CHECK-NEXT:    [[CONV3:%.*]] = zext i1 [[TMP2]] to i32\n; CHECK-NEXT:    ret i32 [[CONV3]]\n  %conv = sext i32 %a to i64\n  %conv1 = sext i32 %b to i64\n  %mul = mul nsw i64 %conv1, %conv\n  %cmp = icmp sle i64 %mul, 2147483647\n  %cmp2 = icmp sgt i64 %mul, -2147483648\n  %1 = select i1 %cmp, i1 %cmp2, i1 false\n  %conv3 = zext i1 %1 to i32\n  ret i32 %conv3\n}",
+          "source_program": "target datalayout = \"i32:8:8\"\n\ndefine i32 @smul2(i32 %a, i32 %b) {\n  %conv = sext i32 %a to i64\n  %conv1 = sext i32 %b to i64\n  %mul = mul nsw i64 %conv1, %conv\n  %cmp = icmp sle i64 %mul, 2147483647\n  %cmp2 = icmp sgt i64 %mul, -2147483648\n  %1 = select i1 %cmp, i1 %cmp2, i1 false\n  %conv3 = zext i1 %1 to i32\n  ret i32 %conv3\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

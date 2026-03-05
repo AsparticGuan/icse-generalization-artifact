@@ -1,0 +1,82 @@
+{
+  "pr_number": 76583,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/76583",
+  "title": "[InstCombine] Relax the same-underlying-object constraint for the GEP canonicalization",
+  "commit_sha": "2f4070584272f4e1370420290a87faffc6924a6b",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          2471,
+          2484
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::visitGetElementPtrInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex df393d72a85bf..351fc3b0174fc 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2471,14 +2471,26 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n \n       if (TyAllocSize == 1) {\n         // Canonicalize (gep i8* X, (ptrtoint Y)-(ptrtoint X)) to (bitcast Y),\n-        // but only if both point to the same underlying object (otherwise\n-        // provenance is not necessarily retained).\n+        // but only if the result pointer is only used as if it were an integer,\n+        // or both point to the same underlying object (otherwise provenance is\n+        // not necessarily retained).\n         Value *X = GEP.getPointerOperand();\n         Value *Y;\n         if (match(GEP.getOperand(1),\n                   m_Sub(m_PtrToInt(m_Value(Y)), m_PtrToInt(m_Specific(X)))) &&\n-            getUnderlyingObject(X) == getUnderlyingObject(Y))\n-          return CastInst::CreatePointerBitCastOrAddrSpaceCast(Y, GEPType);\n+            GEPType == Y->getType()) {\n+          bool HasSameUnderlyingObject =\n+              getUnderlyingObject(X) == getUnderlyingObject(Y);\n+          bool Changed = false;\n+          GEP.replaceUsesWithIf(Y, [&](Use &U) {\n+            bool ShouldReplace = HasSameUnderlyingObject ||\n+                                 isa<ICmpInst>(U.getUser()) ||\n+                                 isa<PtrToIntInst>(U.getUser());\n+            Changed |= ShouldReplace;\n+            return ShouldReplace;\n+          });\n+          return Changed ? &GEP : nullptr;\n+        }\n       } else {\n         // Canonicalize (gep T* X, V / sizeof(T)) to (gep i8* X, V)\n         Value *V;\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/getelementptr.ll b/llvm/test/Transforms/InstCombine/getelementptr.ll\nindex 7d67f2583aa24..373b7f5f2fc0a 100644\n--- a/llvm/test/Transforms/InstCombine/getelementptr.ll\n+++ b/llvm/test/Transforms/InstCombine/getelementptr.ll\n@@ -1537,4 +1537,82 @@ define ptr @gep_ashr_without_exact(ptr %p, i64 %off) {\n   ret ptr %ptr\n }\n \n+define i1 @test_only_used_by_icmp(ptr %a, ptr %b, ptr %c) {\n+; CHECK-LABEL: @test_only_used_by_icmp(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[B:%.*]], [[C:%.*]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %pa = ptrtoint ptr %a to i64\n+  %pb = ptrtoint ptr %b to i64\n+  %sub = sub i64 %pb, %pa\n+  %gep = getelementptr i8, ptr %a, i64 %sub\n+  %cmp = icmp eq ptr %gep, %c\n+  ret i1 %cmp\n+}\n+\n+define i64 @test_only_used_by_ptrtoint(ptr %a, ptr %b) {\n+; CHECK-LABEL: @test_only_used_by_ptrtoint(\n+; CHECK-NEXT:    [[VAL:%.*]] = ptrtoint ptr [[B:%.*]] to i64\n+; CHECK-NEXT:    ret i64 [[VAL]]\n+;\n+  %pa = ptrtoint ptr %a to i64\n+  %pb = ptrtoint ptr %b to i64\n+  %sub = sub i64 %pb, %pa\n+  %gep = getelementptr i8, ptr %a, i64 %sub\n+  %val = ptrtoint ptr %gep to i64\n+  ret i64 %val\n+}\n+\n+define i64 @test_used_by_both(ptr %a, ptr %b, ptr %c) {\n+; CHECK-LABEL: @test_used_by_both(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[B:%.*]], [[C:%.*]]\n+; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n+; CHECK:       if.then:\n+; CHECK-NEXT:    [[VAL:%.*]] = ptrtoint ptr [[B]] to i64\n+; CHECK-NEXT:    ret i64 [[VAL]]\n+; CHECK:       if.else:\n+; CHECK-NEXT:    ret i64 0\n+;\n+  %pa = ptrtoint ptr %a to i64\n+  %pb = ptrtoint ptr %b to i64\n+  %sub = sub i64 %pb, %pa\n+  %gep = getelementptr i8, ptr %a, i64 %sub\n+  %cmp = icmp eq ptr %gep, %c\n+  br i1 %cmp, label %if.then, label %if.else\n+if.then:\n+  %val = ptrtoint ptr %gep to i64\n+  ret i64 %val\n+if.else:\n+  ret i64 0\n+}\n+\n+; Negative tests\n+\n+define i64 @test_used_by_both_invalid(ptr %a, ptr %b, ptr %c) {\n+; CHECK-LABEL: @test_used_by_both_invalid(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[B:%.*]], [[C:%.*]]\n+; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n+; CHECK:       if.then:\n+; CHECK-NEXT:    [[PB:%.*]] = ptrtoint ptr [[B]] to i64\n+; CHECK-NEXT:    [[PA:%.*]] = ptrtoint ptr [[A:%.*]] to i64\n+; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[PB]], [[PA]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[A]], i64 [[SUB]]\n+; CHECK-NEXT:    [[VAL:%.*]] = load i64, ptr [[GEP]], align 8\n+; CHECK-NEXT:    ret i64 [[VAL]]\n+; CHECK:       if.else:\n+; CHECK-NEXT:    ret i64 0\n+;\n+  %pa = ptrtoint ptr %a to i64\n+  %pb = ptrtoint ptr %b to i64\n+  %sub = sub i64 %pb, %pa\n+  %gep = getelementptr i8, ptr %a, i64 %sub\n+  %cmp = icmp eq ptr %gep, %c\n+  br i1 %cmp, label %if.then, label %if.else\n+if.then:\n+  %val = load i64, ptr %gep, align 8\n+  ret i64 %val\n+if.else:\n+  ret i64 0\n+}\n+\n !0 = !{!\"branch_weights\", i32 2, i32 10}\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/getelementptr.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/getelementptr.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "gep_ashr_without_exact",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine ptr @gep_ashr_without_exact(ptr %p, i64 %off) {\n; CHECK-LABEL: @gep_ashr_without_exact(\n; CHECK-NEXT:    [[INDEX:%.*]] = ashr i64 [[OFF:%.*]], 2\n; CHECK-NEXT:    [[PTR:%.*]] = getelementptr i32, ptr [[P:%.*]], i64 [[INDEX]]\n; CHECK-NEXT:    ret ptr [[PTR]]\n  %index = ashr i64 %off, 2\n  %ptr = getelementptr i32, ptr %p, i64 %index\n  ret ptr %ptr\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine ptr @gep_ashr_without_exact(ptr %p, i64 %off) {\n  %index = ashr i64 %off, 2\n  %ptr = getelementptr i32, ptr %p, i64 %index\n  ret ptr %ptr\n}\n"
+        },
+        {
+          "test_name": "test_only_used_by_icmp",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i1 @test_only_used_by_icmp(ptr %a, ptr %b, ptr %c) {\n; CHECK-LABEL: @test_only_used_by_icmp(\n; CHECK-NEXT:    [[PA:%.*]] = ptrtoint ptr [[A:%.*]] to i64\n; CHECK-NEXT:    [[PB:%.*]] = ptrtoint ptr [[B:%.*]] to i64\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[PB]], [[PA]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[A]], i64 [[SUB]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[GEP]], [[C:%.*]]\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  ret i1 %cmp\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i1 @test_only_used_by_icmp(ptr %a, ptr %b, ptr %c) {\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_only_used_by_ptrtoint",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_only_used_by_ptrtoint(ptr %a, ptr %b) {\n; CHECK-LABEL: @test_only_used_by_ptrtoint(\n; CHECK-NEXT:    [[PA:%.*]] = ptrtoint ptr [[A:%.*]] to i64\n; CHECK-NEXT:    [[PB:%.*]] = ptrtoint ptr [[B:%.*]] to i64\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[PB]], [[PA]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[A]], i64 [[SUB]]\n; CHECK-NEXT:    [[VAL:%.*]] = ptrtoint ptr [[GEP]] to i64\n; CHECK-NEXT:    ret i64 [[VAL]]\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %val = ptrtoint ptr %gep to i64\n  ret i64 %val\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_only_used_by_ptrtoint(ptr %a, ptr %b) {\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %val = ptrtoint ptr %gep to i64\n  ret i64 %val\n}\n"
+        },
+        {
+          "test_name": "test_used_by_both",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_used_by_both(ptr %a, ptr %b, ptr %c) {\n; CHECK-LABEL: @test_used_by_both(\n; CHECK-NEXT:    [[PA:%.*]] = ptrtoint ptr [[A:%.*]] to i64\n; CHECK-NEXT:    [[PB:%.*]] = ptrtoint ptr [[B:%.*]] to i64\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[PB]], [[PA]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[A]], i64 [[SUB]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[GEP]], [[C:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[VAL:%.*]] = ptrtoint ptr [[GEP]] to i64\n; CHECK-NEXT:    ret i64 [[VAL]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i64 0\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %val = ptrtoint ptr %gep to i64\n  ret i64 %val\n\nif.else:                                          ; preds = %0\n  ret i64 0\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_used_by_both(ptr %a, ptr %b, ptr %c) {\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %val = ptrtoint ptr %gep to i64\n  ret i64 %val\n\nif.else:                                          ; preds = %0\n  ret i64 0\n}\n"
+        },
+        {
+          "test_name": "test_used_by_both_invalid",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_used_by_both_invalid(ptr %a, ptr %b, ptr %c) {\n; CHECK-LABEL: @test_used_by_both_invalid(\n; CHECK-NEXT:    [[PA:%.*]] = ptrtoint ptr [[A:%.*]] to i64\n; CHECK-NEXT:    [[PB:%.*]] = ptrtoint ptr [[B:%.*]] to i64\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 [[PB]], [[PA]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[A]], i64 [[SUB]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[GEP]], [[C:%.*]]\n; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n; CHECK:       if.then:\n; CHECK-NEXT:    [[VAL:%.*]] = load i64, ptr [[GEP]], align 8\n; CHECK-NEXT:    ret i64 [[VAL]]\n; CHECK:       if.else:\n; CHECK-NEXT:    ret i64 0\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %val = load i64, ptr %gep, align 8\n  ret i64 %val\n\nif.else:                                          ; preds = %0\n  ret i64 0\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @test_used_by_both_invalid(ptr %a, ptr %b, ptr %c) {\n  %pa = ptrtoint ptr %a to i64\n  %pb = ptrtoint ptr %b to i64\n  %sub = sub i64 %pb, %pa\n  %gep = getelementptr i8, ptr %a, i64 %sub\n  %cmp = icmp eq ptr %gep, %c\n  br i1 %cmp, label %if.then, label %if.else\n\nif.then:                                          ; preds = %0\n  %val = load i64, ptr %gep, align 8\n  ret i64 %val\n\nif.else:                                          ; preds = %0\n  ret i64 0\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

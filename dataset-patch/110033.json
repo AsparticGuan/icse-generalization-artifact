@@ -1,0 +1,104 @@
+{
+  "pr_number": 110033,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/110033",
+  "title": "[InstCombine] Canonicalize more geps with constant gep bases and constant offsets.",
+  "commit_sha": "149efb8681ee98a86241383fb5fcdd1dc1706228",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          2731,
+          2736
+        ],
+        [
+          2812,
+          2830
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombiner::getFreelyInvertedImpl",
+        "InstCombinerImpl::visitGetElementPtrInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 1ea3efb27937d..1f4a6f793404c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2731,6 +2731,36 @@ Value *InstCombiner::getFreelyInvertedImpl(Value *V, bool WillInvertAllUses,\n   return nullptr;\n }\n \n+/// Return true if we should canonicalize the gep to an i8 ptradd.\n+static bool shouldCanonicalizeGEPToPtrAdd(GetElementPtrInst &GEP) {\n+  Value *PtrOp = GEP.getOperand(0);\n+  Type *GEPEltType = GEP.getSourceElementType();\n+  if (GEPEltType->isIntegerTy(8))\n+    return false;\n+\n+  // Canonicalize scalable GEPs to an explicit offset using the llvm.vscale\n+  // intrinsic. This has better support in BasicAA.\n+  if (GEPEltType->isScalableTy())\n+    return true;\n+\n+  // gep i32 p, mul(O, C) -> gep i8, p, mul(O, C*4) to fold the two multiplies\n+  // together.\n+  if (GEP.getNumIndices() == 1 &&\n+      match(GEP.getOperand(1),\n+            m_OneUse(m_CombineOr(m_Mul(m_Value(), m_ConstantInt()),\n+                                 m_Shl(m_Value(), m_ConstantInt())))))\n+    return true;\n+\n+  // gep (gep %p, C1), %x, C2 is expanded so the two constants can\n+  // possibly be merged together.\n+  auto PtrOpGep = dyn_cast<GEPOperator>(PtrOp);\n+  return PtrOpGep && PtrOpGep->hasAllConstantIndices() &&\n+         any_of(GEP.indices(), [](Value *V) {\n+           const APInt *C;\n+           return match(V, m_APInt(C)) && !C->isZero();\n+         });\n+}\n+\n Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n   Value *PtrOp = GEP.getOperand(0);\n   SmallVector<Value *, 8> Indices(GEP.indices());\n@@ -2812,19 +2842,11 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n                                     GEP.getNoWrapFlags()));\n   }\n \n-  // Canonicalize\n-  //  - scalable GEPs to an explicit offset using the llvm.vscale intrinsic.\n-  //    This has better support in BasicAA.\n-  //  - gep i32 p, mul(O, C) -> gep i8, p, mul(O, C*4) to fold the two\n-  //    multiplies together.\n-  if (GEPEltType->isScalableTy() ||\n-      (!GEPEltType->isIntegerTy(8) && GEP.getNumIndices() == 1 &&\n-       match(GEP.getOperand(1),\n-             m_OneUse(m_CombineOr(m_Mul(m_Value(), m_ConstantInt()),\n-                                  m_Shl(m_Value(), m_ConstantInt())))))) {\n+  if (shouldCanonicalizeGEPToPtrAdd(GEP)) {\n     Value *Offset = EmitGEPOffset(cast<GEPOperator>(&GEP));\n-    return replaceInstUsesWith(\n-        GEP, Builder.CreatePtrAdd(PtrOp, Offset, \"\", GEP.getNoWrapFlags()));\n+    Value *NewGEP =\n+        Builder.CreatePtrAdd(PtrOp, Offset, \"\", GEP.getNoWrapFlags());\n+    return replaceInstUsesWith(GEP, NewGEP);\n   }\n \n   // Check to see if the inputs to the PHI node are getelementptr instructions.\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll b/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\nindex f1f01a1884a22..53585dfde48b2 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\n@@ -7,7 +7,8 @@ define ptr @x12(i64 %x) {\n ; CHECK-LABEL: define ptr @x12(\n ; CHECK-SAME: i64 [[X:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr inbounds (i8, ptr @glob, i64 36), i64 0, i64 [[X]], i64 1, i64 2\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul nsw i64 [[X]], 400\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 84), i64 [[GEP_IDX]]\n ; CHECK-NEXT:    ret ptr [[GEP]]\n ;\n entry:\n@@ -19,7 +20,10 @@ define ptr @x1y(i64 %x, i64 %y) {\n ; CHECK-LABEL: define ptr @x1y(\n ; CHECK-SAME: i64 [[X:%.*]], i64 [[Y:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[GEP:%.*]] = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr inbounds (i8, ptr @glob, i64 36), i64 0, i64 [[X]], i64 2, i64 [[Y]]\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul nsw i64 [[X]], 400\n+; CHECK-NEXT:    [[GEP_IDX1:%.*]] = shl nsw i64 [[Y]], 2\n+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 116), i64 [[GEP_IDX]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 [[GEP_IDX1]]\n ; CHECK-NEXT:    ret ptr [[GEP]]\n ;\n entry:\n@@ -55,8 +59,10 @@ define i32 @twoloads(i64 %x) {\n ; CHECK-LABEL: define i32 @twoloads(\n ; CHECK-SAME: i64 [[X:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr inbounds (i8, ptr @glob, i64 50), i64 0, i64 [[X]], i64 2, i64 1\n-; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr inbounds (i8, ptr @glob, i64 36), i64 0, i64 [[X]], i64 2, i64 4\n+; CHECK-NEXT:    [[GEP1_IDX:%.*]] = mul nsw i64 [[X]], 400\n+; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 134), i64 [[GEP1_IDX]]\n+; CHECK-NEXT:    [[GEP2_IDX:%.*]] = mul nsw i64 [[X]], 400\n+; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 132), i64 [[GEP2_IDX]]\n ; CHECK-NEXT:    [[A:%.*]] = load i32, ptr [[GEP1]], align 4\n ; CHECK-NEXT:    [[B:%.*]] = load i32, ptr [[GEP2]], align 4\n ; CHECK-NEXT:    [[C:%.*]] = add i32 [[A]], [[B]]\ndiff --git a/llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll b/llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll\nindex 509d19c8c00c7..edec54495c1ae 100644\n--- a/llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll\n+++ b/llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll\n@@ -140,12 +140,11 @@ define ptr @notDivisible(ptr %p) {\n   ret ptr %2\n }\n \n-; Negative test. Two GEP should not be merged if not both offsets are constant\n-; or divisible by the other's size.\n define ptr @partialConstant2(ptr %p, i64 %a) {\n ; CHECK-LABEL: @partialConstant2(\n-; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 4\n-; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds [4 x i64], ptr [[TMP1]], i64 [[A:%.*]], i64 2\n+; CHECK-NEXT:    [[DOTIDX:%.*]] = shl nsw i64 [[A:%.*]], 5\n+; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr i8, ptr [[P:%.*]], i64 20\n+; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr i8, ptr [[TMP1]], i64 [[DOTIDX]]\n ; CHECK-NEXT:    ret ptr [[TMP2]]\n ;\n   %1 = getelementptr inbounds i32, ptr %p, i64 1\n@@ -153,13 +152,13 @@ define ptr @partialConstant2(ptr %p, i64 %a) {\n   ret ptr %2\n }\n \n-; Negative test. Two GEP should not be merged if there is another use of the\n-; first GEP by the second GEP.\n define ptr @partialConstant3(ptr %p) {\n ; CHECK-LABEL: @partialConstant3(\n ; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 4\n ; CHECK-NEXT:    [[TMP2:%.*]] = ptrtoint ptr [[TMP1]] to i64\n-; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds [4 x i64], ptr [[TMP1]], i64 [[TMP2]], i64 2\n+; CHECK-NEXT:    [[DOTIDX:%.*]] = shl nsw i64 [[TMP2]], 5\n+; CHECK-NEXT:    [[DOTOFFS:%.*]] = or disjoint i64 [[DOTIDX]], 16\n+; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds i8, ptr [[TMP1]], i64 [[DOTOFFS]]\n ; CHECK-NEXT:    ret ptr [[TMP3]]\n ;\n   %1 = getelementptr inbounds i32, ptr %p, i64 1\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll",
+    "llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "twoloads",
+          "test_body": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine i32 @twoloads(i64 %x) {\n; CHECK-LABEL: define i32 @twoloads(\n; CHECK-SAME: i64 [[X:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[GEP1_IDX:%.*]] = mul nsw i64 [[X]], 400\n; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 134), i64 [[GEP1_IDX]]\n; CHECK-NEXT:    [[GEP2_IDX:%.*]] = mul nsw i64 [[X]], 400\n; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 132), i64 [[GEP2_IDX]]\n; CHECK-NEXT:    [[A:%.*]] = load i32, ptr [[GEP1]], align 4\n; CHECK-NEXT:    [[B:%.*]] = load i32, ptr [[GEP2]], align 4\n; CHECK-NEXT:    [[C:%.*]] = add i32 [[A]], [[B]]\n; CHECK-NEXT:    ret i32 [[C]]\nentry:\n  %gep1 = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 50), i64 0, i64 %x, i64 2, i64 1\n  %gep2 = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 2, i64 4\n  %a = load i32, ptr %gep1, align 4\n  %b = load i32, ptr %gep2, align 4\n  %c = add i32 %a, %b\n  ret i32 %c\n}",
+          "source_program": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine i32 @twoloads(i64 %x) {\nentry:\n  %gep1 = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 50), i64 0, i64 %x, i64 2, i64 1\n  %gep2 = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 2, i64 4\n  %a = load i32, ptr %gep1, align 4\n  %b = load i32, ptr %gep2, align 4\n  %c = add i32 %a, %b\n  ret i32 %c\n}\n"
+        },
+        {
+          "test_name": "x12",
+          "test_body": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x12(i64 %x) {\n; CHECK-LABEL: define ptr @x12(\n; CHECK-SAME: i64 [[X:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul nsw i64 [[X]], 400\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 84), i64 [[GEP_IDX]]\n; CHECK-NEXT:    ret ptr [[GEP]]\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 1, i64 2\n  ret ptr %gep\n}",
+          "source_program": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x12(i64 %x) {\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 1, i64 2\n  ret ptr %gep\n}\n"
+        },
+        {
+          "test_name": "x1y",
+          "test_body": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x1y(i64 %x, i64 %y) {\n; CHECK-LABEL: define ptr @x1y(\n; CHECK-SAME: i64 [[X:%.*]], i64 [[Y:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul nsw i64 [[X]], 400\n; CHECK-NEXT:    [[GEP_IDX1:%.*]] = shl nsw i64 [[Y]], 2\n; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr getelementptr inbounds (i8, ptr @glob, i64 116), i64 [[GEP_IDX]]\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 [[GEP_IDX1]]\n; CHECK-NEXT:    ret ptr [[GEP]]\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 2, i64 %y\n  ret ptr %gep\n}",
+          "source_program": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x1y(i64 %x, i64 %y) {\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 2, i64 %y\n  ret ptr %gep\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/gep-merge-constant-indices.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "notDivisible",
+          "test_body": "target datalayout = \"i24:8:8\"\n\ndefine ptr @notDivisible(ptr %p) {\n; CHECK-LABEL: @notDivisible(\n; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 7\n; CHECK-NEXT:    ret ptr [[TMP1]]\n  %1 = getelementptr inbounds i24, ptr %p, i64 1\n  %2 = getelementptr inbounds i32, ptr %1, i64 1\n  ret ptr %2\n}",
+          "source_program": "target datalayout = \"i24:8:8\"\n\ndefine ptr @notDivisible(ptr %p) {\n  %1 = getelementptr inbounds i24, ptr %p, i64 1\n  %2 = getelementptr inbounds i32, ptr %1, i64 1\n  ret ptr %2\n}\n"
+        },
+        {
+          "test_name": "partialConstant2",
+          "test_body": "target datalayout = \"i24:8:8\"\n\ndefine ptr @partialConstant2(ptr %p, i64 %a) {\n; CHECK-LABEL: @partialConstant2(\n; CHECK-NEXT:    [[DOTIDX:%.*]] = shl nsw i64 [[A:%.*]], 5\n; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr i8, ptr [[P:%.*]], i64 20\n; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr i8, ptr [[TMP1]], i64 [[DOTIDX]]\n; CHECK-NEXT:    ret ptr [[TMP2]]\n  %1 = getelementptr inbounds i32, ptr %p, i64 1\n  %2 = getelementptr inbounds [4 x i64], ptr %1, i64 %a, i64 2\n  ret ptr %2\n}",
+          "source_program": "target datalayout = \"i24:8:8\"\n\ndefine ptr @partialConstant2(ptr %p, i64 %a) {\n  %1 = getelementptr inbounds i32, ptr %p, i64 1\n  %2 = getelementptr inbounds [4 x i64], ptr %1, i64 %a, i64 2\n  ret ptr %2\n}\n"
+        },
+        {
+          "test_name": "partialConstant3",
+          "test_body": "target datalayout = \"i24:8:8\"\n\ndefine ptr @partialConstant3(ptr %p) {\n; CHECK-LABEL: @partialConstant3(\n; CHECK-NEXT:    [[TMP1:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 4\n; CHECK-NEXT:    [[TMP2:%.*]] = ptrtoint ptr [[TMP1]] to i64\n; CHECK-NEXT:    [[DOTIDX:%.*]] = shl nsw i64 [[TMP2]], 5\n; CHECK-NEXT:    [[DOTOFFS:%.*]] = or disjoint i64 [[DOTIDX]], 16\n; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds i8, ptr [[TMP1]], i64 [[DOTOFFS]]\n; CHECK-NEXT:    ret ptr [[TMP3]]\n  %1 = getelementptr inbounds i32, ptr %p, i64 1\n  %2 = ptrtoint ptr %1 to i64\n  %3 = getelementptr inbounds [4 x i64], ptr %1, i64 %2, i64 2\n  ret ptr %3\n}",
+          "source_program": "target datalayout = \"i24:8:8\"\n\ndefine ptr @partialConstant3(ptr %p) {\n  %1 = getelementptr inbounds i32, ptr %p, i64 1\n  %2 = ptrtoint ptr %1 to i64\n  %3 = getelementptr inbounds [4 x i64], ptr %1, i64 %2, i64 2\n  ret ptr %3\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

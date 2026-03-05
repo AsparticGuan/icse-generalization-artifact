@@ -1,0 +1,144 @@
+{
+  "pr_number": 175548,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175548",
+  "title": "InstCombine: SimplifyDemandedFPClass multiple use support for select",
+  "commit_sha": "fbad7d83511a473266b4a6ca92622f1051d7d90c",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/Attributor",
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          5560,
+          5566
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        [
+          2766,
+          2772
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "computeKnownFPClass"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        "InstCombinerImpl::SimplifyDemandedUseFPClass"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex dbb44c8828545..5340d41dd3683 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5560,7 +5560,10 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n         // Doubling 0 will give the same 0.\n         if (SelfAdd && KnownRHS.isKnownNeverLogicalPosZero(Mode) &&\n             (Mode.Output == DenormalMode::IEEE ||\n-             Mode.Output == DenormalMode::PreserveSign))\n+             (Mode.Output == DenormalMode::PreserveSign &&\n+              KnownRHS.isKnownNeverPosSubnormal()) ||\n+             (Mode.Output == DenormalMode::PositiveZero &&\n+              KnownRHS.isKnownNeverSubnormal())))\n           Known.knownNot(fcPosZero);\n \n         // (fadd x, 0.0) is guaranteed to return +0.0, not -0.0.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 22064638bb229..9382f5b536d87 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2766,7 +2766,33 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n Value *InstCombinerImpl::SimplifyMultipleUseDemandedFPClass(\n     Instruction *I, FPClassTest DemandedMask, KnownFPClass &Known,\n     Instruction *CxtI, unsigned Depth) {\n-  Known = computeKnownFPClass(I, DemandedMask, CxtI, Depth + 1);\n+  switch (I->getOpcode()) {\n+  case Instruction::Select: {\n+    // TODO: Can we infer which side it came from based on adjusted result\n+    // class?\n+    KnownFPClass KnownRHS =\n+        computeKnownFPClass(I->getOperand(2), DemandedMask, CxtI, Depth + 1);\n+    if (KnownRHS.isKnownNever(DemandedMask))\n+      return I->getOperand(1);\n+\n+    KnownFPClass KnownLHS =\n+        computeKnownFPClass(I->getOperand(1), DemandedMask, CxtI, Depth + 1);\n+    if (KnownLHS.isKnownNever(DemandedMask))\n+      return I->getOperand(2);\n+\n+    const SimplifyQuery &SQ = getSimplifyQuery();\n+    adjustKnownFPClassForSelectArm(KnownLHS, I->getOperand(0), I->getOperand(1),\n+                                   /*Invert=*/false, SQ, Depth);\n+    adjustKnownFPClassForSelectArm(KnownRHS, I->getOperand(0), I->getOperand(2),\n+                                   /*Invert=*/true, SQ, Depth);\n+    Known = KnownLHS.intersectWith(KnownRHS);\n+    break;\n+  }\n+  default:\n+    Known = computeKnownFPClass(I, DemandedMask, CxtI, Depth + 1);\n+    break;\n+  }\n+\n   return getFPClassConstant(I->getType(), DemandedMask & Known.KnownFPClasses);\n }\n \n",
+  "test_patch": "diff --git a/llvm/test/Transforms/Attributor/nofpclass.ll b/llvm/test/Transforms/Attributor/nofpclass.ll\nindex bb0b1930ffe58..4260c4ff1115a 100644\n--- a/llvm/test/Transforms/Attributor/nofpclass.ll\n+++ b/llvm/test/Transforms/Attributor/nofpclass.ll\n@@ -3607,7 +3607,7 @@ define float @fadd_double_no_pzero_maybe_undef(float nofpclass(pzero) %arg) {\n ; still be flushed.\n define float @fadd_double_no_zero__output_only_is_ftz(float noundef nofpclass(zero) %arg) #7 {\n ; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n-; CHECK-LABEL: define noundef nofpclass(pzero) float @fadd_double_no_zero__output_only_is_ftz\n+; CHECK-LABEL: define noundef float @fadd_double_no_zero__output_only_is_ftz\n ; CHECK-SAME: (float noundef nofpclass(zero) [[ARG:%.*]]) #[[ATTR13]] {\n ; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n ; CHECK-NEXT:    ret float [[ADD]]\n@@ -3675,6 +3675,50 @@ define float @assume_returned_arg(float %arg) {\n   ret float %arg\n }\n \n+define float @fadd_double_no_zero__output_only_is_ftpz(float noundef nofpclass(zero) %arg) #4 {\n+; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n+; CHECK-LABEL: define noundef nofpclass(nzero) float @fadd_double_no_zero__output_only_is_ftpz\n+; CHECK-SAME: (float noundef nofpclass(zero) [[ARG:%.*]]) #[[ATTR12]] {\n+; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n+; CHECK-NEXT:    ret float [[ADD]]\n+;\n+  %add = fadd float %arg, %arg\n+  ret float %add\n+}\n+\n+define float @fadd_double_no_zero_or_nsub__output_only_is_ftpz(float noundef nofpclass(zero nsub) %arg) #4 {\n+; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n+; CHECK-LABEL: define noundef nofpclass(nzero) float @fadd_double_no_zero_or_nsub__output_only_is_ftpz\n+; CHECK-SAME: (float noundef nofpclass(zero nsub) [[ARG:%.*]]) #[[ATTR12]] {\n+; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n+; CHECK-NEXT:    ret float [[ADD]]\n+;\n+  %add = fadd float %arg, %arg\n+  ret float %add\n+}\n+\n+define float @fadd_double_no_zero_or_psub__output_only_is_ftpz(float noundef nofpclass(zero psub) %arg) #4 {\n+; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n+; CHECK-LABEL: define noundef nofpclass(nzero) float @fadd_double_no_zero_or_psub__output_only_is_ftpz\n+; CHECK-SAME: (float noundef nofpclass(zero psub) [[ARG:%.*]]) #[[ATTR12]] {\n+; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n+; CHECK-NEXT:    ret float [[ADD]]\n+;\n+  %add = fadd float %arg, %arg\n+  ret float %add\n+}\n+\n+define float @fadd_double_no_zero_or_sub__output_only_is_ftpz(float noundef nofpclass(zero sub) %arg) #4 {\n+; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n+; CHECK-LABEL: define noundef nofpclass(zero) float @fadd_double_no_zero_or_sub__output_only_is_ftpz\n+; CHECK-SAME: (float noundef nofpclass(zero sub) [[ARG:%.*]]) #[[ATTR12]] {\n+; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n+; CHECK-NEXT:    ret float [[ADD]]\n+;\n+  %add = fadd float %arg, %arg\n+  ret float %add\n+}\n+\n declare i64 @_Z13get_global_idj(i32 noundef)\n \n attributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\ndiff --git a/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll b/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll\nindex 16378b8677f83..e04fa3c0d6481 100644\n--- a/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll\n+++ b/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll\n@@ -383,7 +383,7 @@ define nofpclass(inf) float @ret_nofpclass_inf__select_multi_use_pinf_lhs(i1 %co\n ; CHECK-SAME: (i1 [[COND:%.*]], float [[X:%.*]], ptr [[PTR:%.*]]) {\n ; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], float 0x7FF0000000000000, float [[X]]\n ; CHECK-NEXT:    store float [[SELECT]], ptr [[PTR]], align 4\n-; CHECK-NEXT:    ret float [[SELECT]]\n+; CHECK-NEXT:    ret float [[X]]\n ;\n   %select = select i1 %cond, float 0x7FF0000000000000, float %x\n   store float %select, ptr %ptr\n@@ -1098,13 +1098,11 @@ define nofpclass(nan inf nzero nsub nnorm) float @test_powr_issue64870_2(float n\n ; CHECK-LABEL: define nofpclass(nan inf nzero nsub nnorm) float @test_powr_issue64870_2\n ; CHECK-SAME: (float nofpclass(nan inf) [[ARG:%.*]], float nofpclass(nan inf) [[ARG1:%.*]]) {\n ; CHECK-NEXT:  bb:\n-; CHECK-NEXT:    [[I:%.*]] = fcmp olt float [[ARG]], 0.000000e+00\n-; CHECK-NEXT:    [[I2:%.*]] = select i1 [[I]], float 0x7FF8000000000000, float [[ARG]]\n-; CHECK-NEXT:    [[I3:%.*]] = tail call float @llvm.log2.f32(float noundef [[I2]])\n+; CHECK-NEXT:    [[I3:%.*]] = tail call float @llvm.log2.f32(float noundef [[ARG]])\n ; CHECK-NEXT:    [[I5:%.*]] = fmul float [[ARG1]], [[I3]]\n ; CHECK-NEXT:    [[I6:%.*]] = tail call noundef nofpclass(ninf nzero nsub nnorm) float @llvm.exp2.f32(float noundef [[I5]])\n-; CHECK-NEXT:    [[I10:%.*]] = fcmp oeq float [[I2]], 0.000000e+00\n-; CHECK-NEXT:    [[I12:%.*]] = select i1 [[I10]], float 0.000000e+00, float [[I6]]\n+; CHECK-NEXT:    [[TMP0:%.*]] = fcmp oeq float [[ARG]], 0.000000e+00\n+; CHECK-NEXT:    [[I12:%.*]] = select i1 [[TMP0]], float 0.000000e+00, float [[I6]]\n ; CHECK-NEXT:    ret float [[I12]]\n ;\n bb:\n@@ -1542,3 +1540,55 @@ define nofpclass(nan) float @exp_select_must_be_0_commute(float %arg, float nofp\n   %exp = call float @llvm.exp.f32(float %select)\n   ret float %exp\n }\n+\n+; Select has multiple uses, with the same user\n+define nofpclass(nan) float @ret_nonan_fmul_select_fmul_select_nan_multiple_use(i1 %cond, float noundef %x) {\n+; CHECK-LABEL: define nofpclass(nan) float @ret_nonan_fmul_select_fmul_select_nan_multiple_use\n+; CHECK-SAME: (i1 [[COND:%.*]], float noundef [[X:%.*]]) {\n+; CHECK-NEXT:    [[FMUL:%.*]] = fmul float [[X]], [[X]]\n+; CHECK-NEXT:    ret float [[FMUL]]\n+;\n+  %select = select i1 %cond, float %x, float 0x7FF8000000000000\n+  %fmul = fmul float %select, %select\n+  ret float %fmul\n+}\n+\n+define nofpclass(nan) float @ret_nonan_fmul_select_fmul_select_nan_multiple_use_commute(i1 %cond, float noundef %x) {\n+; CHECK-LABEL: define nofpclass(nan) float @ret_nonan_fmul_select_fmul_select_nan_multiple_use_commute\n+; CHECK-SAME: (i1 [[COND:%.*]], float noundef [[X:%.*]]) {\n+; CHECK-NEXT:    [[FMUL:%.*]] = fmul float [[X]], [[X]]\n+; CHECK-NEXT:    ret float [[FMUL]]\n+;\n+  %select = select i1 %cond, float 0x7FF8000000000000, float %x\n+  %fmul = fmul float %select, %select\n+  ret float %fmul\n+}\n+\n+; Select has a second, unrelated use\n+define nofpclass(nan) float @ret_nonan_fmul_select_nan_other_use(i1 %cond, float noundef %x, float %y, ptr %ptr) {\n+; CHECK-LABEL: define nofpclass(nan) float @ret_nonan_fmul_select_nan_other_use\n+; CHECK-SAME: (i1 [[COND:%.*]], float noundef [[X:%.*]], float [[Y:%.*]], ptr [[PTR:%.*]]) {\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], float [[X]], float 0x7FF8000000000000\n+; CHECK-NEXT:    store float [[SELECT]], ptr [[PTR]], align 4\n+; CHECK-NEXT:    [[NAN_USER:%.*]] = fmul float [[X]], [[Y]]\n+; CHECK-NEXT:    ret float [[NAN_USER]]\n+;\n+  %select = select i1 %cond, float %x, float 0x7FF8000000000000\n+  store float %select, ptr %ptr\n+  %nan.user = fmul float %select, %y\n+  ret float %nan.user\n+}\n+\n+define nofpclass(nan) float @ret_nonan_fmul_select_nan_other_use_commute(i1 %cond, float noundef %x, float %y, ptr %ptr) {\n+; CHECK-LABEL: define nofpclass(nan) float @ret_nonan_fmul_select_nan_other_use_commute\n+; CHECK-SAME: (i1 [[COND:%.*]], float noundef [[X:%.*]], float [[Y:%.*]], ptr [[PTR:%.*]]) {\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], float 0x7FF8000000000000, float [[X]]\n+; CHECK-NEXT:    store float [[SELECT]], ptr [[PTR]], align 4\n+; CHECK-NEXT:    [[NAN_USER:%.*]] = fmul float [[X]], [[Y]]\n+; CHECK-NEXT:    ret float [[NAN_USER]]\n+;\n+  %select = select i1 %cond, float 0x7FF8000000000000, float %x\n+  store float %select, ptr %ptr\n+  %nan.user = fmul float %select, %y\n+  ret float %nan.user\n+}\n",
+  "source_files": [
+    "llvm/lib/Analysis/ValueTracking.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/Attributor/nofpclass.ll",
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        [
+          "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+          "FileCheck %s --check-prefixes=CHECK,CHECK-CV,TUNIT,TUNIT-CV,CGSCC,CGSCC-CV,CHECK-CI,TUNIT-CI,CGSCC-CI"
+        ],
+        [
+          "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+          "FileCheck %s --check-prefixes=CHECK,CHECK-CV,TUNIT,TUNIT-CV,CGSCC,CGSCC-CV,CHECK-CI,TUNIT-CI,CGSCC-CI"
+        ],
+        [
+          "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+          "FileCheck %s --check-prefixes=CHECK,CHECK-CV,TUNIT,TUNIT-CV,CGSCC,CGSCC-CV,CHECK-CI,TUNIT-CI,CGSCC-CI"
+        ],
+        [
+          "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+          "FileCheck %s --check-prefixes=CHECK,CHECK-CV,TUNIT,TUNIT-CV,CGSCC,CGSCC-CV,CHECK-CI,TUNIT-CI,CGSCC-CI"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "assume_returned_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_returned_arg(float %arg) {\n; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(inaccessiblemem: write)\n; CHECK-LABEL: define float @assume_returned_arg\n; CHECK-SAME: (float returned [[ARG:%.*]]) #[[ATTR19]] {\n; CHECK-NEXT:    [[ORD:%.*]] = fcmp ord float [[ARG]], 0.000000e+00\n; CHECK-NEXT:    call void @llvm.assume(i1 noundef [[ORD]]) #[[ATTR22]]\n; CHECK-NEXT:    ret float [[ARG]]\n  %ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %arg\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_returned_arg(float %arg) {\n  %ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %arg\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_pzero_maybe_undef",
+          "test_body": "define float @fadd_double_no_pzero_maybe_undef(float nofpclass(pzero) %arg) {\n; CHECK: Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)\n; CHECK-LABEL: define float @fadd_double_no_pzero_maybe_undef\n; CHECK-SAME: (float nofpclass(pzero) [[ARG:%.*]]) #[[ATTR3]] {\n; CHECK-NEXT:    [[ADD:%.*]] = fadd float [[ARG]], [[ARG]]\n; CHECK-NEXT:    ret float [[ADD]]\n  %add = fadd float %arg, %arg\n  ret float %add\n}",
+          "source_program": "define float @fadd_double_no_pzero_maybe_undef(float nofpclass(pzero) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero__output_only_is_ftpz",
+          "test_body": "define float @fadd_double_no_zero__output_only_is_ftpz(float noundef nofpclass(zero) %arg) #0 {",
+          "source_program": "define float @fadd_double_no_zero__output_only_is_ftpz(float noundef nofpclass(zero) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero__output_only_is_ftz",
+          "test_body": "define float @fadd_double_no_zero__output_only_is_ftz(float noundef nofpclass(zero) %arg) #0 {",
+          "source_program": "define float @fadd_double_no_zero__output_only_is_ftz(float noundef nofpclass(zero) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero_or_nsub__output_only_is_ftpz",
+          "test_body": "define float @fadd_double_no_zero_or_nsub__output_only_is_ftpz(float noundef nofpclass(zero nsub) %arg) #0 {",
+          "source_program": "define float @fadd_double_no_zero_or_nsub__output_only_is_ftpz(float noundef nofpclass(zero nsub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero_or_psub__output_only_is_ftpz",
+          "test_body": "define float @fadd_double_no_zero_or_psub__output_only_is_ftpz(float noundef nofpclass(zero psub) %arg) #0 {",
+          "source_program": "define float @fadd_double_no_zero_or_psub__output_only_is_ftpz(float noundef nofpclass(zero psub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero_or_sub__output_only_is_ftpz",
+          "test_body": "define float @fadd_double_no_zero_or_sub__output_only_is_ftpz(float noundef nofpclass(zero sub) %arg) #0 {",
+          "source_program": "define float @fadd_double_no_zero_or_sub__output_only_is_ftpz(float noundef nofpclass(zero sub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "exp_select_must_be_0_commute",
+          "test_body": "define nofpclass(nan) float @exp_select_must_be_0_commute(float %arg, float nofpclass(inf sub norm) %zero.or.nan) {\n; CHECK-LABEL: define nofpclass(nan) float @exp_select_must_be_0_commute\n; CHECK-SAME: (float [[ARG:%.*]], float nofpclass(inf sub norm) [[ZERO_OR_NAN:%.*]]) {\n; CHECK-NEXT:    ret float 1.000000e+00\n  %is.zero = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.zero, float %arg, float %zero.or.nan\n  %exp = call float @llvm.exp.f32(float %select)\n  ret float %exp\n}",
+          "source_program": "define nofpclass(nan) float @exp_select_must_be_0_commute(float %arg, float nofpclass(inf sub norm) %zero.or.nan) {\n  %is.zero = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.zero, float %arg, float %zero.or.nan\n  %exp = call float @llvm.exp.f32(float %select)\n  ret float %exp\n}\n"
+        },
+        {
+          "test_name": "ret_nofpclass_inf__select_multi_use_pinf_lhs",
+          "test_body": "define nofpclass(inf) float @ret_nofpclass_inf__select_multi_use_pinf_lhs(i1 %cond, float %x, ptr %ptr) {\n; CHECK-LABEL: define nofpclass(inf) float @ret_nofpclass_inf__select_multi_use_pinf_lhs\n; CHECK-SAME: (i1 [[COND:%.*]], float [[X:%.*]], ptr [[PTR:%.*]]) {\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], float 0x7FF0000000000000, float [[X]]\n; CHECK-NEXT:    store float [[SELECT]], ptr [[PTR]], align 4\n; CHECK-NEXT:    ret float [[SELECT]]\n  %select = select i1 %cond, float 0x7FF0000000000000, float %x\n  store float %select, ptr %ptr, align 4\n  ret float %select\n}",
+          "source_program": "define nofpclass(inf) float @ret_nofpclass_inf__select_multi_use_pinf_lhs(i1 %cond, float %x, ptr %ptr) {\n  %select = select i1 %cond, float 0x7FF0000000000000, float %x\n  store float %select, ptr %ptr, align 4\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "test_powr_issue64870_2",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.log2.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.exp2.f32(float) #0\n\ndefine nofpclass(nan inf nzero nsub nnorm) float @test_powr_issue64870_2(float nofpclass(nan inf) %arg, float nofpclass(nan inf) %arg1) {",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.log2.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.exp2.f32(float) #0\n\ndefine nofpclass(nan inf nzero nsub nnorm) float @test_powr_issue64870_2(float nofpclass(nan inf) %arg, float nofpclass(nan inf) %arg1) {\nbb:\n  %i = fcmp olt float %arg, 0.000000e+00\n  %i2 = select i1 %i, float 0x7FF8000000000000, float %arg\n  %i3 = tail call float @llvm.log2.f32(float noundef %i2)\n  %i4 = select i1 %i, float 0x7FF8000000000000, float %arg1\n  %i5 = fmul float %i4, %i3\n  %i6 = tail call noundef nofpclass(ninf nzero nsub nnorm) float @llvm.exp2.f32(float noundef %i5)\n  %i7 = fcmp olt float %i4, 0.000000e+00\n  %i8 = select i1 %i7, float 0x7FF0000000000000, float 0.000000e+00\n  %i9 = fcmp ueq float %i4, 0.000000e+00\n  %i10 = fcmp oeq float %i2, 0.000000e+00\n  %i11 = select i1 %i9, float 0x7FF8000000000000, float %i8\n  %i12 = select i1 %i10, float %i11, float %i6\n  ret float %i12\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

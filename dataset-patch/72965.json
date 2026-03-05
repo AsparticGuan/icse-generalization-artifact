@@ -1,0 +1,923 @@
+{
+  "pr_number": 72965,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/72965",
+  "title": "[InstCombine] Improve folds for `and/or cmp, cmp` ",
+  "commit_sha": "28b23d7b188b0198139eaaaf81ff57236e7cd36e",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/IR/PatternMatch.h": [
+        [
+          564,
+          569
+        ],
+        [
+          595,
+          600
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        [
+          739,
+          744
+        ],
+        [
+          3133,
+          3138
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          1010,
+          1019
+        ],
+        [
+          1027,
+          1037
+        ],
+        [
+          1043,
+          1054
+        ],
+        [
+          1541,
+          1548
+        ],
+        [
+          1667,
+          1673
+        ],
+        [
+          2471,
+          2477
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          4047,
+          4057
+        ],
+        [
+          4060,
+          4080
+        ],
+        [
+          4142,
+          4148
+        ],
+        [
+          4504,
+          4510
+        ],
+        [
+          4525,
+          4530
+        ],
+        [
+          4552,
+          4558
+        ],
+        [
+          5053,
+          5059
+        ],
+        [
+          5308,
+          5328
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          470,
+          475
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/IR/PatternMatch.h": [
+        "m_LowBitMask",
+        "m_NegatedPower2"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+        "InstCombinerImpl::foldAndOrOfICmps",
+        "InstCombinerImpl::simplifyRangeCheck"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::foldIntrinsicIsFPClass",
+        "InstCombinerImpl::visitCallInst",
+        "getKnownSign",
+        "getKnownSignOrZero"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpBinOp",
+        "InstCombinerImpl::foldICmpEquality",
+        "InstCombinerImpl::foldSelectICmp",
+        "foldICmpAndXX",
+        "foldICmpOrXX",
+        "foldICmpWithLowBitMaskedVal",
+        "foldICmpXNegX"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/IR/PatternMatch.h b/llvm/include/llvm/IR/PatternMatch.h\nindex f709a5ac52a41..6b086fccfb63c 100644\n--- a/llvm/include/llvm/IR/PatternMatch.h\n+++ b/llvm/include/llvm/IR/PatternMatch.h\n@@ -564,6 +564,19 @@ inline api_pred_ty<is_negated_power2> m_NegatedPower2(const APInt *&V) {\n   return V;\n }\n \n+struct is_negated_power2_or_zero {\n+  bool isValue(const APInt &C) { return !C || C.isNegatedPowerOf2(); }\n+};\n+/// Match a integer or vector negated power-of-2.\n+/// For vectors, this includes constants with undefined elements.\n+inline cst_pred_ty<is_negated_power2_or_zero> m_NegatedPower2OrZero() {\n+  return cst_pred_ty<is_negated_power2_or_zero>();\n+}\n+inline api_pred_ty<is_negated_power2_or_zero>\n+m_NegatedPower2OrZero(const APInt *&V) {\n+  return V;\n+}\n+\n struct is_power2_or_zero {\n   bool isValue(const APInt &C) { return !C || C.isPowerOf2(); }\n };\n@@ -595,6 +608,18 @@ inline cst_pred_ty<is_lowbit_mask> m_LowBitMask() {\n }\n inline api_pred_ty<is_lowbit_mask> m_LowBitMask(const APInt *&V) { return V; }\n \n+struct is_lowbit_mask_or_zero {\n+  bool isValue(const APInt &C) { return !C || C.isMask(); }\n+};\n+/// Match an integer or vector with only the low bit(s) set.\n+/// For vectors, this includes constants with undefined elements.\n+inline cst_pred_ty<is_lowbit_mask_or_zero> m_LowBitMaskOrZero() {\n+  return cst_pred_ty<is_lowbit_mask_or_zero>();\n+}\n+inline api_pred_ty<is_lowbit_mask_or_zero> m_LowBitMaskOrZero(const APInt *&V) {\n+  return V;\n+}\n+\n struct icmp_pred_with_threshold {\n   ICmpInst::Predicate Pred;\n   const APInt *Thr;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 02881109f17d2..2374bdc5d2171 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -739,6 +739,38 @@ Value *InstCombinerImpl::simplifyRangeCheck(ICmpInst *Cmp0, ICmpInst *Cmp1,\n   return Builder.CreateICmp(NewPred, Input, RangeEnd);\n }\n \n+// (or (icmp eq X, 0), (icmp eq X, Pow2OrZero))\n+//      -> (icmp eq (and X, Pow2OrZero), X)\n+// (and (icmp ne X, 0), (icmp ne X, Pow2OrZero))\n+//      -> (icmp ne (and X, Pow2OrZero), X)\n+static Value *\n+foldAndOrOfICmpsWithPow2AndWithZero(InstCombiner::BuilderTy &Builder,\n+                                    ICmpInst *LHS, ICmpInst *RHS, bool IsAnd,\n+                                    const SimplifyQuery &Q) {\n+  CmpInst::Predicate Pred = IsAnd ? CmpInst::ICMP_NE : CmpInst::ICMP_EQ;\n+  // Make sure we have right compares for our op.\n+  if (LHS->getPredicate() != Pred || RHS->getPredicate() != Pred)\n+    return nullptr;\n+\n+  // Make it so we can match LHS against the (icmp eq/ne X, 0) just for\n+  // simplicity.\n+  if (match(RHS->getOperand(1), m_Zero()))\n+    std::swap(LHS, RHS);\n+\n+  Value *Pow2, *Op;\n+  // Match the desired pattern:\n+  // LHS: (icmp eq/ne X, 0)\n+  // RHS: (icmp eq/ne X, Pow2OrZero)\n+  if (!match(LHS, m_ICmp(Pred, m_Value(Op), m_Zero())) ||\n+      !match(RHS, m_c_ICmp(Pred, m_Specific(Op), m_Value(Pow2))) ||\n+      !isKnownToBeAPowerOfTwo(Pow2, Q.DL, /*OrZero*/ true, /*Depth*/ 0, Q.AC,\n+                              Q.CxtI, Q.DT))\n+    return nullptr;\n+\n+  Value *And = Builder.CreateAnd(Op, Pow2);\n+  return Builder.CreateICmp(Pred, And, Op);\n+}\n+\n // Fold (iszero(A & K1) | iszero(A & K2)) -> (A & (K1 | K2)) != (K1 | K2)\n // Fold (!iszero(A & K1) & !iszero(A & K2)) -> (A & (K1 | K2)) == (K1 | K2)\n Value *InstCombinerImpl::foldAndOrOfICmpsOfAndWithPow2(ICmpInst *LHS,\n@@ -3133,6 +3165,11 @@ Value *InstCombinerImpl::foldAndOrOfICmps(ICmpInst *LHS, ICmpInst *RHS,\n   ICmpInst::Predicate PredL = LHS->getPredicate(), PredR = RHS->getPredicate();\n   Value *LHS0 = LHS->getOperand(0), *RHS0 = RHS->getOperand(0);\n   Value *LHS1 = LHS->getOperand(1), *RHS1 = RHS->getOperand(1);\n+  if (!IsLogical)\n+    if (Value *V =\n+            foldAndOrOfICmpsWithPow2AndWithZero(Builder, LHS, RHS, IsAnd, Q))\n+      return V;\n+\n   const APInt *LHSC = nullptr, *RHSC = nullptr;\n   match(LHS1, m_APInt(LHSC));\n   match(RHS1, m_APInt(RHSC));\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex f8346cd03849a..d7d9376eec8ee 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1010,10 +1010,9 @@ Instruction *InstCombinerImpl::foldIntrinsicIsFPClass(IntrinsicInst &II) {\n   return nullptr;\n }\n \n-static std::optional<bool> getKnownSign(Value *Op, Instruction *CxtI,\n-                                   const DataLayout &DL, AssumptionCache *AC,\n-                                   DominatorTree *DT) {\n-  KnownBits Known = computeKnownBits(Op, DL, 0, AC, CxtI, DT);\n+std::optional<bool> InstCombinerImpl::getKnownSign(Value *Op,\n+                                                   Instruction *CxtI) const {\n+  KnownBits Known = llvm::computeKnownBits(Op, DL, /*Depth*/ 0, &AC, CxtI, &DT);\n   if (Known.isNonNegative())\n     return false;\n   if (Known.isNegative())\n@@ -1027,11 +1026,9 @@ static std::optional<bool> getKnownSign(Value *Op, Instruction *CxtI,\n       ICmpInst::ICMP_SLT, Op, Constant::getNullValue(Op->getType()), CxtI, DL);\n }\n \n-static std::optional<bool> getKnownSignOrZero(Value *Op, Instruction *CxtI,\n-                                              const DataLayout &DL,\n-                                              AssumptionCache *AC,\n-                                              DominatorTree *DT) {\n-  if (std::optional<bool> Sign = getKnownSign(Op, CxtI, DL, AC, DT))\n+std::optional<bool>\n+InstCombinerImpl::getKnownSignOrZero(Value *Op, Instruction *CxtI) const {\n+  if (std::optional<bool> Sign = getKnownSign(Op, CxtI))\n     return Sign;\n \n   Value *X, *Y;\n@@ -1043,12 +1040,11 @@ static std::optional<bool> getKnownSignOrZero(Value *Op, Instruction *CxtI,\n \n /// Return true if two values \\p Op0 and \\p Op1 are known to have the same sign.\n static bool signBitMustBeTheSame(Value *Op0, Value *Op1, Instruction *CxtI,\n-                                 const DataLayout &DL, AssumptionCache *AC,\n-                                 DominatorTree *DT) {\n-  std::optional<bool> Known1 = getKnownSign(Op1, CxtI, DL, AC, DT);\n+                                 InstCombinerImpl &IC) {\n+  std::optional<bool> Known1 = IC.getKnownSign(Op1, CxtI);\n   if (!Known1)\n     return false;\n-  std::optional<bool> Known0 = getKnownSign(Op0, CxtI, DL, AC, DT);\n+  std::optional<bool> Known0 = IC.getKnownSign(Op0, CxtI);\n   if (!Known0)\n     return false;\n   return *Known0 == *Known1;\n@@ -1541,8 +1537,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n     if (match(IIOperand, m_Select(m_Value(), m_Neg(m_Value(X)), m_Deferred(X))))\n       return replaceOperand(*II, 0, X);\n \n-    if (std::optional<bool> Known =\n-            getKnownSignOrZero(IIOperand, II, DL, &AC, &DT)) {\n+    if (std::optional<bool> Known = getKnownSignOrZero(IIOperand, II)) {\n       // abs(x) -> x if x >= 0 (include abs(x-y) --> x - y where x >= y)\n       // abs(x) -> x if x > 0 (include abs(x-y) --> x - y where x > y)\n       if (!*Known)\n@@ -1667,7 +1662,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       bool UseAndN = IID == Intrinsic::smin || IID == Intrinsic::umin;\n \n       if (IID == Intrinsic::smax || IID == Intrinsic::smin) {\n-        auto KnownSign = getKnownSign(X, II, DL, &AC, &DT);\n+        auto KnownSign = getKnownSign(X, II);\n         if (KnownSign == std::nullopt) {\n           UseOr = false;\n           UseAndN = false;\n@@ -2471,7 +2466,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       FastMathFlags InnerFlags = cast<FPMathOperator>(Src)->getFastMathFlags();\n \n       if ((FMF.allowReassoc() && InnerFlags.allowReassoc()) ||\n-          signBitMustBeTheSame(Exp, InnerExp, II, DL, &AC, &DT)) {\n+          signBitMustBeTheSame(Exp, InnerExp, II, *this)) {\n         // TODO: Add nsw/nuw probably safe if integer type exceeds exponent\n         // width.\n         Value *NewExp = Builder.CreateAdd(InnerExp, Exp);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex b6e59f707e782..4cf76d639e063 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -4047,11 +4047,115 @@ Instruction *InstCombinerImpl::foldSelectICmp(ICmpInst::Predicate Pred,\n   return nullptr;\n }\n \n+// Returns of V is a Mask ((X + 1) & X == 0) or ~Mask (-Pow2OrZero)\n+static bool isMaskOrZero(const Value *V, bool Not, const SimplifyQuery &Q,\n+                         unsigned Depth = 0) {\n+  if (Not ? match(V, m_NegatedPower2OrZero()) : match(V, m_LowBitMaskOrZero()))\n+    return true;\n+  if (V->getType()->getScalarSizeInBits() == 1)\n+    return true;\n+  if (Depth++ >= MaxAnalysisRecursionDepth)\n+    return false;\n+  Value *X;\n+  if (match(V, m_Not(m_Value(X))))\n+    return isMaskOrZero(X, !Not, Q, Depth);\n+  const Operator *I = dyn_cast<Operator>(V);\n+  if (I == nullptr)\n+    return false;\n+  switch (I->getOpcode()) {\n+  case Instruction::ZExt:\n+    // ZExt(Mask) is a Mask.\n+    return !Not && isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+  case Instruction::SExt:\n+    // SExt(Mask) is a Mask.\n+    // SExt(~Mask) is a ~Mask.\n+    return isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+  case Instruction::And:\n+  case Instruction::Or:\n+    // Mask0 | Mask1 is a Mask.\n+    // Mask0 & Mask1 is a Mask.\n+    // ~Mask0 | ~Mask1 is a ~Mask.\n+    // ~Mask0 & ~Mask1 is a ~Mask.\n+    return isMaskOrZero(I->getOperand(1), Not, Q, Depth) &&\n+           isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+  case Instruction::Xor:\n+    // (X ^ (X - 1)) is a Mask\n+    return match(V, m_c_Xor(m_Value(X), m_Add(m_Deferred(X), m_AllOnes())));\n+  case Instruction::Select:\n+    // c ? Mask0 : Mask1 is a Mask.\n+    return isMaskOrZero(I->getOperand(1), Not, Q, Depth) &&\n+           isMaskOrZero(I->getOperand(2), Not, Q, Depth);\n+  case Instruction::Shl:\n+    if (Not) {\n+      // (-1 >> X) << X is ~Mask\n+      if (match(I->getOperand(0),\n+                m_Shr(m_AllOnes(), m_Specific(I->getOperand(1)))))\n+        return true;\n+\n+      // (~Mask) << X is a ~Mask.\n+      return isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+    }\n+    break;\n+  case Instruction::LShr:\n+    if (!Not) {\n+      // (-1 << X) >> X is a Mask\n+      if (match(I->getOperand(0),\n+                m_Shl(m_AllOnes(), m_Specific(I->getOperand(1)))))\n+        return true;\n+      // Mask >> X is a Mask.\n+      return isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+    }\n+    return false;\n+  case Instruction::AShr:\n+    // Mask s>> X is a Mask.\n+    // ~Mask s>> X is a ~Mask.\n+    return isMaskOrZero(I->getOperand(0), Not, Q, Depth);\n+  case Instruction::Add:\n+    // Pow2 - 1 is a Mask.\n+    if (!Not && match(I->getOperand(1), m_AllOnes()))\n+      return isKnownToBeAPowerOfTwo(I->getOperand(0), Q.DL, /*OrZero*/ true,\n+                                    Depth, Q.AC, Q.CxtI, Q.DT);\n+    break;\n+  case Instruction::Sub:\n+    // -Pow2 is a ~Mask.\n+    if (Not && match(I->getOperand(0), m_Zero()))\n+      return isKnownToBeAPowerOfTwo(I->getOperand(1), Q.DL, /*OrZero*/ true,\n+                                    Depth, Q.AC, Q.CxtI, Q.DT);\n+    break;\n+  case Instruction::Invoke:\n+  case Instruction::Call: {\n+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {\n+      switch (II->getIntrinsicID()) {\n+        // min/max(Mask0, Mask1) is a Mask.\n+        // min/max(~Mask0, ~Mask1) is a ~Mask.\n+      case Intrinsic::umax:\n+      case Intrinsic::smax:\n+      case Intrinsic::umin:\n+      case Intrinsic::smin:\n+        return isMaskOrZero(II->getArgOperand(1), Not, Q, Depth) &&\n+               isMaskOrZero(II->getArgOperand(0), Not, Q, Depth);\n+\n+        // In the context of masks, bitreverse(Mask) == ~Mask\n+      case Intrinsic::bitreverse:\n+        return isMaskOrZero(II->getArgOperand(0), !Not, Q, Depth);\n+      default:\n+        break;\n+      }\n+    }\n+    break;\n+  }\n+  default:\n+    break;\n+  }\n+  return false;\n+}\n+\n /// Some comparisons can be simplified.\n /// In this case, we are looking for comparisons that look like\n /// a check for a lossy truncation.\n /// Folds:\n ///   icmp SrcPred (x & Mask), x    to    icmp DstPred x, Mask\n+///   icmp eq/ne (x & ~Mask), 0     to    icmp DstPred x, Mask\n /// Where Mask is some pattern that produces all-ones in low bits:\n ///    (-1 >> y)\n ///    ((-1 << y) >> y)     <- non-canonical, has extra uses\n@@ -4060,21 +4164,45 @@ Instruction *InstCombinerImpl::foldSelectICmp(ICmpInst::Predicate Pred,\n /// The Mask can be a constant, too.\n /// For some predicates, the operands are commutative.\n /// For others, x can only be on a specific side.\n-static Value *foldICmpWithLowBitMaskedVal(ICmpInst &I,\n-                                          InstCombiner::BuilderTy &Builder) {\n+static Value *foldICmpWithLowBitMaskedVal(ICmpInst &I, const SimplifyQuery &Q,\n+                                          InstCombiner &IC) {\n+\n+  Value *X, *M;\n+  ICmpInst::Predicate Pred = I.getPredicate();\n   ICmpInst::Predicate SrcPred;\n-  Value *X, *M, *Y;\n-  auto m_VariableMask = m_CombineOr(\n-      m_CombineOr(m_Not(m_Shl(m_AllOnes(), m_Value())),\n-                  m_Add(m_Shl(m_One(), m_Value()), m_AllOnes())),\n-      m_CombineOr(m_LShr(m_AllOnes(), m_Value()),\n-                  m_LShr(m_Shl(m_AllOnes(), m_Value(Y)), m_Deferred(Y))));\n-  auto m_Mask = m_CombineOr(m_VariableMask, m_LowBitMask());\n-  if (!match(&I, m_c_ICmp(SrcPred,\n-                          m_c_And(m_CombineAnd(m_Mask, m_Value(M)), m_Value(X)),\n-                          m_Deferred(X))))\n-    return nullptr;\n+  bool NeedsNot = false;\n \n+  auto CheckMask = [&](Value *V, bool Not) {\n+    if (!ICmpInst::isSigned(Pred))\n+      return isMaskOrZero(V, Not, Q);\n+    return Not ? match(V, m_NegatedPower2OrZero())\n+               : match(V, m_LowBitMaskOrZero());\n+  };\n+\n+  auto TryMatch = [&](unsigned OpNo) {\n+    SrcPred = Pred;\n+    if (match(I.getOperand(OpNo),\n+              m_c_And(m_Specific(I.getOperand(1 - OpNo)), m_Value(M)))) {\n+      X = I.getOperand(1 - OpNo);\n+      if (OpNo)\n+        SrcPred = ICmpInst::getSwappedPredicate(Pred);\n+      return CheckMask(M, /*Not*/ false);\n+    }\n+    if (OpNo == 1 && match(I.getOperand(1), m_Zero()) &&\n+        ICmpInst::isEquality(Pred) &&\n+        match(I.getOperand(0), m_OneUse(m_And(m_Value(X), m_Value(M))))) {\n+      NeedsNot = true;\n+      if (IC.isFreeToInvert(X, X->hasOneUse()) && CheckMask(X, /*Not*/ true)) {\n+        std::swap(X, M);\n+        return true;\n+      }\n+      return IC.isFreeToInvert(M, M->hasOneUse()) && CheckMask(M, /*Not*/ true);\n+    }\n+    return false;\n+  };\n+\n+  if (!TryMatch(0) && !TryMatch(1))\n+    return nullptr;\n   ICmpInst::Predicate DstPred;\n   switch (SrcPred) {\n   case ICmpInst::Predicate::ICMP_EQ:\n@@ -4142,7 +4270,9 @@ static Value *foldICmpWithLowBitMaskedVal(ICmpInst &I,\n     M = Constant::replaceUndefsWith(VecC, SafeReplacementConstant);\n   }\n \n-  return Builder.CreateICmp(DstPred, X, M);\n+  if (NeedsNot)\n+    M = IC.Builder.CreateNot(M);\n+  return IC.Builder.CreateICmp(DstPred, X, M);\n }\n \n /// Some comparisons can be simplified.\n@@ -4504,7 +4634,7 @@ static Instruction *foldICmpXNegX(ICmpInst &I,\n   return nullptr;\n }\n \n-static Instruction *foldICmpAndXX(ICmpInst &I, const SimplifyQuery &Q,\n+static Instruction *foldICmpAndXX(ICmpInst &I, const SimplifyQuery &,\n                                   InstCombinerImpl &IC) {\n   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1), *A;\n   // Normalize and operand as operand 0.\n@@ -4525,6 +4655,65 @@ static Instruction *foldICmpAndXX(ICmpInst &I, const SimplifyQuery &Q,\n   if (Pred == ICmpInst::ICMP_UGE)\n     return new ICmpInst(ICmpInst::ICMP_EQ, Op0, Op1);\n \n+  if (ICmpInst::isEquality(Pred) && Op0->hasOneUse()) {\n+    // icmp (X & Y) eq/ne Y --> (X | ~Y) eq/ne -1 if Y is freely invertible and\n+    // Y is non-constant. If Y is constant this form is preferable (and\n+    // canonicalize too it elsewhere).\n+    if (!match(Op1, m_ImmConstant()) &&\n+        IC.isFreeToInvert(Op1, Op1->hasOneUse() || Op1->hasNUses(2)))\n+      return new ICmpInst(Pred,\n+                          IC.Builder.CreateOr(A, IC.Builder.CreateNot(Op1)),\n+                          Constant::getAllOnesValue(Op1->getType()));\n+    // icmp (X & Y) eq/ne Y --> (~X & Y) eq/ne 0 if X  is freely invertible.\n+    if (IC.isFreeToInvert(A, A->hasOneUse()))\n+      return new ICmpInst(Pred,\n+                          IC.Builder.CreateAnd(Op1, IC.Builder.CreateNot(A)),\n+                          Constant::getNullValue(Op1->getType()));\n+  }\n+\n+  if (ICmpInst::isEquality(Pred) || ICmpInst::getSignedPredicate(Pred) != Pred)\n+    return nullptr;\n+\n+  auto IsTrue = [](std::optional<bool> OptBool) {\n+    return OptBool.has_value() && OptBool.value();\n+  };\n+\n+  auto IsFalse = [](std::optional<bool> OptBool) {\n+    return OptBool.has_value() && !OptBool.value();\n+  };\n+\n+  auto KnownSignY = IC.getKnownSign(A, &I);\n+\n+  // (X & NegY) spred X --> (icmp (X & NegY) upred X\n+  if (IsTrue(KnownSignY))\n+    return new ICmpInst(ICmpInst::getUnsignedPredicate(Pred), Op0, Op1);\n+\n+  if (Pred != ICmpInst::ICMP_SLE && Pred != ICmpInst::ICMP_SGT)\n+    return nullptr;\n+\n+  if (IsFalse(KnownSignY)) {\n+    // (X & PosY) s<= X --> X s>= 0\n+    if (Pred == ICmpInst::ICMP_SLE)\n+      return new ICmpInst(ICmpInst::ICMP_SGE, Op1,\n+                          Constant::getNullValue(Op1->getType()));\n+    // (X & PosY) s> X --> X s< 0\n+    if (Pred == ICmpInst::ICMP_SGT)\n+      return new ICmpInst(ICmpInst::ICMP_SLT, Op1,\n+                          Constant::getNullValue(Op1->getType()));\n+  }\n+\n+  if (IsTrue(IC.getKnownSign(Op1, &I))) {\n+    // (NegX & Y) s> NegX --> Y s>= 0\n+    if (Pred == ICmpInst::ICMP_SGT)\n+      return new ICmpInst(ICmpInst::ICMP_SGE, A,\n+                          Constant::getNullValue(A->getType()));\n+\n+    // (NegX & Y) s<= NegX --> Y s< 0\n+    if (Pred == ICmpInst::ICMP_SLE)\n+      return new ICmpInst(ICmpInst::ICMP_SLT, A,\n+                          Constant::getNullValue(A->getType()));\n+  }\n+\n   return nullptr;\n }\n \n@@ -4552,7 +4741,7 @@ static Instruction *foldICmpOrXX(ICmpInst &I, const SimplifyQuery &Q,\n   if (ICmpInst::isEquality(Pred) && Op0->hasOneUse()) {\n     // icmp (X | Y) eq/ne Y --> (X & ~Y) eq/ne 0 if Y is freely invertible\n     if (Value *NotOp1 =\n-            IC.getFreelyInverted(Op1, Op1->hasOneUse(), &IC.Builder))\n+            IC.getFreelyInverted(Op1, !Op1->hasNUsesOrMore(3), &IC.Builder))\n       return new ICmpInst(Pred, IC.Builder.CreateAnd(A, NotOp1),\n                           Constant::getNullValue(Op1->getType()));\n     // icmp (X | Y) eq/ne Y --> (~X | Y) eq/ne -1 if X  is freely invertible.\n@@ -5053,7 +5242,7 @@ Instruction *InstCombinerImpl::foldICmpBinOp(ICmpInst &I,\n   if (Value *V = foldMultiplicationOverflowCheck(I))\n     return replaceInstUsesWith(I, V);\n \n-  if (Value *V = foldICmpWithLowBitMaskedVal(I, Builder))\n+  if (Value *V = foldICmpWithLowBitMaskedVal(I, Q, *this))\n     return replaceInstUsesWith(I, V);\n \n   if (Instruction *R = foldICmpAndXX(I, Q, *this))\n@@ -5308,21 +5497,6 @@ Instruction *InstCombinerImpl::foldICmpEquality(ICmpInst &I) {\n     }\n   }\n \n-  // canoncalize:\n-  // (icmp eq/ne (and X, C), X)\n-  //    -> (icmp eq/ne (and X, ~C), 0)\n-  {\n-    Constant *CMask;\n-    A = nullptr;\n-    if (match(Op0, m_OneUse(m_And(m_Specific(Op1), m_ImmConstant(CMask)))))\n-      A = Op1;\n-    else if (match(Op1, m_OneUse(m_And(m_Specific(Op0), m_ImmConstant(CMask)))))\n-      A = Op0;\n-    if (A)\n-      return new ICmpInst(Pred, Builder.CreateAnd(A, Builder.CreateNot(CMask)),\n-                          Constant::getNullValue(A->getType()));\n-  }\n-\n   if (match(Op1, m_Xor(m_Value(A), m_Value(B))) && (A == Op0 || B == Op0)) {\n     // A == (A^B)  ->  B == 0\n     Value *OtherVal = A == Op0 ? B : A;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 0bbb22be71569..cf0ccdfd651f5 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -470,6 +470,13 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n       Instruction::BinaryOps BinaryOp, bool IsSigned,\n       Value *LHS, Value *RHS, Instruction *CxtI) const;\n \n+  // Return true if known negative, false if known positive, and nullopt if\n+  // unknown.\n+  std::optional<bool> getKnownSign(Value *Op, Instruction *CxtI) const;\n+  // Return true if known negative or zero, false if known non-zero positive,\n+  // and nullopt if unknown.\n+  std::optional<bool> getKnownSignOrZero(Value *Op, Instruction *CxtI) const;\n+\n   /// Performs a few simplifications for operators which are associative\n   /// or commutative.\n   bool SimplifyAssociativeOrCommutative(BinaryOperator &I);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/and-or-icmps.ll b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\nindex 881a9b7ff129d..eb91bd7cbf13d 100644\n--- a/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n+++ b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n@@ -3044,3 +3044,146 @@ define i32 @icmp_slt_0_or_icmp_add_1_sge_100_i32_fail(i32 %x) {\n   %D = or i32 %C, %B\n   ret i32 %D\n }\n+\n+define i1 @icmp_eq_or_z_or_pow2orz(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_or_z_or_pow2orz(\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[POW2ORZ]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP1]], [[X]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %ny = sub i8 0, %y\n+  %pow2orz = and i8 %ny, %y\n+\n+  %c0 = icmp eq i8 %x, 0\n+  %cp2 = icmp eq i8 %x, %pow2orz\n+  %r = or i1 %c0, %cp2\n+  ret i1 %r\n+}\n+\n+\n+define i1 @icmp_eq_or_z_or_pow2orz_fail_logic_or(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_or_z_or_pow2orz_fail_logic_or(\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[C0:%.*]] = icmp eq i8 [[X:%.*]], 0\n+; CHECK-NEXT:    [[CP2:%.*]] = icmp eq i8 [[POW2ORZ]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C0]], i1 true, i1 [[CP2]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %ny = sub i8 0, %y\n+  %pow2orz = and i8 %ny, %y\n+\n+  %c0 = icmp eq i8 %x, 0\n+  %cp2 = icmp eq i8 %x, %pow2orz\n+  %r = select i1 %c0, i1 true, i1 %cp2\n+  ret i1 %r\n+}\n+\n+\n+define <2 x i1> @icmp_ne_and_z_and_pow2orz(<2 x i8> %x, <2 x i8> %y) {\n+; CHECK-LABEL: @icmp_ne_and_z_and_pow2orz(\n+; CHECK-NEXT:    [[NY:%.*]] = sub <2 x i8> zeroinitializer, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and <2 x i8> [[NY]], [[Y]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[POW2ORZ]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne <2 x i8> [[TMP1]], [[X]]\n+; CHECK-NEXT:    ret <2 x i1> [[R]]\n+;\n+  %ny = sub <2 x i8> zeroinitializer, %y\n+  %pow2orz = and <2 x i8> %ny, %y\n+\n+  %c0 = icmp ne <2 x i8> %x, zeroinitializer\n+  %cp2 = icmp ne <2 x i8> %x, %pow2orz\n+  %r = and <2 x i1> %c0, %cp2\n+  ret <2 x i1> %r\n+}\n+\n+define <2 x i1> @icmp_ne_and_z_and_pow2orz_fail_logic_and(<2 x i8> %x, <2 x i8> %y) {\n+; CHECK-LABEL: @icmp_ne_and_z_and_pow2orz_fail_logic_and(\n+; CHECK-NEXT:    [[NY:%.*]] = sub <2 x i8> zeroinitializer, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and <2 x i8> [[NY]], [[Y]]\n+; CHECK-NEXT:    [[C0:%.*]] = icmp ne <2 x i8> [[X:%.*]], zeroinitializer\n+; CHECK-NEXT:    [[CP2:%.*]] = icmp ne <2 x i8> [[POW2ORZ]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[C0]], <2 x i1> [[CP2]], <2 x i1> zeroinitializer\n+; CHECK-NEXT:    ret <2 x i1> [[R]]\n+;\n+  %ny = sub <2 x i8> zeroinitializer, %y\n+  %pow2orz = and <2 x i8> %ny, %y\n+\n+  %c0 = icmp ne <2 x i8> %x, zeroinitializer\n+  %cp2 = icmp ne <2 x i8> %x, %pow2orz\n+  %r = select <2 x i1> %c0, <2 x i1> %cp2, <2 x i1> zeroinitializer\n+  ret <2 x i1> %r\n+}\n+\n+define i1 @icmp_eq_or_z_or_pow2orz_fail_not_pow2(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_or_z_or_pow2orz_fail_not_pow2(\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 1, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[C0:%.*]] = icmp eq i8 [[X:%.*]], 0\n+; CHECK-NEXT:    [[CP2:%.*]] = icmp eq i8 [[POW2ORZ]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = or i1 [[C0]], [[CP2]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %ny = sub i8 1, %y\n+  %pow2orz = and i8 %ny, %y\n+\n+  %c0 = icmp eq i8 %x, 0\n+  %cp2 = icmp eq i8 %x, %pow2orz\n+  %r = or i1 %c0, %cp2\n+  ret i1 %r\n+}\n+\n+define i1 @icmp_eq_or_z_or_pow2orz_fail_nonzero_const(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_or_z_or_pow2orz_fail_nonzero_const(\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[C0:%.*]] = icmp eq i8 [[X:%.*]], 1\n+; CHECK-NEXT:    [[CP2:%.*]] = icmp eq i8 [[POW2ORZ]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = or i1 [[C0]], [[CP2]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %ny = sub i8 0, %y\n+  %pow2orz = and i8 %ny, %y\n+\n+  %c0 = icmp eq i8 %x, 1\n+  %cp2 = icmp eq i8 %x, %pow2orz\n+  %r = or i1 %c0, %cp2\n+  ret i1 %r\n+}\n+\n+define <2 x i1> @icmp_ne_and_z_and_pow2orz_fail_bad_pred(<2 x i8> %x, <2 x i8> %y) {\n+; CHECK-LABEL: @icmp_ne_and_z_and_pow2orz_fail_bad_pred(\n+; CHECK-NEXT:    [[NY:%.*]] = sub <2 x i8> zeroinitializer, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and <2 x i8> [[NY]], [[Y]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = or <2 x i8> [[POW2ORZ]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    ret <2 x i1> [[R]]\n+;\n+  %ny = sub <2 x i8> zeroinitializer, %y\n+  %pow2orz = and <2 x i8> %ny, %y\n+\n+  %c0 = icmp eq <2 x i8> %x, zeroinitializer\n+  %cp2 = icmp eq <2 x i8> %x, %pow2orz\n+  %r = and <2 x i1> %c0, %cp2\n+  ret <2 x i1> %r\n+}\n+\n+define i1 @icmp_eq_or_z_or_pow2orz_fail_bad_pred2(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_or_z_or_pow2orz_fail_bad_pred2(\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[POW2ORZ:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[C0:%.*]] = icmp slt i8 [[X:%.*]], 1\n+; CHECK-NEXT:    [[CP2:%.*]] = icmp sge i8 [[POW2ORZ]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = or i1 [[C0]], [[CP2]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %ny = sub i8 0, %y\n+  %pow2orz = and i8 %ny, %y\n+\n+  %c0 = icmp sle i8 %x, 0\n+  %cp2 = icmp sle i8 %x, %pow2orz\n+  %r = or i1 %c0, %cp2\n+  ret i1 %r\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll\nindex a957fb2d088ef..5b7a99d53c308 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll\n@@ -62,8 +62,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X:%.*]], <i8 4, i8 1>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll\nindex 57361cdf38977..160d968b9ac4c 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll\n@@ -62,8 +62,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X:%.*]], <i8 3, i8 0>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll\nindex 0dfc9f51baf9c..0380c052d5d02 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll\n@@ -50,8 +50,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n-; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X:%.*]], <i8 3, i8 0>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sge <2 x i8> [[TMP0]], [[X]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[X:%.*]], <i8 4, i8 1>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n@@ -99,8 +98,7 @@ declare i8 @gen8()\n define i1 @c0() {\n ; CHECK-LABEL: @c0(\n ; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n-; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sge i8 [[X]], [[TMP0]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp sgt i8 [[X]], -1\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %x = call i8 @gen8()\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll\nindex e0893ce4cf2ec..4a8b4d4ba595c 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll\n@@ -63,8 +63,7 @@ define <2 x i1> @p2_vec_nonsplat() {\n define <2 x i1> @p2_vec_nonsplat_edgecase() {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n ; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n-; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X]], <i8 3, i8 0>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X]], [[TMP0]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X]], <i8 3, i8 0>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %x = call <2 x i8> @gen2x8()\n@@ -126,8 +125,7 @@ define i1 @oneuse0() {\n \n define i1 @c0(i8 %x) {\n ; CHECK-LABEL: @c0(\n-; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X:%.*]], 3\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sgt i8 [[TMP0]], [[X]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp slt i8 [[X:%.*]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %tmp0 = and i8 %x, 3\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll\nindex 81887a3909157..8d00f445243a4 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll\n@@ -63,8 +63,7 @@ define <2 x i1> @p2_vec_nonsplat() {\n define <2 x i1> @p2_vec_nonsplat_edgecase() {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n ; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n-; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X]], <i8 3, i8 0>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sle <2 x i8> [[X]], [[TMP0]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[X]], <i8 4, i8 1>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %x = call <2 x i8> @gen2x8()\n@@ -114,8 +113,7 @@ define i1 @oneuse0() {\n \n define i1 @c0(i8 %x) {\n ; CHECK-LABEL: @c0(\n-; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X:%.*]], 3\n-; CHECK-NEXT:    [[RET:%.*]] = icmp sle i8 [[TMP0]], [[X]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp sgt i8 [[X:%.*]], -1\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %tmp0 = and i8 %x, 3\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll\nindex 8ce8687f19844..8130029a3dd58 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll\n@@ -50,8 +50,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n-; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X:%.*]], <i8 3, i8 0>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[TMP0]], [[X]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X:%.*]], <i8 3, i8 0>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n@@ -109,8 +108,7 @@ declare i8 @gen8()\n define i1 @c0() {\n ; CHECK-LABEL: @c0(\n ; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n-; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n-; CHECK-NEXT:    [[RET:%.*]] = icmp slt i8 [[X]], [[TMP0]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp slt i8 [[X]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %x = call i8 @gen8()\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll\nindex ff09e255185b5..a93e8f779435f 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll\n@@ -62,8 +62,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X:%.*]], <i8 4, i8 1>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll\nindex 4ad04710fd7bb..73ea4d456d246 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll\n@@ -75,8 +75,7 @@ define <2 x i1> @p2_vec_nonsplat() {\n define <2 x i1> @p2_vec_nonsplat_edgecase0() {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n ; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X]], <i8 3, i8 0>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %x = call <2 x i8> @gen2x8()\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll\nindex 8e513dcbf4ef3..53886b5f2dc9c 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll\n@@ -75,8 +75,7 @@ define <2 x i1> @p2_vec_nonsplat() {\n define <2 x i1> @p2_vec_nonsplat_edgecase0() {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n ; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X]], <i8 4, i8 1>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %x = call <2 x i8> @gen2x8()\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll\nindex d02ecf6965e87..d66be571008c2 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll\n@@ -62,8 +62,7 @@ define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n \n define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n ; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X:%.*]], <i8 3, i8 0>\n ; CHECK-NEXT:    ret <2 x i1> [[RET]]\n ;\n   %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll\nindex dfd67eae8aafd..85a3cae7ee07f 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll\n@@ -269,9 +269,8 @@ define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n define i1 @n1(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n1(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n-; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[T0]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[TMP1]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 1, %y ; not -1\n@@ -284,9 +283,9 @@ define i1 @n1(i8 %x, i8 %y) {\n define i1 @n2(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n2(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n-; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], 1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[T0]], -2\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 -1, %y\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll\nindex 608e133ec7f73..95b8381095abc 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll\n@@ -269,9 +269,8 @@ define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n define i1 @n1(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n1(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n-; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[T0]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[TMP1]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 1, %y ; not -1\n@@ -284,9 +283,9 @@ define i1 @n1(i8 %x, i8 %y) {\n define i1 @n2(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n2(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n-; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], 1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[T0]], -2\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 -1, %y\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll\nindex a65be1e9ceeca..946bb03e04f7e 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll\n@@ -251,9 +251,9 @@ define i1 @n1(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n1(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n ; CHECK-NEXT:    call void @use8(i8 [[T0]])\n-; CHECK-NEXT:    [[T1:%.*]] = add i8 [[T0]], -1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = sub i8 0, [[T0]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 -1, %y ; not 1\n@@ -268,9 +268,9 @@ define i1 @n2(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n2(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n ; CHECK-NEXT:    call void @use8(i8 [[T0]])\n-; CHECK-NEXT:    [[T1:%.*]] = add nuw i8 [[T0]], 1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = sub nuw i8 -2, [[T0]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 1, %y\ndiff --git a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll\nindex f156d9bf007cb..63d406d54179f 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll\n@@ -251,9 +251,9 @@ define i1 @n1(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n1(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n ; CHECK-NEXT:    call void @use8(i8 [[T0]])\n-; CHECK-NEXT:    [[T1:%.*]] = add i8 [[T0]], -1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = sub i8 0, [[T0]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 -1, %y ; not 1\n@@ -268,9 +268,9 @@ define i1 @n2(i8 %x, i8 %y) {\n ; CHECK-LABEL: @n2(\n ; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n ; CHECK-NEXT:    call void @use8(i8 [[T0]])\n-; CHECK-NEXT:    [[T1:%.*]] = add nuw i8 [[T0]], 1\n-; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n-; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = sub nuw i8 -2, [[T0]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[RET]]\n ;\n   %t0 = shl i8 1, %y\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-and-lowbit-mask.ll b/llvm/test/Transforms/InstCombine/icmp-and-lowbit-mask.ll\nnew file mode 100644\nindex 0000000000000..c07008b306b83\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/icmp-and-lowbit-mask.ll\n@@ -0,0 +1,623 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+declare void @llvm.assume(i1)\n+declare i8 @llvm.ctpop.i8(i8)\n+declare i8 @llvm.umin.i8(i8, i8)\n+declare i8 @llvm.umax.i8(i8, i8)\n+declare i8 @llvm.smin.i8(i8, i8)\n+declare i8 @llvm.smax.i8(i8, i8)\n+declare i8 @llvm.bitreverse.i8(i8)\n+declare void @use.i8(i8)\n+declare void @use.i16(i16)\n+define i1 @src_is_mask_zext(i16 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_zext(\n+; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = zext i8 [[M_IN]] to i16\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i16 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = lshr i8 -1, %y\n+  %mask = zext i8 %m_in to i16\n+\n+  %and = and i16 %x, %mask\n+  %r = icmp eq i16 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_zext_fail_not_mask(i16 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_zext_fail_not_mask(\n+; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -2, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = zext i8 [[M_IN]] to i16\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i16 [[X_IN:%.*]], -124\n+; CHECK-NEXT:    [[TMP2:%.*]] = or i16 [[TMP1]], [[MASK]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[TMP2]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = lshr i8 -2, %y\n+  %mask = zext i8 %m_in to i16\n+\n+  %and = and i16 %x, %mask\n+  %r = icmp eq i16 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_sext(i16 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_sext(\n+; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 31, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = zext nneg i8 [[M_IN]] to i16\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i16 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = lshr i8 31, %y\n+  %mask = sext i8 %m_in to i16\n+  %notmask = xor i16 %mask, -1\n+\n+  %and = and i16 %notmask, %x\n+  %r = icmp eq i16 %and, 0\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_sext_fail_multiuse(i16 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_sext_fail_multiuse(\n+; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 122\n+; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[M_IN]], -1\n+; CHECK-NEXT:    [[NOTMASK:%.*]] = sext i8 [[TMP1]] to i16\n+; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[NOTMASK]]\n+; CHECK-NEXT:    call void @use.i16(i16 [[AND]])\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = lshr i8 -1, %y\n+  %mask = sext i8 %m_in to i16\n+  %notmask = xor i16 %mask, -1\n+\n+  %and = and i16 %notmask, %x\n+  call void @use.i16(i16 %and)\n+  %r = icmp eq i16 %and, 0\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_and(i8 %x_in, i8 %y, i8 %z) {\n+; CHECK-LABEL: @src_is_mask_and(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[MY:%.*]] = lshr i8 7, [[Y:%.*]]\n+; CHECK-NEXT:    [[MZ:%.*]] = lshr i8 -1, [[Z:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], [[MZ]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %my = ashr i8 7, %y\n+  %mz = lshr i8 -1, %z\n+  %mask = and i8 %my, %mz\n+\n+  %and = and i8 %x, %mask\n+  %r = icmp eq i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_and_fail_mixed(i8 %x_in, i8 %y, i8 %z) {\n+; CHECK-LABEL: @src_is_mask_and_fail_mixed(\n+; CHECK-NEXT:    [[MY:%.*]] = ashr i8 -8, [[Y:%.*]]\n+; CHECK-NEXT:    [[MZ:%.*]] = lshr i8 -1, [[Z:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], [[MZ]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[X_IN:%.*]], -124\n+; CHECK-NEXT:    [[TMP2:%.*]] = or i8 [[MASK]], [[TMP1]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP2]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %my = ashr i8 -8, %y\n+  %mz = lshr i8 -1, %z\n+  %mask = and i8 %my, %mz\n+\n+  %and = and i8 %x, %mask\n+  %r = icmp eq i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_or(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_or(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[MY:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], 7\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %my = lshr i8 -1, %y\n+  %mask = and i8 %my, 7\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp eq i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_xor(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_xor(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[MASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %mask = xor i8 %y, %y_m1\n+  %and = and i8 %x, %mask\n+  %r = icmp ne i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_xor_fail_notmask(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_xor_fail_notmask(\n+; CHECK-NEXT:    [[TMP1:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[TMP1]], [[Y]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = xor i8 [[X_IN:%.*]], -124\n+; CHECK-NEXT:    [[TMP3:%.*]] = or i8 [[NOTMASK]], [[TMP2]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[TMP3]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %mask = xor i8 %y, %y_m1\n+  %notmask = xor i8 %mask, -1\n+  %and = and i8 %x, %notmask\n+  %r = icmp ne i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_select(i8 %x_in, i8 %y, i1 %cond) {\n+; CHECK-LABEL: @src_is_mask_select(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = select i1 %cond, i8 %ymask, i8 15\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp ne i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_select_fail_wrong_pattern(i8 %x_in, i8 %y, i1 %cond, i8 %z) {\n+; CHECK-LABEL: @src_is_mask_select_fail_wrong_pattern(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n+; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[Z:%.*]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = select i1 %cond, i8 %ymask, i8 15\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp ne i8 %and, %z\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_shl_lshr(i8 %x_in, i8 %y, i1 %cond) {\n+; CHECK-LABEL: @src_is_mask_shl_lshr(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n+; CHECK-NEXT:    [[TMP1:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[TMP1]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %m_shl = shl i8 -1, %y\n+  %mask = lshr i8 %m_shl, %y\n+  %notmask = xor i8 %mask, -1\n+\n+  %and = and i8 %x, %notmask\n+  %r = icmp ne i8 0, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_shl_lshr_fail_not_allones(i8 %x_in, i8 %y, i1 %cond) {\n+; CHECK-LABEL: @src_is_mask_shl_lshr_fail_not_allones(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[TMP1:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[TMP1]], -2\n+; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[MASK]], -1\n+; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %m_shl = shl i8 -2, %y\n+  %mask = lshr i8 %m_shl, %y\n+  %notmask = xor i8 %mask, -1\n+\n+  %and = and i8 %x, %notmask\n+  %r = icmp ne i8 0, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_lshr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n+; CHECK-LABEL: @src_is_mask_lshr(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[SMASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n+; CHECK-NEXT:    [[MASK:%.*]] = lshr i8 [[SMASK]], [[Z:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %smask = select i1 %cond, i8 %ymask, i8 15\n+  %mask = lshr i8 %smask, %z\n+  %and = and i8 %mask, %x\n+  %r = icmp ne i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_ashr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n+; CHECK-LABEL: @src_is_mask_ashr(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[SMASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n+; CHECK-NEXT:    [[MASK:%.*]] = ashr i8 [[SMASK]], [[Z:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %smask = select i1 %cond, i8 %ymask, i8 15\n+  %mask = ashr i8 %smask, %z\n+  %and = and i8 %x, %mask\n+  %r = icmp ult i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_p2_m1(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_p2_m1(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[P2ORZ:%.*]] = shl i8 2, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = add i8 [[P2ORZ]], -1\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %p2orz = shl i8 2, %y\n+  %mask = add i8 %p2orz, -1\n+  %and = and i8 %mask, %x\n+  %r = icmp ult i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_umax(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_umax(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umax.i8(i8 [[YMASK]], i8 3)\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = call i8 @llvm.umax.i8(i8 %ymask, i8 3)\n+\n+  %and = and i8 %x, %mask\n+  %r = icmp ugt i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_umin(i8 %x_in, i8 %y, i8 %z) {\n+; CHECK-LABEL: @src_is_mask_umin(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[ZMASK:%.*]] = lshr i8 15, [[Z:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umin.i8(i8 [[YMASK]], i8 [[ZMASK]])\n+; CHECK-NEXT:    [[R:%.*]] = icmp ugt i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %zmask = lshr i8 15, %z\n+  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 %zmask)\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp ugt i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_umin_fail_mismatch(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_umin_fail_mismatch(\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umin.i8(i8 [[YMASK]], i8 -32)\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[X_IN:%.*]], -124\n+; CHECK-NEXT:    [[TMP2:%.*]] = or i8 [[MASK]], [[TMP1]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[TMP2]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 -32)\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp ugt i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_smax(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_smax(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.smax.i8(i8 [[YMASK]], i8 -1)\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = call i8 @llvm.smax.i8(i8 %ymask, i8 -1)\n+\n+  %and = and i8 %x, %mask\n+  %r = icmp uge i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_smin(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_smin(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.smin.i8(i8 [[YMASK]], i8 0)\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %y_m1 = add i8 %y, -1\n+  %ymask = xor i8 %y, %y_m1\n+  %mask = call i8 @llvm.smin.i8(i8 %ymask, i8 0)\n+\n+  %and = and i8 %mask, %x\n+  %r = icmp uge i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_bitreverse_not_mask(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_mask_bitreverse_not_mask(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %nmask = shl i8 -1, %y\n+  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n+\n+  %and = and i8 %x, %mask\n+  %r = icmp ule i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_sext(i16 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_notmask_sext(\n+; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[M_IN:%.*]] = shl i8 -8, [[Y:%.*]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[M_IN]], -1\n+; CHECK-NEXT:    [[MASK:%.*]] = sext i8 [[TMP1]] to i16\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i16 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = shl i8 -8, %y\n+  %nmask = sext i8 %m_in to i16\n+  %mask = xor i16 %nmask, -1\n+  %and = and i16 %mask, %x\n+  %r = icmp ule i16 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_shl(i8 %x_in, i8 %y, i1 %cond) {\n+; CHECK-LABEL: @src_is_notmask_shl(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n+; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i8 [[MASK]], i8 7\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[TMP1]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %nmask = shl i8 -1, %y\n+  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n+  %notmask0 = xor i8 %mask, -1\n+  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n+  %and = and i8 %x, %notmask\n+  %r = icmp eq i8 %and, 0\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_shl_fail_multiuse_invert(i8 %x_in, i8 %y, i1 %cond) {\n+; CHECK-LABEL: @src_is_notmask_shl_fail_multiuse_invert(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n+; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n+; CHECK-NEXT:    [[NOTMASK0:%.*]] = xor i8 [[MASK]], -1\n+; CHECK-NEXT:    [[NOTMASK:%.*]] = select i1 [[COND:%.*]], i8 [[NOTMASK0]], i8 -8\n+; CHECK-NEXT:    call void @use.i8(i8 [[NOTMASK]])\n+; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %nmask = shl i8 -1, %y\n+  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n+  %notmask0 = xor i8 %mask, -1\n+  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n+  call void @use.i8(i8 %notmask)\n+  %and = and i8 %x, %notmask\n+  %r = icmp eq i8 %and, 0\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_lshr_shl(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_notmask_lshr_shl(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[X_HIGHBITS:%.*]] = lshr i8 [[X]], [[Y:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[X_HIGHBITS]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %mask_shr = lshr i8 -1, %y\n+  %nmask = shl i8 %mask_shr, %y\n+  %mask = xor i8 %nmask, -1\n+  %and = and i8 %mask, %x\n+  %r = icmp eq i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_lshr_shl_fail_mismatch_shifts(i8 %x_in, i8 %y, i8 %z) {\n+; CHECK-LABEL: @src_is_notmask_lshr_shl_fail_mismatch_shifts(\n+; CHECK-NEXT:    [[MASK_SHR:%.*]] = lshr i8 -1, [[Y:%.*]]\n+; CHECK-NEXT:    [[NMASK:%.*]] = shl i8 [[MASK_SHR]], [[Z:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = xor i8 [[NMASK]], -1\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[X_IN:%.*]], -124\n+; CHECK-NEXT:    [[TMP2:%.*]] = or i8 [[TMP1]], [[MASK]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP2]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %mask_shr = lshr i8 -1, %y\n+  %nmask = shl i8 %mask_shr, %z\n+  %mask = xor i8 %nmask, -1\n+  %and = and i8 %mask, %x\n+  %r = icmp eq i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_ashr(i16 %x_in, i8 %y, i16 %z) {\n+; CHECK-LABEL: @src_is_notmask_ashr(\n+; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[M_IN:%.*]] = shl i8 -32, [[Y:%.*]]\n+; CHECK-NEXT:    [[NMASK:%.*]] = sext i8 [[M_IN]] to i16\n+; CHECK-NEXT:    [[NMASK_SHR:%.*]] = ashr i16 [[NMASK]], [[Z:%.*]]\n+; CHECK-NEXT:    [[MASK:%.*]] = xor i16 [[NMASK_SHR]], -1\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i16 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i16 %x_in, 123\n+  %m_in = shl i8 -32, %y\n+  %nmask = sext i8 %m_in to i16\n+  %nmask_shr = ashr i16 %nmask, %z\n+  %mask = xor i16 %nmask_shr, -1\n+  %and = and i16 %x, %mask\n+  %r = icmp eq i16 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_neg_p2(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_notmask_neg_p2(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n+; CHECK-NEXT:    [[P2:%.*]] = and i8 [[NY]], [[Y]]\n+; CHECK-NEXT:    [[NMASK:%.*]] = sub i8 0, [[P2]]\n+; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[MASK]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %ny = sub i8 0, %y\n+  %p2 = and i8 %ny, %y\n+  %nmask = sub i8 0, %p2\n+  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n+  %notmask = xor i8 %mask, -1\n+  %and = and i8 %notmask, %x\n+  %r = icmp eq i8 0, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_notmask_neg_p2_fail_not_invertable(i8 %x_in, i8 %y) {\n+; CHECK-LABEL: @src_is_notmask_neg_p2_fail_not_invertable(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i8 [[Y:%.*]], -1\n+; CHECK-NEXT:    [[TMP2:%.*]] = xor i8 [[Y]], -1\n+; CHECK-NEXT:    [[TMP3:%.*]] = and i8 [[TMP1]], [[TMP2]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp ule i8 [[X]], [[TMP3]]\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %ny = sub i8 0, %y\n+  %p2 = and i8 %ny, %y\n+  %notmask = sub i8 0, %p2\n+  %and = and i8 %notmask, %x\n+  %r = icmp eq i8 0, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_const_slt(i8 %x_in) {\n+; CHECK-LABEL: @src_is_mask_const_slt(\n+; CHECK-NEXT:    [[R:%.*]] = icmp slt i8 [[X_IN:%.*]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %and = and i8 %x, 7\n+  %r = icmp slt i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_const_sgt(i8 %x_in) {\n+; CHECK-LABEL: @src_is_mask_const_sgt(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt i8 [[X]], 7\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %and = and i8 %x, 7\n+  %r = icmp sgt i8 %x, %and\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_const_sle(i8 %x_in) {\n+; CHECK-LABEL: @src_is_mask_const_sle(\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt i8 [[X_IN:%.*]], -1\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %and = and i8 %x, 31\n+  %r = icmp sle i8 %and, %x\n+  ret i1 %r\n+}\n+\n+define i1 @src_is_mask_const_sge(i8 %x_in) {\n+; CHECK-LABEL: @src_is_mask_const_sge(\n+; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n+; CHECK-NEXT:    [[R:%.*]] = icmp slt i8 [[X]], 32\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %x = xor i8 %x_in, 123\n+  %and = and i8 %x, 31\n+  %r = icmp sge i8 %and, %x\n+  ret i1 %r\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-of-and-x.ll b/llvm/test/Transforms/InstCombine/icmp-of-and-x.ll\nindex e95c72b75f97d..bfb4abc80ae37 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-of-and-x.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-of-and-x.ll\n@@ -57,7 +57,7 @@ define i1 @icmp_sge_x_negy(i8 %x, i8 %y) {\n ; CHECK-NEXT:    [[CY:%.*]] = icmp slt i8 [[Y:%.*]], 0\n ; CHECK-NEXT:    call void @llvm.assume(i1 [[CY]])\n ; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sge i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp eq i8 [[AND]], [[X]]\n ; CHECK-NEXT:    ret i1 [[Z]]\n ;\n   %cy = icmp slt i8 %y, 0\n@@ -73,7 +73,7 @@ define i1 @icmp_slt_x_negy(i8 %x, i8 %y) {\n ; CHECK-NEXT:    br i1 [[CY]], label [[NEGY:%.*]], label [[POSY:%.*]]\n ; CHECK:       negy:\n ; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp slt i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp ne i8 [[AND]], [[X]]\n ; CHECK-NEXT:    ret i1 [[Z]]\n ; CHECK:       posy:\n ; CHECK-NEXT:    [[R:%.*]] = call i1 @barrier()\n@@ -115,10 +115,7 @@ posy:\n \n define i1 @icmp_sle_x_negy(i8 %x, i8 %yy) {\n ; CHECK-LABEL: @icmp_sle_x_negy(\n-; CHECK-NEXT:    [[Y:%.*]] = or i8 [[YY:%.*]], -128\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[Y]], [[X:%.*]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sle i8 [[AND]], [[X]]\n-; CHECK-NEXT:    ret i1 [[Z]]\n+; CHECK-NEXT:    ret i1 true\n ;\n   %y = or i8 %yy, 128\n   %and = and i8 %y, %x\n@@ -128,10 +125,7 @@ define i1 @icmp_sle_x_negy(i8 %x, i8 %yy) {\n \n define <2 x i1> @icmp_sgt_x_negy(<2 x i8> %x, <2 x i8> %yy) {\n ; CHECK-LABEL: @icmp_sgt_x_negy(\n-; CHECK-NEXT:    [[Y:%.*]] = or <2 x i8> [[YY:%.*]], <i8 -128, i8 -128>\n-; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[Y]], [[X:%.*]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[AND]], [[X]]\n-; CHECK-NEXT:    ret <2 x i1> [[Z]]\n+; CHECK-NEXT:    ret <2 x i1> zeroinitializer\n ;\n   %y = or <2 x i8> %yy, <i8 128, i8 128>\n   %and = and <2 x i8> %y, %x\n@@ -154,9 +148,7 @@ define <2 x i1> @icmp_sgt_x_negy_fail_partial(<2 x i8> %x, <2 x i8> %yy) {\n \n define <2 x i1> @icmp_sle_x_posy(<2 x i8> %x, <2 x i8> %yy) {\n ; CHECK-LABEL: @icmp_sle_x_posy(\n-; CHECK-NEXT:    [[Y:%.*]] = and <2 x i8> [[YY:%.*]], <i8 127, i8 127>\n-; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[Y]], [[X:%.*]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sle <2 x i8> [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[X:%.*]], <i8 -1, i8 -1>\n ; CHECK-NEXT:    ret <2 x i1> [[Z]]\n ;\n   %y = and <2 x i8> %yy, <i8 127, i8 127>\n@@ -182,8 +174,7 @@ define i1 @icmp_sgt_x_posy(i8 %x, i8 %y) {\n ; CHECK-LABEL: @icmp_sgt_x_posy(\n ; CHECK-NEXT:    [[CY:%.*]] = icmp sgt i8 [[Y:%.*]], -1\n ; CHECK-NEXT:    call void @llvm.assume(i1 [[CY]])\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sgt i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp slt i8 [[X:%.*]], 0\n ; CHECK-NEXT:    ret i1 [[Z]]\n ;\n   %cy = icmp sge i8 %y, 0\n@@ -195,9 +186,7 @@ define i1 @icmp_sgt_x_posy(i8 %x, i8 %y) {\n \n define <2 x i1> @icmp_sgt_negx_y(<2 x i8> %xx, <2 x i8> %y) {\n ; CHECK-LABEL: @icmp_sgt_negx_y(\n-; CHECK-NEXT:    [[X:%.*]] = or <2 x i8> [[XX:%.*]], <i8 -128, i8 -128>\n-; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[X]], [[Y:%.*]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[Y:%.*]], <i8 -1, i8 -1>\n ; CHECK-NEXT:    ret <2 x i1> [[Z]]\n ;\n   %x = or <2 x i8> %xx, <i8 128, i8 128>\n@@ -210,8 +199,7 @@ define i1 @icmp_sle_negx_y(i8 %x, i8 %y) {\n ; CHECK-LABEL: @icmp_sle_negx_y(\n ; CHECK-NEXT:    [[CX:%.*]] = icmp slt i8 [[X:%.*]], 0\n ; CHECK-NEXT:    call void @llvm.assume(i1 [[CX]])\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[Y:%.*]]\n-; CHECK-NEXT:    [[Z:%.*]] = icmp sle i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[Z:%.*]] = icmp slt i8 [[Y:%.*]], 0\n ; CHECK-NEXT:    ret i1 [[Z]]\n ;\n   %cx = icmp slt i8 %x, 0\n@@ -238,9 +226,9 @@ define i1 @icmp_sle_negx_y_fail_maybe_zero(i8 %x, i8 %y) {\n \n define i1 @icmp_eq_x_invertable_y_todo(i8 %x, i1 %y) {\n ; CHECK-LABEL: @icmp_eq_x_invertable_y_todo(\n-; CHECK-NEXT:    [[YY:%.*]] = select i1 [[Y:%.*]], i8 7, i8 24\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[Y:%.*]], i8 -8, i8 -25\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP2]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %yy = select i1 %y, i8 7, i8 24\n@@ -251,9 +239,8 @@ define i1 @icmp_eq_x_invertable_y_todo(i8 %x, i1 %y) {\n \n define i1 @icmp_eq_x_invertable_y(i8 %x, i8 %y) {\n ; CHECK-LABEL: @icmp_eq_x_invertable_y(\n-; CHECK-NEXT:    [[YY:%.*]] = xor i8 [[Y:%.*]], -1\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP1]], 0\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %yy = xor i8 %y, -1\n@@ -264,9 +251,9 @@ define i1 @icmp_eq_x_invertable_y(i8 %x, i8 %y) {\n \n define i1 @icmp_eq_x_invertable_y2_todo(i8 %x, i1 %y) {\n ; CHECK-LABEL: @icmp_eq_x_invertable_y2_todo(\n-; CHECK-NEXT:    [[YY:%.*]] = select i1 [[Y:%.*]], i8 7, i8 24\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[YY]], [[AND]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[Y:%.*]], i8 -8, i8 -25\n+; CHECK-NEXT:    [[TMP2:%.*]] = or i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP2]], -1\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %yy = select i1 %y, i8 7, i8 24\n@@ -277,9 +264,8 @@ define i1 @icmp_eq_x_invertable_y2_todo(i8 %x, i1 %y) {\n \n define i1 @icmp_eq_x_invertable_y2(i8 %x, i8 %y) {\n ; CHECK-LABEL: @icmp_eq_x_invertable_y2(\n-; CHECK-NEXT:    [[YY:%.*]] = xor i8 [[Y:%.*]], -1\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[YY]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = or i8 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP1]], -1\n ; CHECK-NEXT:    ret i1 [[R]]\n ;\n   %yy = xor i8 %y, -1\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-of-or-x.ll b/llvm/test/Transforms/InstCombine/icmp-of-or-x.ll\nindex 4b8df439b846f..050636e3332e9 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-of-or-x.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-of-or-x.ll\n@@ -377,3 +377,29 @@ define i1 @pr64610(ptr %b) {\n   %r = icmp ugt i32 %or, %s\n   ret i1 %r\n }\n+\n+define i1 @icmp_eq_x_invertable_y2_todo(i8 %x, i1 %y, i8 %z) {\n+; CHECK-LABEL: @icmp_eq_x_invertable_y2_todo(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[Y:%.*]], i8 -8, i8 [[Z:%.*]]\n+; CHECK-NEXT:    [[TMP2:%.*]] = and i8 [[TMP1]], [[X:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP2]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %zz = xor i8 %z, -1\n+  %yy = select i1 %y, i8 7, i8 %zz\n+  %or = or i8 %x, %yy\n+  %r = icmp eq i8 %yy, %or\n+  ret i1 %r\n+}\n+\n+define i1 @icmp_eq_x_invertable_y2(i8 %x, i8 %y) {\n+; CHECK-LABEL: @icmp_eq_x_invertable_y2(\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[TMP1]], 0\n+; CHECK-NEXT:    ret i1 [[R]]\n+;\n+  %yy = xor i8 %y, -1\n+  %or = or i8 %x, %yy\n+  %r = icmp eq i8 %yy, %or\n+  ret i1 %r\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll b/llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll\nindex 79aef3a5406cf..847a7940bad8c 100644\n--- a/llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll\n+++ b/llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll\n@@ -84,8 +84,7 @@ define <4 x i1> @vec_4xi32_lshr_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_lshr_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_lshr_and_negC_eq_undef1(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 undef, i32 -8, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[LSHR]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\n@@ -97,8 +96,7 @@ define <4 x i1> @vec_lshr_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_lshr_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_lshr_and_negC_eq_undef2(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 -8, i32 -8, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[LSHR]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\n@@ -110,8 +108,7 @@ define <4 x i1> @vec_lshr_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_lshr_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_lshr_and_negC_eq_undef3(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 -8, i32 undef, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[LSHR]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\ndiff --git a/llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll b/llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll\nindex 5335a4736896d..39f4e58b25dc8 100644\n--- a/llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll\n+++ b/llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll\n@@ -84,8 +84,7 @@ define <4 x i1> @vec_4xi32_lshr_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef1(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[LSHR]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\n@@ -97,8 +96,7 @@ define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y\n define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef2(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 undef, i32 0, i32 0, i32 0>\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[LSHR]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\n@@ -110,8 +108,7 @@ define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y\n define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef3(\n ; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[LSHR]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %lshr = lshr <4 x i32> %x, %y\ndiff --git a/llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll b/llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll\nindex d8e7fe2e2a2c1..406dc72f2646e 100644\n--- a/llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll\n+++ b/llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll\n@@ -84,8 +84,7 @@ define <4 x i1> @vec_4xi32_shl_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_shl_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_shl_and_negC_eq_undef1(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 undef, i32 -8, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[SHL]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\n@@ -97,8 +96,7 @@ define <4 x i1> @vec_shl_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_shl_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_shl_and_negC_eq_undef2(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 -8, i32 -8, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[SHL]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\n@@ -110,8 +108,7 @@ define <4 x i1> @vec_shl_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_shl_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_shl_and_negC_eq_undef3(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 -8, i32 undef, i32 -8>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[SHL]], <i32 8, i32 8, i32 8, i32 8>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\ndiff --git a/llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll b/llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll\nindex 42b755f51a971..4c2c876e3925b 100644\n--- a/llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll\n+++ b/llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll\n@@ -84,8 +84,7 @@ define <4 x i1> @vec_4xi32_shl_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef1(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[SHL]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\n@@ -97,8 +96,7 @@ define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y)\n define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef2(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 undef, i32 0, i32 0, i32 0>\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[SHL]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\n@@ -110,8 +108,7 @@ define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y)\n define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n ; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef3(\n ; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n-; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n+; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[SHL]], <i32 -1, i32 -1, i32 -1, i32 -1>\n ; CHECK-NEXT:    ret <4 x i1> [[R]]\n ;\n   %shl = shl <4 x i32> %x, %y\n",
+  "source_files": [
+    "llvm/include/llvm/IR/PatternMatch.h",
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll",
+    "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll",
+    "llvm/test/Transforms/InstCombine/icmp-and-lowbit-mask.ll",
+    "llvm/test/Transforms/InstCombine/icmp-of-and-x.ll",
+    "llvm/test/Transforms/InstCombine/icmp-of-or-x.ll",
+    "llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll",
+    "llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll",
+    "llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll",
+    "llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_slt_0_or_icmp_add_1_sge_100_i32_fail",
+          "test_body": "define i32 @icmp_slt_0_or_icmp_add_1_sge_100_i32_fail(i32 %x) {\n; CHECK-LABEL: @icmp_slt_0_or_icmp_add_1_sge_100_i32_fail(\n; CHECK-NEXT:    [[X1:%.*]] = add i32 [[X:%.*]], 1\n; CHECK-NEXT:    [[A:%.*]] = icmp sgt i32 [[X1]], 99\n; CHECK-NEXT:    [[TMP1:%.*]] = icmp slt i32 [[X]], 0\n; CHECK-NEXT:    [[TMP2:%.*]] = or i1 [[TMP1]], [[A]]\n; CHECK-NEXT:    [[D:%.*]] = zext i1 [[TMP2]] to i32\n; CHECK-NEXT:    ret i32 [[D]]\n  %X1 = add i32 %x, 1\n  %A = icmp sge i32 %X1, 100\n  %B = zext i1 %A to i32\n  %C = lshr i32 %x, 31\n  %D = or i32 %C, %B\n  ret i32 %D\n}",
+          "source_program": "define i32 @icmp_slt_0_or_icmp_add_1_sge_100_i32_fail(i32 %x) {\n  %X1 = add i32 %x, 1\n  %A = icmp sge i32 %X1, 100\n  %B = zext i1 %A to i32\n  %C = lshr i32 %x, 31\n  %D = or i32 %C, %B\n  ret i32 %D\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-eq-to-icmp-ule.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X:%.*]], <i8 4, i8 16>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp eq <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp eq <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp eq <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp eq <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ne-to-icmp-ugt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X:%.*]], <i8 3, i8 15>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ne <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ne <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ne <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ne <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sge-to-icmp-sle.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "c0",
+          "test_body": "declare i8 @gen8()\n\ndefine i1 @c0() {\n; CHECK-LABEL: @c0(\n; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n; CHECK-NEXT:    [[RET:%.*]] = icmp sge i8 [[X]], [[TMP0]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sge i8 %x, %tmp0\n  ret i1 %ret\n}",
+          "source_program": "declare i8 @gen8()\n\ndefine i1 @c0() {\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sge i8 %x, %tmp0\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[X:%.*]], <i8 4, i8 16>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X:%.*]], <i8 3, i8 0>\n; CHECK-NEXT:    [[RET:%.*]] = icmp sge <2 x i8> [[TMP0]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sgt-to-icmp-sgt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "c0",
+          "test_body": "define i1 @c0(i8 %x) {\n; CHECK-LABEL: @c0(\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X:%.*]], 3\n; CHECK-NEXT:    [[RET:%.*]] = icmp sgt i8 [[TMP0]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sgt i8 %tmp0, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @c0(i8 %x) {\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sgt i8 %tmp0, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "oneuse0",
+          "test_body": "declare i8 @gen8()\n\ndeclare void @use8(i8)\n\ndefine i1 @oneuse0() {\n; CHECK-LABEL: @oneuse0(\n; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n; CHECK-NEXT:    call void @use8(i8 [[TMP0]])\n; CHECK-NEXT:    [[RET:%.*]] = icmp sgt i8 [[X]], 3\n; CHECK-NEXT:    ret i1 [[RET]]\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  call void @use8(i8 %tmp0)\n  %ret = icmp sgt i8 %x, %tmp0\n  ret i1 %ret\n}",
+          "source_program": "declare i8 @gen8()\n\ndeclare void @use8(i8)\n\ndefine i1 @oneuse0() {\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  call void @use8(i8 %tmp0)\n  %ret = icmp sgt i8 %x, %tmp0\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X]], <i8 3, i8 15>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sgt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sgt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase() {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X]], <i8 3, i8 0>\n; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X]], [[TMP0]]\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sgt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sgt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-sle-to-icmp-sle.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "c0",
+          "test_body": "define i1 @c0(i8 %x) {\n; CHECK-LABEL: @c0(\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X:%.*]], 3\n; CHECK-NEXT:    [[RET:%.*]] = icmp sle i8 [[TMP0]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sle i8 %tmp0, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @c0(i8 %x) {\n  %tmp0 = and i8 %x, 3\n  %ret = icmp sle i8 %tmp0, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "oneuse0",
+          "test_body": "declare i8 @gen8()\n\ndeclare void @use8(i8)\n\ndefine i1 @oneuse0() {\n; CHECK-LABEL: @oneuse0(\n; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n; CHECK-NEXT:    call void @use8(i8 [[TMP0]])\n; CHECK-NEXT:    [[RET:%.*]] = icmp slt i8 [[X]], 4\n; CHECK-NEXT:    ret i1 [[RET]]\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  call void @use8(i8 %tmp0)\n  %ret = icmp sle i8 %x, %tmp0\n  ret i1 %ret\n}",
+          "source_program": "declare i8 @gen8()\n\ndeclare void @use8(i8)\n\ndefine i1 @oneuse0() {\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  call void @use8(i8 %tmp0)\n  %ret = icmp sle i8 %x, %tmp0\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[X]], <i8 4, i8 16>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sle <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp sle <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase() {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X]], <i8 3, i8 0>\n; CHECK-NEXT:    [[RET:%.*]] = icmp sle <2 x i8> [[X]], [[TMP0]]\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sle <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp sle <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-slt-to-icmp-sgt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "c0",
+          "test_body": "declare i8 @gen8()\n\ndefine i1 @c0() {\n; CHECK-LABEL: @c0(\n; CHECK-NEXT:    [[X:%.*]] = call i8 @gen8()\n; CHECK-NEXT:    [[TMP0:%.*]] = and i8 [[X]], 3\n; CHECK-NEXT:    [[RET:%.*]] = icmp slt i8 [[X]], [[TMP0]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  %ret = icmp slt i8 %x, %tmp0\n  ret i1 %ret\n}",
+          "source_program": "declare i8 @gen8()\n\ndefine i1 @c0() {\n  %x = call i8 @gen8()\n  %tmp0 = and i8 %x, 3\n  %ret = icmp slt i8 %x, %tmp0\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp sgt <2 x i8> [[X:%.*]], <i8 3, i8 15>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp slt <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp slt <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase(\n; CHECK-NEXT:    [[TMP0:%.*]] = and <2 x i8> [[X:%.*]], <i8 3, i8 0>\n; CHECK-NEXT:    [[RET:%.*]] = icmp slt <2 x i8> [[TMP0]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp slt <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp slt <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-uge-to-icmp-ule.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X:%.*]], <i8 4, i8 16>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp uge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp uge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp uge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp uge <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ugt-to-icmp-ugt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X]], <i8 3, i8 15>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ugt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ugt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase0() {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ugt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase0() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ugt <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ule-to-icmp-ule.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[RET:%.*]] = icmp ult <2 x i8> [[X]], <i8 4, i8 16>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ule <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ule <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase0() {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[X:%.*]] = call <2 x i8> @gen2x8()\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ule <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}",
+          "source_program": "declare <2 x i8> @gen2x8()\n\ndefine <2 x i1> @p2_vec_nonsplat_edgecase0() {\n  %x = call <2 x i8> @gen2x8()\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ule <2 x i8> %x, %tmp0\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-constant-low-bit-mask-and-icmp-ult-to-icmp-ugt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "p2_vec_nonsplat",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat(\n; CHECK-NEXT:    [[RET:%.*]] = icmp ugt <2 x i8> [[X:%.*]], <i8 3, i8 15>\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ult <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 15>\n  %ret = icmp ult <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "p2_vec_nonsplat_edgecase0",
+          "test_body": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n; CHECK-LABEL: @p2_vec_nonsplat_edgecase0(\n; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i8> [[X:%.*]], <i8 -4, i8 -1>\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne <2 x i8> [[TMP1]], zeroinitializer\n; CHECK-NEXT:    ret <2 x i1> [[RET]]\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ult <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}",
+          "source_program": "define <2 x i1> @p2_vec_nonsplat_edgecase0(<2 x i8> %x) {\n  %tmp0 = and <2 x i8> %x, <i8 3, i8 0>\n  %ret = icmp ult <2 x i8> %tmp0, %x\n  ret <2 x i1> %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-eq-to-icmp-ule.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "n0",
+          "test_body": "define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n; CHECK-LABEL: @n0(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[NOTX:%.*]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %notx\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %notx\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n1",
+          "test_body": "define i1 @n1(i8 %x, i8 %y) {\n; CHECK-LABEL: @n1(\n; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n1(i8 %x, i8 %y) {\n  %t0 = shl i8 1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n2",
+          "test_body": "define i1 @n2(i8 %x, i8 %y) {\n; CHECK-LABEL: @n2(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], 1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n2(i8 %x, i8 %y) {\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v2-and-icmp-ne-to-icmp-ugt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "n0",
+          "test_body": "define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n; CHECK-LABEL: @n0(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[NOTX:%.*]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %notx\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n0(i8 %x, i8 %y, i8 %notx) {\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %notx\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n1",
+          "test_body": "define i1 @n1(i8 %x, i8 %y) {\n; CHECK-LABEL: @n1(\n; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n1(i8 %x, i8 %y) {\n  %t0 = shl i8 1, %y\n  %t1 = xor i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n2",
+          "test_body": "define i1 @n2(i8 %x, i8 %y) {\n; CHECK-LABEL: @n2(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = xor i8 [[T0]], 1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "define i1 @n2(i8 %x, i8 %y) {\n  %t0 = shl i8 -1, %y\n  %t1 = xor i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-eq-to-icmp-ule.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "n1",
+          "test_body": "declare void @use8(i8)\n\ndefine i1 @n1(i8 %x, i8 %y) {\n; CHECK-LABEL: @n1(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    call void @use8(i8 [[T0]])\n; CHECK-NEXT:    [[T1:%.*]] = add i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "declare void @use8(i8)\n\ndefine i1 @n1(i8 %x, i8 %y) {\n  %t0 = shl i8 -1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n2",
+          "test_body": "declare void @use8(i8)\n\ndefine i1 @n2(i8 %x, i8 %y) {\n; CHECK-LABEL: @n2(\n; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n; CHECK-NEXT:    call void @use8(i8 [[T0]])\n; CHECK-NEXT:    [[T1:%.*]] = add nuw i8 [[T0]], 1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp eq i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "declare void @use8(i8)\n\ndefine i1 @n2(i8 %x, i8 %y) {\n  %t0 = shl i8 1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp eq i8 %t2, %x\n  ret i1 %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-low-bit-mask-v3-and-icmp-ne-to-icmp-ugt.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "n1",
+          "test_body": "declare void @use8(i8)\n\ndefine i1 @n1(i8 %x, i8 %y) {\n; CHECK-LABEL: @n1(\n; CHECK-NEXT:    [[T0:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    call void @use8(i8 [[T0]])\n; CHECK-NEXT:    [[T1:%.*]] = add i8 [[T0]], -1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 -1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "declare void @use8(i8)\n\ndefine i1 @n1(i8 %x, i8 %y) {\n  %t0 = shl i8 -1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, -1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}\n"
+        },
+        {
+          "test_name": "n2",
+          "test_body": "declare void @use8(i8)\n\ndefine i1 @n2(i8 %x, i8 %y) {\n; CHECK-LABEL: @n2(\n; CHECK-NEXT:    [[T0:%.*]] = shl nuw i8 1, [[Y:%.*]]\n; CHECK-NEXT:    call void @use8(i8 [[T0]])\n; CHECK-NEXT:    [[T1:%.*]] = add nuw i8 [[T0]], 1\n; CHECK-NEXT:    [[T2:%.*]] = and i8 [[T1]], [[X:%.*]]\n; CHECK-NEXT:    [[RET:%.*]] = icmp ne i8 [[T2]], [[X]]\n; CHECK-NEXT:    ret i1 [[RET]]\n  %t0 = shl i8 1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}",
+          "source_program": "declare void @use8(i8)\n\ndefine i1 @n2(i8 %x, i8 %y) {\n  %t0 = shl i8 1, %y\n  call void @use8(i8 %t0)\n  %t1 = add i8 %t0, 1\n  %t2 = and i8 %t1, %x\n  %ret = icmp ne i8 %t2, %x\n  ret i1 %ret\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-and-lowbit-mask.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "src_is_mask_and",
+          "test_body": "define i1 @src_is_mask_and(i8 %x_in, i8 %y, i8 %z) {\n; CHECK-LABEL: @src_is_mask_and(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[MY:%.*]] = lshr i8 7, [[Y:%.*]]\n; CHECK-NEXT:    [[MZ:%.*]] = lshr i8 -1, [[Z:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], [[MZ]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %my = ashr i8 7, %y\n  %mz = lshr i8 -1, %z\n  %mask = and i8 %my, %mz\n  %and = and i8 %x, %mask\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_and(i8 %x_in, i8 %y, i8 %z) {\n  %x = xor i8 %x_in, 123\n  %my = ashr i8 7, %y\n  %mz = lshr i8 -1, %z\n  %mask = and i8 %my, %mz\n  %and = and i8 %x, %mask\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_and_fail_mixed",
+          "test_body": "define i1 @src_is_mask_and_fail_mixed(i8 %x_in, i8 %y, i8 %z) {\n; CHECK-LABEL: @src_is_mask_and_fail_mixed(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[MY:%.*]] = ashr i8 -8, [[Y:%.*]]\n; CHECK-NEXT:    [[MZ:%.*]] = lshr i8 -1, [[Z:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], [[MZ]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %my = ashr i8 -8, %y\n  %mz = lshr i8 -1, %z\n  %mask = and i8 %my, %mz\n  %and = and i8 %x, %mask\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_and_fail_mixed(i8 %x_in, i8 %y, i8 %z) {\n  %x = xor i8 %x_in, 123\n  %my = ashr i8 -8, %y\n  %mz = lshr i8 -1, %z\n  %mask = and i8 %my, %mz\n  %and = and i8 %x, %mask\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_ashr",
+          "test_body": "define i1 @src_is_mask_ashr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n; CHECK-LABEL: @src_is_mask_ashr(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[SMASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n; CHECK-NEXT:    [[MASK:%.*]] = ashr i8 [[SMASK]], [[Z:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %smask = select i1 %cond, i8 %ymask, i8 15\n  %mask = ashr i8 %smask, %z\n  %and = and i8 %x, %mask\n  %r = icmp ult i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_ashr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %smask = select i1 %cond, i8 %ymask, i8 15\n  %mask = ashr i8 %smask, %z\n  %and = and i8 %x, %mask\n  %r = icmp ult i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_bitreverse_not_mask",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_mask_bitreverse_not_mask(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_bitreverse_not_mask(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %and = and i8 %x, %mask\n  %r = icmp ule i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_mask_bitreverse_not_mask(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %and = and i8 %x, %mask\n  %r = icmp ule i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_const_sge",
+          "test_body": "define i1 @src_is_mask_const_sge(i8 %x_in) {\n; CHECK-LABEL: @src_is_mask_const_sge(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[R:%.*]] = icmp slt i8 [[X]], 32\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 31\n  %r = icmp sge i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_const_sge(i8 %x_in) {\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 31\n  %r = icmp sge i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_const_sgt",
+          "test_body": "define i1 @src_is_mask_const_sgt(i8 %x_in) {\n; CHECK-LABEL: @src_is_mask_const_sgt(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[R:%.*]] = icmp sgt i8 [[X]], 7\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 7\n  %r = icmp sgt i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_const_sgt(i8 %x_in) {\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 7\n  %r = icmp sgt i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_const_sle",
+          "test_body": "define i1 @src_is_mask_const_sle(i8 %x_in) {\n; CHECK-LABEL: @src_is_mask_const_sle(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], 31\n; CHECK-NEXT:    [[R:%.*]] = icmp sle i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 31\n  %r = icmp sle i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_const_sle(i8 %x_in) {\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 31\n  %r = icmp sle i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_const_slt",
+          "test_body": "define i1 @src_is_mask_const_slt(i8 %x_in) {\n; CHECK-LABEL: @src_is_mask_const_slt(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], 7\n; CHECK-NEXT:    [[R:%.*]] = icmp slt i8 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 7\n  %r = icmp slt i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_const_slt(i8 %x_in) {\n  %x = xor i8 %x_in, 123\n  %and = and i8 %x, 7\n  %r = icmp slt i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_lshr",
+          "test_body": "define i1 @src_is_mask_lshr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n; CHECK-LABEL: @src_is_mask_lshr(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[SMASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n; CHECK-NEXT:    [[MASK:%.*]] = lshr i8 [[SMASK]], [[Z:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %smask = select i1 %cond, i8 %ymask, i8 15\n  %mask = lshr i8 %smask, %z\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_lshr(i8 %x_in, i8 %y, i8 %z, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %smask = select i1 %cond, i8 %ymask, i8 15\n  %mask = lshr i8 %smask, %z\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_or",
+          "test_body": "define i1 @src_is_mask_or(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_or(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[MY:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[MY]], 7\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %my = lshr i8 -1, %y\n  %mask = and i8 %my, 7\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_or(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %my = lshr i8 -1, %y\n  %mask = and i8 %my, 7\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_p2_m1",
+          "test_body": "define i1 @src_is_mask_p2_m1(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_p2_m1(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[P2ORZ:%.*]] = shl i8 2, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = add i8 [[P2ORZ]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %p2orz = shl i8 2, %y\n  %mask = add i8 %p2orz, -1\n  %and = and i8 %mask, %x\n  %r = icmp ult i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_p2_m1(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %p2orz = shl i8 2, %y\n  %mask = add i8 %p2orz, -1\n  %and = and i8 %mask, %x\n  %r = icmp ult i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_select",
+          "test_body": "define i1 @src_is_mask_select(i8 %x_in, i8 %y, i1 %cond) {\n; CHECK-LABEL: @src_is_mask_select(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = select i1 %cond, i8 %ymask, i8 15\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_select(i8 %x_in, i8 %y, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = select i1 %cond, i8 %ymask, i8 15\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_select_fail_wrong_pattern",
+          "test_body": "define i1 @src_is_mask_select_fail_wrong_pattern(i8 %x_in, i8 %y, i1 %cond, i8 %z) {\n; CHECK-LABEL: @src_is_mask_select_fail_wrong_pattern(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = select i1 [[COND:%.*]], i8 [[YMASK]], i8 15\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[Z:%.*]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = select i1 %cond, i8 %ymask, i8 15\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %and, %z\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_select_fail_wrong_pattern(i8 %x_in, i8 %y, i1 %cond, i8 %z) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = select i1 %cond, i8 %ymask, i8 15\n  %and = and i8 %mask, %x\n  %r = icmp ne i8 %and, %z\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_sext",
+          "test_body": "define i1 @src_is_mask_sext(i16 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_sext(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 31, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = zext nneg i8 [[M_IN]] to i16\n; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i16 [[MASK]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 31, %y\n  %mask = sext i8 %m_in to i16\n  %notmask = xor i16 %mask, -1\n  %and = and i16 %notmask, %x\n  %r = icmp eq i16 %and, 0\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_sext(i16 %x_in, i8 %y) {\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 31, %y\n  %mask = sext i8 %m_in to i16\n  %notmask = xor i16 %mask, -1\n  %and = and i16 %notmask, %x\n  %r = icmp eq i16 %and, 0\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_sext_fail_multiuse",
+          "test_body": "declare void @use.i16(i16)\n\ndefine i1 @src_is_mask_sext_fail_multiuse(i16 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_sext_fail_multiuse(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 122\n; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[M_IN]], -1\n; CHECK-NEXT:    [[NOTMASK:%.*]] = sext i8 [[TMP1]] to i16\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    call void @use.i16(i16 [[AND]])\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -1, %y\n  %mask = sext i8 %m_in to i16\n  %notmask = xor i16 %mask, -1\n  %and = and i16 %notmask, %x\n  call void @use.i16(i16 %and)\n  %r = icmp eq i16 %and, 0\n  ret i1 %r\n}",
+          "source_program": "declare void @use.i16(i16)\n\ndefine i1 @src_is_mask_sext_fail_multiuse(i16 %x_in, i8 %y) {\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -1, %y\n  %mask = sext i8 %m_in to i16\n  %notmask = xor i16 %mask, -1\n  %and = and i16 %notmask, %x\n  call void @use.i16(i16 %and)\n  %r = icmp eq i16 %and, 0\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_shl_lshr",
+          "test_body": "define i1 @src_is_mask_shl_lshr(i8 %x_in, i8 %y, i1 %cond) {\n; CHECK-LABEL: @src_is_mask_shl_lshr(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n; CHECK-NEXT:    [[TMP1:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[TMP1]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %m_shl = shl i8 -1, %y\n  %mask = lshr i8 %m_shl, %y\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 0, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_shl_lshr(i8 %x_in, i8 %y, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %m_shl = shl i8 -1, %y\n  %mask = lshr i8 %m_shl, %y\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 0, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_shl_lshr_fail_not_allones",
+          "test_body": "define i1 @src_is_mask_shl_lshr_fail_not_allones(i8 %x_in, i8 %y, i1 %cond) {\n; CHECK-LABEL: @src_is_mask_shl_lshr_fail_not_allones(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[TMP1:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = and i8 [[TMP1]], -2\n; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[MASK]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %m_shl = shl i8 -2, %y\n  %mask = lshr i8 %m_shl, %y\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 0, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_shl_lshr_fail_not_allones(i8 %x_in, i8 %y, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %m_shl = shl i8 -2, %y\n  %mask = lshr i8 %m_shl, %y\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 0, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_smax",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_smax(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_smax(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.smax.i8(i8 [[YMASK]], i8 -1)\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.smax.i8(i8 %ymask, i8 -1)\n  %and = and i8 %x, %mask\n  %r = icmp uge i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_smax(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.smax.i8(i8 %ymask, i8 -1)\n  %and = and i8 %x, %mask\n  %r = icmp uge i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_smin",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_smin(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_smin(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.smin.i8(i8 [[YMASK]], i8 0)\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.smin.i8(i8 %ymask, i8 0)\n  %and = and i8 %mask, %x\n  %r = icmp uge i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_smin(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.smin.i8(i8 %ymask, i8 0)\n  %and = and i8 %mask, %x\n  %r = icmp uge i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_umax",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umax(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_umax(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umax.i8(i8 [[YMASK]], i8 3)\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.umax.i8(i8 %ymask, i8 3)\n  %and = and i8 %x, %mask\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umax(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.umax.i8(i8 %ymask, i8 3)\n  %and = and i8 %x, %mask\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_umin",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umin(i8 %x_in, i8 %y, i8 %z) {\n; CHECK-LABEL: @src_is_mask_umin(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[ZMASK:%.*]] = lshr i8 15, [[Z:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umin.i8(i8 [[YMASK]], i8 [[ZMASK]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %zmask = lshr i8 15, %z\n  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 %zmask)\n  %and = and i8 %mask, %x\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umin(i8 %x_in, i8 %y, i8 %z) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %zmask = lshr i8 15, %z\n  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 %zmask)\n  %and = and i8 %mask, %x\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_umin_fail_mismatch",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umin_fail_mismatch(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_umin_fail_mismatch(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[YMASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.umin.i8(i8 [[YMASK]], i8 -32)\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[MASK]], [[X]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 -32)\n  %and = and i8 %mask, %x\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @src_is_mask_umin_fail_mismatch(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %ymask = xor i8 %y, %y_m1\n  %mask = call i8 @llvm.umin.i8(i8 %ymask, i8 -32)\n  %and = and i8 %mask, %x\n  %r = icmp ugt i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_xor",
+          "test_body": "define i1 @src_is_mask_xor(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_xor(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[Y_M1:%.*]] = add i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[MASK:%.*]] = xor i8 [[Y_M1]], [[Y]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %mask = xor i8 %y, %y_m1\n  %and = and i8 %x, %mask\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_xor(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %mask = xor i8 %y, %y_m1\n  %and = and i8 %x, %mask\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_xor_fail_notmask",
+          "test_body": "define i1 @src_is_mask_xor_fail_notmask(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_xor_fail_notmask(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[TMP1:%.*]] = sub i8 0, [[Y:%.*]]\n; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[TMP1]], [[Y]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ne i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %mask = xor i8 %y, %y_m1\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_xor_fail_notmask(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %y_m1 = add i8 %y, -1\n  %mask = xor i8 %y, %y_m1\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %x, %notmask\n  %r = icmp ne i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_zext",
+          "test_body": "define i1 @src_is_mask_zext(i16 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_zext(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = zext i8 [[M_IN]] to i16\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -1, %y\n  %mask = zext i8 %m_in to i16\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_zext(i16 %x_in, i8 %y) {\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -1, %y\n  %mask = zext i8 %m_in to i16\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_mask_zext_fail_not_mask",
+          "test_body": "define i1 @src_is_mask_zext_fail_not_mask(i16 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_mask_zext_fail_not_mask(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[M_IN:%.*]] = lshr i8 -2, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = zext i8 [[M_IN]] to i16\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -2, %y\n  %mask = zext i8 %m_in to i16\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_mask_zext_fail_not_mask(i16 %x_in, i8 %y) {\n  %x = xor i16 %x_in, 123\n  %m_in = lshr i8 -2, %y\n  %mask = zext i8 %m_in to i16\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_ashr",
+          "test_body": "define i1 @src_is_notmask_ashr(i16 %x_in, i8 %y, i16 %z) {\n; CHECK-LABEL: @src_is_notmask_ashr(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[M_IN:%.*]] = shl i8 -32, [[Y:%.*]]\n; CHECK-NEXT:    [[NMASK:%.*]] = sext i8 [[M_IN]] to i16\n; CHECK-NEXT:    [[NMASK_SHR:%.*]] = ashr i16 [[NMASK]], [[Z:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = xor i16 [[NMASK_SHR]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[X]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = shl i8 -32, %y\n  %nmask = sext i8 %m_in to i16\n  %nmask_shr = ashr i16 %nmask, %z\n  %mask = xor i16 %nmask_shr, -1\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_notmask_ashr(i16 %x_in, i8 %y, i16 %z) {\n  %x = xor i16 %x_in, 123\n  %m_in = shl i8 -32, %y\n  %nmask = sext i8 %m_in to i16\n  %nmask_shr = ashr i16 %nmask, %z\n  %mask = xor i16 %nmask_shr, -1\n  %and = and i16 %x, %mask\n  %r = icmp eq i16 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_lshr_shl",
+          "test_body": "define i1 @src_is_notmask_lshr_shl(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_notmask_lshr_shl(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[X_HIGHBITS:%.*]] = lshr i8 [[X]], [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[X_HIGHBITS]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %mask_shr = lshr i8 -1, %y\n  %nmask = shl i8 %mask_shr, %y\n  %mask = xor i8 %nmask, -1\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_notmask_lshr_shl(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %mask_shr = lshr i8 -1, %y\n  %nmask = shl i8 %mask_shr, %y\n  %mask = xor i8 %nmask, -1\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_lshr_shl_fail_mismatch_shifts",
+          "test_body": "define i1 @src_is_notmask_lshr_shl_fail_mismatch_shifts(i8 %x_in, i8 %y, i8 %z) {\n; CHECK-LABEL: @src_is_notmask_lshr_shl_fail_mismatch_shifts(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[MASK_SHR:%.*]] = lshr i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[NMASK:%.*]] = shl i8 [[MASK_SHR]], [[Z:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = xor i8 [[NMASK]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %mask_shr = lshr i8 -1, %y\n  %nmask = shl i8 %mask_shr, %z\n  %mask = xor i8 %nmask, -1\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %and, %x\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_notmask_lshr_shl_fail_mismatch_shifts(i8 %x_in, i8 %y, i8 %z) {\n  %x = xor i8 %x_in, 123\n  %mask_shr = lshr i8 -1, %y\n  %nmask = shl i8 %mask_shr, %z\n  %mask = xor i8 %nmask, -1\n  %and = and i8 %mask, %x\n  %r = icmp eq i8 %and, %x\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_neg_p2",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_notmask_neg_p2(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_notmask_neg_p2(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n; CHECK-NEXT:    [[P2:%.*]] = and i8 [[NY]], [[Y]]\n; CHECK-NEXT:    [[NMASK:%.*]] = sub i8 0, [[P2]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n; CHECK-NEXT:    [[NOTMASK:%.*]] = xor i8 [[MASK]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %ny = sub i8 0, %y\n  %p2 = and i8 %ny, %y\n  %nmask = sub i8 0, %p2\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %notmask, %x\n  %r = icmp eq i8 0, %and\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_notmask_neg_p2(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %ny = sub i8 0, %y\n  %p2 = and i8 %ny, %y\n  %nmask = sub i8 0, %p2\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask = xor i8 %mask, -1\n  %and = and i8 %notmask, %x\n  %r = icmp eq i8 0, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_neg_p2_fail_not_invertable",
+          "test_body": "define i1 @src_is_notmask_neg_p2_fail_not_invertable(i8 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_notmask_neg_p2_fail_not_invertable(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[NY:%.*]] = sub i8 0, [[Y:%.*]]\n; CHECK-NEXT:    [[P2:%.*]] = and i8 [[NY]], [[Y]]\n; CHECK-NEXT:    [[NOTMASK:%.*]] = sub i8 0, [[P2]]\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %ny = sub i8 0, %y\n  %p2 = and i8 %ny, %y\n  %notmask = sub i8 0, %p2\n  %and = and i8 %notmask, %x\n  %r = icmp eq i8 0, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_notmask_neg_p2_fail_not_invertable(i8 %x_in, i8 %y) {\n  %x = xor i8 %x_in, 123\n  %ny = sub i8 0, %y\n  %p2 = and i8 %ny, %y\n  %notmask = sub i8 0, %p2\n  %and = and i8 %notmask, %x\n  %r = icmp eq i8 0, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_sext",
+          "test_body": "define i1 @src_is_notmask_sext(i16 %x_in, i8 %y) {\n; CHECK-LABEL: @src_is_notmask_sext(\n; CHECK-NEXT:    [[X:%.*]] = xor i16 [[X_IN:%.*]], 123\n; CHECK-NEXT:    [[M_IN:%.*]] = shl i8 -8, [[Y:%.*]]\n; CHECK-NEXT:    [[TMP1:%.*]] = xor i8 [[M_IN]], -1\n; CHECK-NEXT:    [[MASK:%.*]] = sext i8 [[TMP1]] to i16\n; CHECK-NEXT:    [[AND:%.*]] = and i16 [[X]], [[MASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i16 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i16 %x_in, 123\n  %m_in = shl i8 -8, %y\n  %nmask = sext i8 %m_in to i16\n  %mask = xor i16 %nmask, -1\n  %and = and i16 %mask, %x\n  %r = icmp ule i16 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @src_is_notmask_sext(i16 %x_in, i8 %y) {\n  %x = xor i16 %x_in, 123\n  %m_in = shl i8 -8, %y\n  %nmask = sext i8 %m_in to i16\n  %mask = xor i16 %nmask, -1\n  %and = and i16 %mask, %x\n  %r = icmp ule i16 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_shl",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_notmask_shl(i8 %x_in, i8 %y, i1 %cond) {\n; CHECK-LABEL: @src_is_notmask_shl(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n; CHECK-NEXT:    [[NOTMASK0:%.*]] = xor i8 [[MASK]], -1\n; CHECK-NEXT:    [[NOTMASK:%.*]] = select i1 [[COND:%.*]], i8 [[NOTMASK0]], i8 -8\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask0 = xor i8 %mask, -1\n  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n  %and = and i8 %x, %notmask\n  %r = icmp eq i8 %and, 0\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndefine i1 @src_is_notmask_shl(i8 %x_in, i8 %y, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask0 = xor i8 %mask, -1\n  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n  %and = and i8 %x, %notmask\n  %r = icmp eq i8 %and, 0\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "src_is_notmask_shl_fail_multiuse_invert",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndeclare void @use.i8(i8)\n\ndefine i1 @src_is_notmask_shl_fail_multiuse_invert(i8 %x_in, i8 %y, i1 %cond) {\n; CHECK-LABEL: @src_is_notmask_shl_fail_multiuse_invert(\n; CHECK-NEXT:    [[X:%.*]] = xor i8 [[X_IN:%.*]], 122\n; CHECK-NEXT:    [[NMASK:%.*]] = shl nsw i8 -1, [[Y:%.*]]\n; CHECK-NEXT:    [[MASK:%.*]] = call i8 @llvm.bitreverse.i8(i8 [[NMASK]])\n; CHECK-NEXT:    [[NOTMASK0:%.*]] = xor i8 [[MASK]], -1\n; CHECK-NEXT:    [[NOTMASK:%.*]] = select i1 [[COND:%.*]], i8 [[NOTMASK0]], i8 -8\n; CHECK-NEXT:    call void @use.i8(i8 [[NOTMASK]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[NOTMASK]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[R]]\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask0 = xor i8 %mask, -1\n  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n  call void @use.i8(i8 %notmask)\n  %and = and i8 %x, %notmask\n  %r = icmp eq i8 %and, 0\n  ret i1 %r\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.bitreverse.i8(i8) #0\n\ndeclare void @use.i8(i8)\n\ndefine i1 @src_is_notmask_shl_fail_multiuse_invert(i8 %x_in, i8 %y, i1 %cond) {\n  %x = xor i8 %x_in, 123\n  %nmask = shl i8 -1, %y\n  %mask = call i8 @llvm.bitreverse.i8(i8 %nmask)\n  %notmask0 = xor i8 %mask, -1\n  %notmask = select i1 %cond, i8 %notmask0, i8 -8\n  call void @use.i8(i8 %notmask)\n  %and = and i8 %x, %notmask\n  %r = icmp eq i8 %and, 0\n  ret i1 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-of-and-x.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_eq_x_invertable_y",
+          "test_body": "define i1 @icmp_eq_x_invertable_y(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_eq_x_invertable_y(\n; CHECK-NEXT:    [[YY:%.*]] = xor i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %yy = xor i8 %y, -1\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @icmp_eq_x_invertable_y(i8 %x, i8 %y) {\n  %yy = xor i8 %y, -1\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_x_invertable_y2",
+          "test_body": "define i1 @icmp_eq_x_invertable_y2(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_eq_x_invertable_y2(\n; CHECK-NEXT:    [[YY:%.*]] = xor i8 [[Y:%.*]], -1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[YY]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %yy = xor i8 %y, -1\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %yy, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @icmp_eq_x_invertable_y2(i8 %x, i8 %y) {\n  %yy = xor i8 %y, -1\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %yy, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_x_invertable_y2_todo",
+          "test_body": "define i1 @icmp_eq_x_invertable_y2_todo(i8 %x, i1 %y) {\n; CHECK-LABEL: @icmp_eq_x_invertable_y2_todo(\n; CHECK-NEXT:    [[YY:%.*]] = select i1 [[Y:%.*]], i8 7, i8 24\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[YY]], [[AND]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %yy = select i1 %y, i8 7, i8 24\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %yy, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @icmp_eq_x_invertable_y2_todo(i8 %x, i1 %y) {\n  %yy = select i1 %y, i8 7, i8 24\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %yy, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_x_invertable_y_todo",
+          "test_body": "define i1 @icmp_eq_x_invertable_y_todo(i8 %x, i1 %y) {\n; CHECK-LABEL: @icmp_eq_x_invertable_y_todo(\n; CHECK-NEXT:    [[YY:%.*]] = select i1 [[Y:%.*]], i8 7, i8 24\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[YY]], [[X:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp eq i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[R]]\n  %yy = select i1 %y, i8 7, i8 24\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}",
+          "source_program": "define i1 @icmp_eq_x_invertable_y_todo(i8 %x, i1 %y) {\n  %yy = select i1 %y, i8 7, i8 24\n  %and = and i8 %x, %yy\n  %r = icmp eq i8 %x, %and\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "icmp_sge_x_negy",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sge_x_negy(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_sge_x_negy(\n; CHECK-NEXT:    [[CY:%.*]] = icmp slt i8 [[Y:%.*]], 0\n; CHECK-NEXT:    call void @llvm.assume(i1 [[CY]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sge i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n  %cy = icmp slt i8 %y, 0\n  call void @llvm.assume(i1 %cy)\n  %and = and i8 %x, %y\n  %z = icmp sge i8 %and, %x\n  ret i1 %z\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sge_x_negy(i8 %x, i8 %y) {\n  %cy = icmp slt i8 %y, 0\n  call void @llvm.assume(i1 %cy)\n  %and = and i8 %x, %y\n  %z = icmp sge i8 %and, %x\n  ret i1 %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_negx_y",
+          "test_body": "define <2 x i1> @icmp_sgt_negx_y(<2 x i8> %xx, <2 x i8> %y) {\n; CHECK-LABEL: @icmp_sgt_negx_y(\n; CHECK-NEXT:    [[X:%.*]] = or <2 x i8> [[XX:%.*]], <i8 -128, i8 -128>\n; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[X]], [[Y:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[AND]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[Z]]\n  %x = or <2 x i8> %xx, <i8 -128, i8 -128>\n  %and = and <2 x i8> %x, %y\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}",
+          "source_program": "define <2 x i1> @icmp_sgt_negx_y(<2 x i8> %xx, <2 x i8> %y) {\n  %x = or <2 x i8> %xx, <i8 -128, i8 -128>\n  %and = and <2 x i8> %x, %y\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_x_negy",
+          "test_body": "define <2 x i1> @icmp_sgt_x_negy(<2 x i8> %x, <2 x i8> %yy) {\n; CHECK-LABEL: @icmp_sgt_x_negy(\n; CHECK-NEXT:    [[Y:%.*]] = or <2 x i8> [[YY:%.*]], <i8 -128, i8 -128>\n; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[Y]], [[X:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[AND]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[Z]]\n  %y = or <2 x i8> %yy, <i8 -128, i8 -128>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}",
+          "source_program": "define <2 x i1> @icmp_sgt_x_negy(<2 x i8> %x, <2 x i8> %yy) {\n  %y = or <2 x i8> %yy, <i8 -128, i8 -128>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_x_negy_fail_partial",
+          "test_body": "define <2 x i1> @icmp_sgt_x_negy_fail_partial(<2 x i8> %x, <2 x i8> %yy) {\n; CHECK-LABEL: @icmp_sgt_x_negy_fail_partial(\n; CHECK-NEXT:    [[Y:%.*]] = or <2 x i8> [[YY:%.*]], <i8 -128, i8 4>\n; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[Y]], [[X:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sgt <2 x i8> [[AND]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[Z]]\n  %y = or <2 x i8> %yy, <i8 -128, i8 4>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}",
+          "source_program": "define <2 x i1> @icmp_sgt_x_negy_fail_partial(<2 x i8> %x, <2 x i8> %yy) {\n  %y = or <2 x i8> %yy, <i8 -128, i8 4>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sgt <2 x i8> %and, %x\n  ret <2 x i1> %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_x_posy",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sgt_x_posy(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_sgt_x_posy(\n; CHECK-NEXT:    [[CY:%.*]] = icmp sgt i8 [[Y:%.*]], -1\n; CHECK-NEXT:    call void @llvm.assume(i1 [[CY]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sgt i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n  %cy = icmp sge i8 %y, 0\n  call void @llvm.assume(i1 %cy)\n  %and = and i8 %x, %y\n  %z = icmp sgt i8 %and, %x\n  ret i1 %z\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sgt_x_posy(i8 %x, i8 %y) {\n  %cy = icmp sge i8 %y, 0\n  call void @llvm.assume(i1 %cy)\n  %and = and i8 %x, %y\n  %z = icmp sgt i8 %and, %x\n  ret i1 %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sle_negx_y",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sle_negx_y(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_sle_negx_y(\n; CHECK-NEXT:    [[CX:%.*]] = icmp slt i8 [[X:%.*]], 0\n; CHECK-NEXT:    call void @llvm.assume(i1 [[CX]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[Y:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sle i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n  %cx = icmp slt i8 %x, 0\n  call void @llvm.assume(i1 %cx)\n  %and = and i8 %x, %y\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sle_negx_y(i8 %x, i8 %y) {\n  %cx = icmp slt i8 %x, 0\n  call void @llvm.assume(i1 %cx)\n  %and = and i8 %x, %y\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sle_negx_y_fail_maybe_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sle_negx_y_fail_maybe_zero(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_sle_negx_y_fail_maybe_zero(\n; CHECK-NEXT:    [[CX:%.*]] = icmp slt i8 [[X:%.*]], 1\n; CHECK-NEXT:    call void @llvm.assume(i1 [[CX]])\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X]], [[Y:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sle i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n  %cx = icmp sle i8 %x, 0\n  call void @llvm.assume(i1 %cx)\n  %and = and i8 %x, %y\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @icmp_sle_negx_y_fail_maybe_zero(i8 %x, i8 %y) {\n  %cx = icmp sle i8 %x, 0\n  call void @llvm.assume(i1 %cx)\n  %and = and i8 %x, %y\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sle_x_negy",
+          "test_body": "define i1 @icmp_sle_x_negy(i8 %x, i8 %yy) {\n; CHECK-LABEL: @icmp_sle_x_negy(\n; CHECK-NEXT:    [[Y:%.*]] = or i8 [[YY:%.*]], -128\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[Y]], [[X:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sle i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n  %y = or i8 %yy, -128\n  %and = and i8 %y, %x\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}",
+          "source_program": "define i1 @icmp_sle_x_negy(i8 %x, i8 %yy) {\n  %y = or i8 %yy, -128\n  %and = and i8 %y, %x\n  %z = icmp sle i8 %and, %x\n  ret i1 %z\n}\n"
+        },
+        {
+          "test_name": "icmp_sle_x_posy",
+          "test_body": "define <2 x i1> @icmp_sle_x_posy(<2 x i8> %x, <2 x i8> %yy) {\n; CHECK-LABEL: @icmp_sle_x_posy(\n; CHECK-NEXT:    [[Y:%.*]] = and <2 x i8> [[YY:%.*]], <i8 127, i8 127>\n; CHECK-NEXT:    [[AND:%.*]] = and <2 x i8> [[Y]], [[X:%.*]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp sle <2 x i8> [[AND]], [[X]]\n; CHECK-NEXT:    ret <2 x i1> [[Z]]\n  %y = and <2 x i8> %yy, <i8 127, i8 127>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sle <2 x i8> %and, %x\n  ret <2 x i1> %z\n}",
+          "source_program": "define <2 x i1> @icmp_sle_x_posy(<2 x i8> %x, <2 x i8> %yy) {\n  %y = and <2 x i8> %yy, <i8 127, i8 127>\n  %and = and <2 x i8> %y, %x\n  %z = icmp sle <2 x i8> %and, %x\n  ret <2 x i1> %z\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_x_negy",
+          "test_body": "declare i1 @barrier()\n\ndefine i1 @icmp_slt_x_negy(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_slt_x_negy(\n; CHECK-NEXT:    [[CY:%.*]] = icmp slt i8 [[Y:%.*]], 0\n; CHECK-NEXT:    br i1 [[CY]], label [[NEGY:%.*]], label [[POSY:%.*]]\n; CHECK:       negy:\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[X:%.*]], [[Y]]\n; CHECK-NEXT:    [[Z:%.*]] = icmp slt i8 [[AND]], [[X]]\n; CHECK-NEXT:    ret i1 [[Z]]\n; CHECK:       posy:\n; CHECK-NEXT:    [[R:%.*]] = call i1 @barrier()\n; CHECK-NEXT:    ret i1 [[R]]\n  %cy = icmp slt i8 %y, 0\n  br i1 %cy, label %negy, label %posy\n\nnegy:                                             ; preds = %0\n  %and = and i8 %x, %y\n  %z = icmp slt i8 %and, %x\n  ret i1 %z\n\nposy:                                             ; preds = %0\n  %r = call i1 @barrier()\n  ret i1 %r\n}",
+          "source_program": "declare i1 @barrier()\n\ndefine i1 @icmp_slt_x_negy(i8 %x, i8 %y) {\n  %cy = icmp slt i8 %y, 0\n  br i1 %cy, label %negy, label %posy\n\nnegy:                                             ; preds = %0\n  %and = and i8 %x, %y\n  %z = icmp slt i8 %and, %x\n  ret i1 %z\n\nposy:                                             ; preds = %0\n  %r = call i1 @barrier()\n  ret i1 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-of-or-x.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "pr64610",
+          "test_body": "define i1 @pr64610(ptr %b) {\n; CHECK-LABEL: @pr64610(\n; CHECK-NEXT:    ret i1 true\n  %v = load i1, ptr %b, align 2\n  %s = select i1 %v, i32 74, i32 0\n  %or = or i32 %s, 1\n  %r = icmp ugt i32 %or, %s\n  ret i1 %r\n}",
+          "source_program": "define i1 @pr64610(ptr %b) {\n  %v = load i1, ptr %b, align 2\n  %s = select i1 %v, i32 74, i32 0\n  %or = or i32 %s, 1\n  %r = icmp ugt i32 %or, %s\n  ret i1 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/lshr-and-negC-icmpeq-zero.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec_4xi32_lshr_and_negC_eq",
+          "test_body": "define <4 x i1> @vec_4xi32_lshr_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_lshr_and_negC_eq(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[LSHR]], <i32 8, i32 8, i32 8, i32 8>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_lshr_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_lshr_and_negC_eq_undef1",
+          "test_body": "define <4 x i1> @vec_lshr_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_lshr_and_negC_eq_undef1(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 undef, i32 -8, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 undef, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_lshr_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 undef, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_lshr_and_negC_eq_undef2",
+          "test_body": "define <4 x i1> @vec_lshr_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_lshr_and_negC_eq_undef2(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 -8, i32 -8, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_lshr_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_lshr_and_negC_eq_undef3",
+          "test_body": "define <4 x i1> @vec_lshr_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_lshr_and_negC_eq_undef3(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -8, i32 -8, i32 undef, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 undef, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_lshr_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -8, i32 -8, i32 undef, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/lshr-and-signbit-icmpeq-zero.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec_4xi32_lshr_and_signbit_eq",
+          "test_body": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[LSHR]], <i32 -1, i32 -1, i32 -1, i32 -1>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_lshr_and_signbit_eq_undef1",
+          "test_body": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef1(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_lshr_and_signbit_eq_undef2",
+          "test_body": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef2(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 undef, i32 0, i32 0, i32 0>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 undef, i32 0, i32 0, i32 0>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 undef, i32 0, i32 0, i32 0>\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_lshr_and_signbit_eq_undef3",
+          "test_body": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_lshr_and_signbit_eq_undef3(\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[LSHR]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_lshr_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n  %lshr = lshr <4 x i32> %x, %y\n  %and = and <4 x i32> %lshr, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shl-and-negC-icmpeq-zero.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec_4xi32_shl_and_negC_eq",
+          "test_body": "define <4 x i1> @vec_4xi32_shl_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_shl_and_negC_eq(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp ult <4 x i32> [[SHL]], <i32 8, i32 8, i32 8, i32 8>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_shl_and_negC_eq(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_shl_and_negC_eq_undef1",
+          "test_body": "define <4 x i1> @vec_shl_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_shl_and_negC_eq_undef1(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 undef, i32 -8, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 undef, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_shl_and_negC_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 undef, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_shl_and_negC_eq_undef2",
+          "test_body": "define <4 x i1> @vec_shl_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_shl_and_negC_eq_undef2(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 -8, i32 -8, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_shl_and_negC_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_shl_and_negC_eq_undef3",
+          "test_body": "define <4 x i1> @vec_shl_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_shl_and_negC_eq_undef3(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -8, i32 -8, i32 undef, i32 -8>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 undef, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_shl_and_negC_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -8, i32 -8, i32 undef, i32 -8>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shl-and-signbit-icmpeq-zero.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec_4xi32_shl_and_signbit_eq",
+          "test_body": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = icmp sgt <4 x i32> [[SHL]], <i32 -1, i32 -1, i32 -1, i32 -1>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_shl_and_signbit_eq_undef1",
+          "test_body": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef1(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], zeroinitializer\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef1(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, zeroinitializer\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_shl_and_signbit_eq_undef2",
+          "test_body": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef2(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 undef, i32 0, i32 0, i32 0>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 undef, i32 0, i32 0, i32 0>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef2(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 undef, i32 0, i32 0, i32 0>\n  ret <4 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "vec_4xi32_shl_and_signbit_eq_undef3",
+          "test_body": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n; CHECK-LABEL: @vec_4xi32_shl_and_signbit_eq_undef3(\n; CHECK-NEXT:    [[SHL:%.*]] = shl <4 x i32> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[AND:%.*]] = and <4 x i32> [[SHL]], <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n; CHECK-NEXT:    [[R:%.*]] = icmp eq <4 x i32> [[AND]], <i32 0, i32 0, i32 0, i32 undef>\n; CHECK-NEXT:    ret <4 x i1> [[R]]\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}",
+          "source_program": "define <4 x i1> @vec_4xi32_shl_and_signbit_eq_undef3(<4 x i32> %x, <4 x i32> %y) {\n  %shl = shl <4 x i32> %x, %y\n  %and = and <4 x i32> %shl, <i32 -2147483648, i32 undef, i32 -2147483648, i32 -2147483648>\n  %r = icmp eq <4 x i32> %and, <i32 0, i32 0, i32 0, i32 undef>\n  ret <4 x i1> %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

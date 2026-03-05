@@ -1,0 +1,143 @@
+{
+  "pr_number": 157447,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/157447",
+  "title": "[InstCombine] Support GEP chains in foldCmpLoadFromIndexedGlobal()",
+  "commit_sha": "9f3a7487239857e7c4b94618e7698b999b829210",
+  "components": [
+    "InstCombine",
+    "Loads"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "Loads"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/Loads.h": [
+        [
+          13,
+          19
+        ],
+        [
+          193,
+          198
+        ]
+      ],
+      "llvm/lib/Analysis/Loads.cpp": [
+        [
+          21,
+          26
+        ],
+        [
+          876,
+          878
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          19,
+          24
+        ],
+        [
+          110,
+          139
+        ],
+        [
+          280,
+          286
+        ],
+        [
+          1958,
+          1967
+        ],
+        [
+          4314,
+          4323
+        ],
+        [
+          8798,
+          8807
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          710,
+          716
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/Loads.h": [
+        "canReplacePointersIfEqual"
+      ],
+      "llvm/lib/Analysis/Loads.cpp": [
+        "llvm::isReadOnlyLoop"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldCmpLoadFromIndexedGlobal",
+        "InstCombinerImpl::foldICmpAndConstant",
+        "InstCombinerImpl::foldICmpInstWithConstantNotInt",
+        "InstCombinerImpl::visitFCmpInst",
+        "isSignTest"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/Loads.h b/llvm/include/llvm/Analysis/Loads.h\nindex 4cec8115709d6..4893c0c9934d2 100644\n--- a/llvm/include/llvm/Analysis/Loads.h\n+++ b/llvm/include/llvm/Analysis/Loads.h\n@@ -13,7 +13,9 @@\n #ifndef LLVM_ANALYSIS_LOADS_H\n #define LLVM_ANALYSIS_LOADS_H\n \n+#include \"llvm/ADT/APInt.h\"\n #include \"llvm/IR/BasicBlock.h\"\n+#include \"llvm/IR/GEPNoWrapFlags.h\"\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Support/Compiler.h\"\n \n@@ -193,6 +195,26 @@ LLVM_ABI bool canReplacePointersIfEqual(const Value *From, const Value *To,\n                                         const DataLayout &DL);\n LLVM_ABI bool canReplacePointersInUseIfEqual(const Use &U, const Value *To,\n                                              const DataLayout &DL);\n+\n+/// Linear expression BasePtr + Index * Scale + Offset.\n+/// Index, Scale and Offset all have the same bit width, which matches the\n+/// pointer index size of BasePtr.\n+/// Index may be nullptr if Scale is 0.\n+struct LinearExpression {\n+  Value *BasePtr;\n+  Value *Index = nullptr;\n+  APInt Scale;\n+  APInt Offset;\n+  GEPNoWrapFlags Flags = GEPNoWrapFlags::all();\n+\n+  LinearExpression(Value *BasePtr, unsigned BitWidth)\n+      : BasePtr(BasePtr), Scale(BitWidth, 0), Offset(BitWidth, 0) {}\n+};\n+\n+/// Decompose a pointer into a linear expression. This may look through\n+/// multiple GEPs.\n+LLVM_ABI LinearExpression decomposeLinearExpression(const DataLayout &DL,\n+                                                    Value *Ptr);\n }\n \n #endif\ndiff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp\nindex 47fdb41e8b445..0c4e3a2e3b233 100644\n--- a/llvm/lib/Analysis/Loads.cpp\n+++ b/llvm/lib/Analysis/Loads.cpp\n@@ -21,6 +21,7 @@\n #include \"llvm/Analysis/ScalarEvolutionExpressions.h\"\n #include \"llvm/Analysis/ValueTracking.h\"\n #include \"llvm/IR/DataLayout.h\"\n+#include \"llvm/IR/GetElementPtrTypeIterator.h\"\n #include \"llvm/IR/IntrinsicInst.h\"\n #include \"llvm/IR/Operator.h\"\n \n@@ -876,3 +877,66 @@ bool llvm::isReadOnlyLoop(\n   }\n   return true;\n }\n+\n+LinearExpression llvm::decomposeLinearExpression(const DataLayout &DL,\n+                                                 Value *Ptr) {\n+  assert(Ptr->getType()->isPointerTy() && \"Must be called with pointer arg\");\n+\n+  unsigned BitWidth = DL.getIndexTypeSizeInBits(Ptr->getType());\n+  LinearExpression Expr(Ptr, BitWidth);\n+\n+  while (true) {\n+    auto *GEP = dyn_cast<GEPOperator>(Expr.BasePtr);\n+    if (!GEP || GEP->getSourceElementType()->isScalableTy())\n+      return Expr;\n+\n+    Value *VarIndex = nullptr;\n+    for (Value *Index : GEP->indices()) {\n+      if (isa<ConstantInt>(Index))\n+        continue;\n+      // Only allow a single variable index. We do not bother to handle the\n+      // case of the same variable index appearing multiple times.\n+      if (Expr.Index || VarIndex)\n+        return Expr;\n+      VarIndex = Index;\n+    }\n+\n+    // Don't return non-canonical indexes.\n+    if (VarIndex && !VarIndex->getType()->isIntegerTy(BitWidth))\n+      return Expr;\n+\n+    // We have verified that we can fully handle this GEP, so we can update Expr\n+    // members past this point.\n+    Expr.BasePtr = GEP->getPointerOperand();\n+    Expr.Flags = Expr.Flags.intersectForOffsetAdd(GEP->getNoWrapFlags());\n+    for (gep_type_iterator GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP);\n+         GTI != GTE; ++GTI) {\n+      Value *Index = GTI.getOperand();\n+      if (auto *ConstOffset = dyn_cast<ConstantInt>(Index)) {\n+        if (ConstOffset->isZero())\n+          continue;\n+        if (StructType *STy = GTI.getStructTypeOrNull()) {\n+          unsigned ElementIdx = ConstOffset->getZExtValue();\n+          const StructLayout *SL = DL.getStructLayout(STy);\n+          Expr.Offset += SL->getElementOffset(ElementIdx);\n+          continue;\n+        }\n+        // Truncate if type size exceeds index space.\n+        APInt IndexedSize(BitWidth, GTI.getSequentialElementStride(DL),\n+                          /*isSigned=*/false,\n+                          /*implcitTrunc=*/true);\n+        Expr.Offset += ConstOffset->getValue() * IndexedSize;\n+        continue;\n+      }\n+\n+      // FIXME: Also look through a mul/shl in the index.\n+      assert(Expr.Index == nullptr && \"Shouldn't have index yet\");\n+      Expr.Index = Index;\n+      // Truncate if type size exceeds index space.\n+      Expr.Scale = APInt(BitWidth, GTI.getSequentialElementStride(DL),\n+                         /*isSigned=*/false, /*implicitTrunc=*/true);\n+    }\n+  }\n+\n+  return Expr;\n+}\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 01b0da3469c18..6a778726df729 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -19,6 +19,7 @@\n #include \"llvm/Analysis/CmpInstAnalysis.h\"\n #include \"llvm/Analysis/ConstantFolding.h\"\n #include \"llvm/Analysis/InstructionSimplify.h\"\n+#include \"llvm/Analysis/Loads.h\"\n #include \"llvm/Analysis/Utils/Local.h\"\n #include \"llvm/Analysis/VectorUtils.h\"\n #include \"llvm/IR/ConstantRange.h\"\n@@ -110,30 +111,27 @@ static bool isSignTest(ICmpInst::Predicate &Pred, const APInt &C) {\n /// If AndCst is non-null, then the loaded value is masked with that constant\n /// before doing the comparison. This handles cases like \"A[i]&4 == 0\".\n Instruction *InstCombinerImpl::foldCmpLoadFromIndexedGlobal(\n-    LoadInst *LI, GetElementPtrInst *GEP, GlobalVariable *GV, CmpInst &ICI,\n-    ConstantInt *AndCst) {\n-  if (LI->isVolatile() || !GV->isConstant() || !GV->hasDefinitiveInitializer())\n+    LoadInst *LI, GetElementPtrInst *GEP, CmpInst &ICI, ConstantInt *AndCst) {\n+  auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(GEP));\n+  if (LI->isVolatile() || !GV || !GV->isConstant() ||\n+      !GV->hasDefinitiveInitializer())\n     return nullptr;\n \n-  Constant *Init = GV->getInitializer();\n-  TypeSize GlobalSize = DL.getTypeAllocSize(Init->getType());\n   Type *EltTy = LI->getType();\n   TypeSize EltSize = DL.getTypeStoreSize(EltTy);\n   if (EltSize.isScalable())\n     return nullptr;\n \n-  unsigned IndexBW = DL.getIndexTypeSizeInBits(GEP->getType());\n-  SmallMapVector<Value *, APInt, 4> VarOffsets;\n-  APInt ConstOffset(IndexBW, 0);\n-  if (!GEP->collectOffset(DL, IndexBW, VarOffsets, ConstOffset) ||\n-      VarOffsets.size() != 1 || IndexBW > 64)\n+  LinearExpression Expr = decomposeLinearExpression(DL, GEP);\n+  if (!Expr.Index || Expr.BasePtr != GV || Expr.Offset.getBitWidth() > 64)\n     return nullptr;\n \n-  Value *Idx = VarOffsets.front().first;\n-  const APInt &Stride = VarOffsets.front().second;\n-  // If the index type is non-canonical, wait for it to be canonicalized.\n-  if (Idx->getType()->getScalarSizeInBits() != IndexBW)\n-    return nullptr;\n+  Constant *Init = GV->getInitializer();\n+  TypeSize GlobalSize = DL.getTypeAllocSize(Init->getType());\n+\n+  Value *Idx = Expr.Index;\n+  const APInt &Stride = Expr.Scale;\n+  const APInt &ConstOffset = Expr.Offset;\n \n   // Allow an additional context offset, but only within the stride.\n   if (!ConstOffset.ult(Stride))\n@@ -280,7 +278,7 @@ Instruction *InstCombinerImpl::foldCmpLoadFromIndexedGlobal(\n   // comparison is false if Idx was 0x80..00.\n   // We need to erase the highest countTrailingZeros(ElementSize) bits of Idx.\n   auto MaskIdx = [&](Value *Idx) {\n-    if (!GEP->isInBounds() && Stride.countr_zero() != 0) {\n+    if (!Expr.Flags.isInBounds() && Stride.countr_zero() != 0) {\n       Value *Mask = Constant::getAllOnesValue(Idx->getType());\n       Mask = Builder.CreateLShr(Mask, Stride.countr_zero());\n       Idx = Builder.CreateAnd(Idx, Mask);\n@@ -1958,10 +1956,8 @@ Instruction *InstCombinerImpl::foldICmpAndConstant(ICmpInst &Cmp,\n   if (auto *C2 = dyn_cast<ConstantInt>(Y))\n     if (auto *LI = dyn_cast<LoadInst>(X))\n       if (auto *GEP = dyn_cast<GetElementPtrInst>(LI->getOperand(0)))\n-        if (auto *GV = dyn_cast<GlobalVariable>(GEP->getOperand(0)))\n-          if (Instruction *Res =\n-                  foldCmpLoadFromIndexedGlobal(LI, GEP, GV, Cmp, C2))\n-            return Res;\n+        if (Instruction *Res = foldCmpLoadFromIndexedGlobal(LI, GEP, Cmp, C2))\n+          return Res;\n \n   if (!Cmp.isEquality())\n     return nullptr;\n@@ -4314,10 +4310,9 @@ Instruction *InstCombinerImpl::foldICmpInstWithConstantNotInt(ICmpInst &I) {\n     // Try to optimize things like \"A[i] > 4\" to index computations.\n     if (GetElementPtrInst *GEP =\n             dyn_cast<GetElementPtrInst>(LHSI->getOperand(0)))\n-      if (GlobalVariable *GV = dyn_cast<GlobalVariable>(GEP->getOperand(0)))\n-        if (Instruction *Res =\n-                foldCmpLoadFromIndexedGlobal(cast<LoadInst>(LHSI), GEP, GV, I))\n-          return Res;\n+      if (Instruction *Res =\n+              foldCmpLoadFromIndexedGlobal(cast<LoadInst>(LHSI), GEP, I))\n+        return Res;\n     break;\n   }\n \n@@ -8798,10 +8793,9 @@ Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {\n       break;\n     case Instruction::Load:\n       if (auto *GEP = dyn_cast<GetElementPtrInst>(LHSI->getOperand(0)))\n-        if (auto *GV = dyn_cast<GlobalVariable>(GEP->getOperand(0)))\n-          if (Instruction *Res = foldCmpLoadFromIndexedGlobal(\n-                  cast<LoadInst>(LHSI), GEP, GV, I))\n-            return Res;\n+        if (Instruction *Res =\n+                foldCmpLoadFromIndexedGlobal(cast<LoadInst>(LHSI), GEP, I))\n+          return Res;\n       break;\n     case Instruction::FPTrunc:\n       if (Instruction *NV = foldFCmpFpTrunc(I, *LHSI, *RHSC))\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 2340028ce93dc..8c64d6398eca9 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -710,7 +710,7 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   bool foldAllocaCmp(AllocaInst *Alloca);\n   Instruction *foldCmpLoadFromIndexedGlobal(LoadInst *LI,\n                                             GetElementPtrInst *GEP,\n-                                            GlobalVariable *GV, CmpInst &ICI,\n+                                            CmpInst &ICI,\n                                             ConstantInt *AndCst = nullptr);\n   Instruction *foldFCmpIntToFPConst(FCmpInst &I, Instruction *LHSI,\n                                     Constant *RHSC);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/load-cmp.ll b/llvm/test/Transforms/InstCombine/load-cmp.ll\nindex 79faefbd5df56..f7d788110b1bc 100644\n--- a/llvm/test/Transforms/InstCombine/load-cmp.ll\n+++ b/llvm/test/Transforms/InstCombine/load-cmp.ll\n@@ -419,6 +419,32 @@ define i1 @load_vs_array_type_mismatch_offset1(i32 %idx) {\n   ret i1 %cmp\n }\n \n+define i1 @load_vs_array_type_mismatch_offset1_separate_gep(i32 %idx) {\n+; CHECK-LABEL: @load_vs_array_type_mismatch_offset1_separate_gep(\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[IDX:%.*]], -3\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[TMP1]], 1\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %gep1 = getelementptr inbounds {i16, i16}, ptr @g_i16_1, i32 %idx\n+  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n+  %load = load i16, ptr %gep2\n+  %cmp = icmp eq i16 %load, 0\n+  ret i1 %cmp\n+}\n+\n+define i1 @load_vs_array_type_mismatch_offset1_separate_gep_swapped(i32 %idx) {\n+; CHECK-LABEL: @load_vs_array_type_mismatch_offset1_separate_gep_swapped(\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[IDX:%.*]], -3\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[TMP1]], 1\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %gep1 = getelementptr inbounds i8, ptr @g_i16_1, i32 2\n+  %gep2 = getelementptr inbounds {i16, i16}, ptr %gep1, i32 %idx\n+  %load = load i16, ptr %gep2\n+  %cmp = icmp eq i16 %load, 0\n+  ret i1 %cmp\n+}\n+\n @g_i16_2 = internal constant [8 x i16] [i16 1, i16 0, i16 0, i16 1, i16 1, i16 0, i16 0, i16 1]\n \n ; idx == 0 || idx == 2\n@@ -554,3 +580,36 @@ entry:\n   %cond = icmp ult i32 %isOK, 5\n   ret i1 %cond\n }\n+\n+define i1 @cmp_load_multiple_indices(i32 %idx, i32 %idx2) {\n+; CHECK-LABEL: @cmp_load_multiple_indices(\n+; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr inbounds i16, ptr @g_i16_1, i32 [[IDX:%.*]]\n+; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr inbounds i16, ptr [[GEP1]], i32 [[IDX2:%.*]]\n+; CHECK-NEXT:    [[GEP3:%.*]] = getelementptr inbounds nuw i8, ptr [[GEP2]], i32 2\n+; CHECK-NEXT:    [[LOAD:%.*]] = load i16, ptr [[GEP3]], align 2\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i16 [[LOAD]], 0\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %gep1 = getelementptr inbounds i16, ptr @g_i16_1, i32 %idx\n+  %gep2 = getelementptr inbounds i16, ptr %gep1, i32 %idx2\n+  %gep3 = getelementptr inbounds i8, ptr %gep2, i32 2\n+  %load = load i16, ptr %gep3\n+  %cmp = icmp eq i16 %load, 0\n+  ret i1 %cmp\n+}\n+\n+define i1 @cmp_load_multiple_indices2(i32 %idx, i32 %idx2) {\n+; CHECK-LABEL: @cmp_load_multiple_indices2(\n+; CHECK-NEXT:    [[GEP1_SPLIT:%.*]] = getelementptr inbounds [1 x i16], ptr @g_i16_1, i32 [[IDX:%.*]]\n+; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr inbounds i16, ptr [[GEP1_SPLIT]], i32 [[IDX2:%.*]]\n+; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr inbounds nuw i8, ptr [[GEP1]], i32 2\n+; CHECK-NEXT:    [[LOAD:%.*]] = load i16, ptr [[GEP2]], align 2\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i16 [[LOAD]], 0\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %gep1 = getelementptr inbounds [1 x i16], ptr @g_i16_1, i32 %idx, i32 %idx2\n+  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n+  %load = load i16, ptr %gep2\n+  %cmp = icmp eq i16 %load, 0\n+  ret i1 %cmp\n+}\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/Loads.h",
+    "llvm/lib/Analysis/Loads.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/load-cmp.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/load-cmp.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -S -data-layout=\"p:32:32:32-p1:16:16:16-p2:128:128:128:32-n8:16:32:64\" < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "cmp_load_multiple_indices",
+          "test_body": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @cmp_load_multiple_indices(i32 %idx, i32 %idx2) {\n; CHECK-LABEL: @cmp_load_multiple_indices(\n; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr inbounds i16, ptr @g_i16_1, i32 [[IDX:%.*]]\n; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr inbounds i16, ptr [[GEP1]], i32 [[IDX2:%.*]]\n; CHECK-NEXT:    [[GEP3:%.*]] = getelementptr inbounds nuw i8, ptr [[GEP2]], i32 2\n; CHECK-NEXT:    [[LOAD:%.*]] = load i16, ptr [[GEP3]], align 2\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i16 [[LOAD]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %gep1 = getelementptr inbounds i16, ptr @g_i16_1, i32 %idx\n  %gep2 = getelementptr inbounds i16, ptr %gep1, i32 %idx2\n  %gep3 = getelementptr inbounds i8, ptr %gep2, i32 2\n  %load = load i16, ptr %gep3, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}",
+          "source_program": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @cmp_load_multiple_indices(i32 %idx, i32 %idx2) {\n  %gep1 = getelementptr inbounds i16, ptr @g_i16_1, i32 %idx\n  %gep2 = getelementptr inbounds i16, ptr %gep1, i32 %idx2\n  %gep3 = getelementptr inbounds i8, ptr %gep2, i32 2\n  %load = load i16, ptr %gep3, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "cmp_load_multiple_indices2",
+          "test_body": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @cmp_load_multiple_indices2(i32 %idx, i32 %idx2) {\n; CHECK-LABEL: @cmp_load_multiple_indices2(\n; CHECK-NEXT:    [[GEP1_SPLIT:%.*]] = getelementptr inbounds [1 x i16], ptr @g_i16_1, i32 [[IDX:%.*]]\n; CHECK-NEXT:    [[GEP1:%.*]] = getelementptr inbounds i16, ptr [[GEP1_SPLIT]], i32 [[IDX2:%.*]]\n; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr inbounds nuw i8, ptr [[GEP1]], i32 2\n; CHECK-NEXT:    [[LOAD:%.*]] = load i16, ptr [[GEP2]], align 2\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i16 [[LOAD]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %gep1 = getelementptr inbounds [1 x i16], ptr @g_i16_1, i32 %idx, i32 %idx2\n  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}",
+          "source_program": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @cmp_load_multiple_indices2(i32 %idx, i32 %idx2) {\n  %gep1 = getelementptr inbounds [1 x i16], ptr @g_i16_1, i32 %idx, i32 %idx2\n  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "load_vs_array_type_mismatch_offset1",
+          "test_body": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1(i32 %idx) {\n; CHECK-LABEL: @load_vs_array_type_mismatch_offset1(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[IDX:%.*]], -3\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[TMP1]], 1\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %gep = getelementptr inbounds { i16, i16 }, ptr @g_i16_1, i32 %idx, i32 1\n  %load = load i16, ptr %gep, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}",
+          "source_program": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1(i32 %idx) {\n  %gep = getelementptr inbounds { i16, i16 }, ptr @g_i16_1, i32 %idx, i32 1\n  %load = load i16, ptr %gep, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "load_vs_array_type_mismatch_offset1_separate_gep",
+          "test_body": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1_separate_gep(i32 %idx) {\n; CHECK-LABEL: @load_vs_array_type_mismatch_offset1_separate_gep(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[IDX:%.*]], -3\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[TMP1]], 1\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %gep1 = getelementptr inbounds { i16, i16 }, ptr @g_i16_1, i32 %idx\n  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}",
+          "source_program": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1_separate_gep(i32 %idx) {\n  %gep1 = getelementptr inbounds { i16, i16 }, ptr @g_i16_1, i32 %idx\n  %gep2 = getelementptr inbounds i8, ptr %gep1, i32 2\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "load_vs_array_type_mismatch_offset1_separate_gep_swapped",
+          "test_body": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1_separate_gep_swapped(i32 %idx) {\n; CHECK-LABEL: @load_vs_array_type_mismatch_offset1_separate_gep_swapped(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[IDX:%.*]], -3\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i32 [[TMP1]], 1\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %gep1 = getelementptr inbounds i8, ptr @g_i16_1, i32 2\n  %gep2 = getelementptr inbounds { i16, i16 }, ptr %gep1, i32 %idx\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}",
+          "source_program": "@g_i16_1 = external hidden constant [8 x i16]\n\ndefine i1 @load_vs_array_type_mismatch_offset1_separate_gep_swapped(i32 %idx) {\n  %gep1 = getelementptr inbounds i8, ptr @g_i16_1, i32 2\n  %gep2 = getelementptr inbounds { i16, i16 }, ptr %gep1, i32 %idx\n  %load = load i16, ptr %gep2, align 2\n  %cmp = icmp eq i16 %load, 0\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

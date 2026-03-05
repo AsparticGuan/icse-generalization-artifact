@@ -1,0 +1,45 @@
+{
+  "pr_number": 125346,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/125346",
+  "title": "[InstCombine] Extend `foldSelectInstWithICmpConst` to handle minmax",
+  "commit_sha": "c1645add10b225c184315196c29642ce3afcb624",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          1771,
+          1796
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "foldSelectInstWithICmpConst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 29c5cef84ccdb..382078e85a17b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1771,26 +1771,38 @@ static Value *foldSelectInstWithICmpConst(SelectInst &SI, ICmpInst *ICI,\n       return Builder.CreateBinaryIntrinsic(Intrinsic::smin, V, TVal);\n   }\n \n-  BinaryOperator *BO;\n+  // Fold icmp(X) ? f(X) : C to f(X) when f(X) is guaranteed to be equal to C\n+  // for all X in the exact range of the inverse predicate.\n+  Instruction *Op;\n   const APInt *C;\n   CmpInst::Predicate CPred;\n-  if (match(&SI, m_Select(m_Specific(ICI), m_APInt(C), m_BinOp(BO))))\n+  if (match(&SI, m_Select(m_Specific(ICI), m_APInt(C), m_Instruction(Op))))\n     CPred = ICI->getPredicate();\n-  else if (match(&SI, m_Select(m_Specific(ICI), m_BinOp(BO), m_APInt(C))))\n+  else if (match(&SI, m_Select(m_Specific(ICI), m_Instruction(Op), m_APInt(C))))\n     CPred = ICI->getInversePredicate();\n   else\n     return nullptr;\n \n-  const APInt *BinOpC;\n-  if (!match(BO, m_BinOp(m_Specific(V), m_APInt(BinOpC))))\n-    return nullptr;\n-\n-  ConstantRange R = ConstantRange::makeExactICmpRegion(CPred, *CmpC)\n-                        .binaryOp(BO->getOpcode(), *BinOpC);\n-  if (R == *C) {\n-    BO->dropPoisonGeneratingFlags();\n-    return BO;\n+  ConstantRange InvDomCR = ConstantRange::makeExactICmpRegion(CPred, *CmpC);\n+  const APInt *OpC;\n+  if (match(Op, m_BinOp(m_Specific(V), m_APInt(OpC)))) {\n+    ConstantRange R = InvDomCR.binaryOp(\n+        static_cast<Instruction::BinaryOps>(Op->getOpcode()), *OpC);\n+    if (R == *C) {\n+      Op->dropPoisonGeneratingFlags();\n+      return Op;\n+    }\n+  }\n+  if (auto *MMI = dyn_cast<MinMaxIntrinsic>(Op);\n+      MMI && MMI->getLHS() == V && match(MMI->getRHS(), m_APInt(OpC))) {\n+    ConstantRange R = ConstantRange::intrinsic(MMI->getIntrinsicID(),\n+                                               {InvDomCR, ConstantRange(*OpC)});\n+    if (R == *C) {\n+      MMI->dropPoisonGeneratingAnnotations();\n+      return MMI;\n+    }\n   }\n+\n   return nullptr;\n }\n \n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/select-min-max.ll b/llvm/test/Transforms/InstCombine/select-min-max.ll\nindex f13223284e6a6..0430fcd5ad370 100644\n--- a/llvm/test/Transforms/InstCombine/select-min-max.ll\n+++ b/llvm/test/Transforms/InstCombine/select-min-max.ll\n@@ -301,3 +301,66 @@ define i8 @not_smin_swap(i8 %i41, i8 %i43) {\n   %spec.select = select i1 %i44, i8 %i46, i8 0\n   ret i8 %spec.select\n }\n+\n+define i8 @sel_umin_constant(i8 %x) {\n+; CHECK-LABEL: @sel_umin_constant(\n+; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 16)\n+; CHECK-NEXT:    ret i8 [[UMIN]]\n+;\n+  %cmp = icmp sgt i8 %x, -1\n+  %umin = call i8 @llvm.umin.i8(i8 %x, i8 16)\n+  %sel = select i1 %cmp, i8 %umin, i8 16\n+  ret i8 %sel\n+}\n+\n+define i8 @sel_constant_smax_with_range_attr(i8 %x) {\n+; CHECK-LABEL: @sel_constant_smax_with_range_attr(\n+; CHECK-NEXT:    [[SEL:%.*]] = call i8 @llvm.smax.i8(i8 [[X:%.*]], i8 16)\n+; CHECK-NEXT:    ret i8 [[SEL]]\n+;\n+  %cmp = icmp slt i8 %x, 0\n+  %smax = call range(i8 8, 16) i8 @llvm.smax.i8(i8 %x, i8 16)\n+  %sel = select i1 %cmp, i8 16, i8 %smax\n+  ret i8 %sel\n+}\n+\n+; Negative tests\n+\n+define i8 @sel_umin_constant_mismatch(i8 %x) {\n+; CHECK-LABEL: @sel_umin_constant_mismatch(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[X:%.*]], -1\n+; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.umin.i8(i8 [[X]], i8 16)\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP]], i8 [[UMIN]], i8 15\n+; CHECK-NEXT:    ret i8 [[SEL]]\n+;\n+  %cmp = icmp sgt i8 %x, -1\n+  %umin = call i8 @llvm.umin.i8(i8 %x, i8 16)\n+  %sel = select i1 %cmp, i8 %umin, i8 15\n+  ret i8 %sel\n+}\n+\n+define i8 @sel_umin_constant_op_mismatch(i8 %x, i8 %y) {\n+; CHECK-LABEL: @sel_umin_constant_op_mismatch(\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[X:%.*]], -1\n+; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.umin.i8(i8 [[Y:%.*]], i8 16)\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP]], i8 [[UMIN]], i8 16\n+; CHECK-NEXT:    ret i8 [[SEL]]\n+;\n+  %cmp = icmp sgt i8 %x, -1\n+  %umin = call i8 @llvm.umin.i8(i8 %y, i8 16)\n+  %sel = select i1 %cmp, i8 %umin, i8 16\n+  ret i8 %sel\n+}\n+\n+define i8 @sel_umin_non_constant(i8 %x, i8 %y) {\n+; CHECK-LABEL: @sel_umin_non_constant(\n+; CHECK-NEXT:    [[UMIN:%.*]] = call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 16)\n+; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i8 [[X]], 0\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP1]], i8 [[Y:%.*]], i8 [[UMIN]]\n+; CHECK-NEXT:    ret i8 [[SEL]]\n+;\n+  %cmp = icmp sgt i8 %x, -1\n+  %umin = call i8 @llvm.umin.i8(i8 %x, i8 16)\n+  %sel = select i1 %cmp, i8 %umin, i8 %y\n+  ret i8 %sel\n+}\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/select-min-max.ll"
+  ],
+  "tests": [],
+  "has_test_changes": false,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

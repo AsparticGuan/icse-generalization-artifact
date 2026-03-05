@@ -1,0 +1,114 @@
+{
+  "pr_number": 76242,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/76242",
+  "title": "[InstCombine] Fold minmax intrinsic using KnownBits information",
+  "commit_sha": "bd763f6ad7ba39a31e3074ed314c8ff866d3195a",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          863,
+          868
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          6289,
+          6298
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          1796,
+          1801
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        "computeConstantRange"
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "mapOverflowResult"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitCallInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex a3186e61b94ad..baa16306ebf5d 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -863,6 +863,11 @@ ConstantRange computeConstantRange(const Value *V, bool ForSigned,\n                                    const DominatorTree *DT = nullptr,\n                                    unsigned Depth = 0);\n \n+/// Combine constant ranges from computeConstantRange() and computeKnownBits().\n+ConstantRange\n+computeConstantRangeIncludingKnownBits(const WithCache<const Value *> &V,\n+                                       bool ForSigned, const SimplifyQuery &SQ);\n+\n /// Return true if this function can prove that the instruction I will\n /// always transfer execution to one of its successors (including the next\n /// instruction that follows within a basic block). E.g. this is not\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 769d921eb1e8d..cac2602d455f9 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -6289,10 +6289,10 @@ static OverflowResult mapOverflowResult(ConstantRange::OverflowResult OR) {\n }\n \n /// Combine constant ranges from computeConstantRange() and computeKnownBits().\n-static ConstantRange\n-computeConstantRangeIncludingKnownBits(const WithCache<const Value *> &V,\n-                                       bool ForSigned,\n-                                       const SimplifyQuery &SQ) {\n+ConstantRange\n+llvm::computeConstantRangeIncludingKnownBits(const WithCache<const Value *> &V,\n+                                             bool ForSigned,\n+                                             const SimplifyQuery &SQ) {\n   ConstantRange CR1 =\n       ConstantRange::fromKnownBits(V.getKnownBits(SQ), ForSigned);\n   ConstantRange CR2 = computeConstantRange(V, ForSigned, SQ.IIQ.UseInstrInfo);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex a272357fa04a4..3b7fe7fa22660 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1796,6 +1796,23 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n     if (Instruction *NewMinMax = factorizeMinMaxTree(II))\n        return NewMinMax;\n \n+    // Try to fold minmax with constant RHS based on range information\n+    const APInt *RHSC;\n+    if (match(I1, m_APIntAllowUndef(RHSC))) {\n+      ICmpInst::Predicate Pred =\n+          ICmpInst::getNonStrictPredicate(MinMaxIntrinsic::getPredicate(IID));\n+      bool IsSigned = MinMaxIntrinsic::isSigned(IID);\n+      ConstantRange LHS_CR = computeConstantRangeIncludingKnownBits(\n+          I0, IsSigned, SQ.getWithInstruction(II));\n+      if (!LHS_CR.isFullSet()) {\n+        if (LHS_CR.icmp(Pred, *RHSC))\n+          return replaceInstUsesWith(*II, I0);\n+        if (LHS_CR.icmp(ICmpInst::getSwappedPredicate(Pred), *RHSC))\n+          return replaceInstUsesWith(*II,\n+                                     ConstantInt::get(II->getType(), *RHSC));\n+      }\n+    }\n+\n     break;\n   }\n   case Intrinsic::bitreverse: {\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/minmax-intrinsics.ll b/llvm/test/Transforms/InstCombine/minmax-intrinsics.ll\nindex f3833a420ee83..ae2e115b1dd9a 100644\n--- a/llvm/test/Transforms/InstCombine/minmax-intrinsics.ll\n+++ b/llvm/test/Transforms/InstCombine/minmax-intrinsics.ll\n@@ -2489,3 +2489,95 @@ define i1 @PR57986() {\n   %umin = call i1 @llvm.umin.i1(i1 ptrtoint (ptr @g to i1), i1 true)\n   ret i1 %umin\n }\n+\n+define i8 @fold_umax_with_knownbits_info(i8 %a, i8 %b) {\n+; CHECK-LABEL: @fold_umax_with_knownbits_info(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 1\n+; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 1\n+; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n+; CHECK-NEXT:    ret i8 [[SUB]]\n+;\n+entry:\n+  %a1 = or i8 %a, 1\n+  %a2 = shl i8 %b, 1\n+  %sub = sub i8 %a1, %a2\n+  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n+  ret i8 %val\n+}\n+\n+define <3 x i8> @fold_umax_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\n+; CHECK-LABEL: @fold_umax_with_knownbits_info_undef_in_splat(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[A1:%.*]] = or <3 x i8> [[A:%.*]], <i8 1, i8 1, i8 1>\n+; CHECK-NEXT:    [[A2:%.*]] = shl <3 x i8> [[B:%.*]], <i8 1, i8 1, i8 1>\n+; CHECK-NEXT:    [[SUB:%.*]] = sub <3 x i8> [[A1]], [[A2]]\n+; CHECK-NEXT:    ret <3 x i8> [[SUB]]\n+;\n+entry:\n+  %a1 = or <3 x i8> %a, <i8 1, i8 1, i8 1>\n+  %a2 = shl <3 x i8> %b, <i8 1, i8 1, i8 1>\n+  %sub = sub <3 x i8> %a1, %a2\n+  %val = call <3 x i8> @llvm.umax.v3i8(<3 x i8> %sub, <3 x i8> <i8 1, i8 undef, i8 1>)\n+  ret <3 x i8> %val\n+}\n+\n+define i8 @fold_umin_with_knownbits_info(i8 %a, i8 %b) {\n+; CHECK-LABEL: @fold_umin_with_knownbits_info(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    ret i8 3\n+;\n+entry:\n+  %a1 = or i8 %a, 3\n+  %a2 = shl i8 %b, 2\n+  %sub = sub i8 %a1, %a2\n+  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n+  ret i8 %val\n+}\n+\n+define <3 x i8> @fold_umin_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\n+; CHECK-LABEL: @fold_umin_with_knownbits_info_undef_in_splat(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    ret <3 x i8> <i8 3, i8 3, i8 3>\n+;\n+entry:\n+  %a1 = or <3 x i8> %a, <i8 3, i8 3, i8 3>\n+  %a2 = shl <3 x i8> %b, <i8 2, i8 2, i8 2>\n+  %sub = sub <3 x i8> %a1, %a2\n+  %val = call <3 x i8> @llvm.umin.v3i8(<3 x i8> %sub, <3 x i8> <i8 3, i8 undef, i8 3>)\n+  ret <3 x i8> %val\n+}\n+\n+define i8 @fold_umax_with_knownbits_info_fail(i8 %a, i8 %b) {\n+; CHECK-LABEL: @fold_umax_with_knownbits_info_fail(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 2\n+; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 1\n+; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n+; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umax.i8(i8 [[SUB]], i8 1)\n+; CHECK-NEXT:    ret i8 [[VAL]]\n+;\n+entry:\n+  %a1 = or i8 %a, 2\n+  %a2 = shl i8 %b, 1\n+  %sub = sub i8 %a1, %a2\n+  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n+  ret i8 %val\n+}\n+\n+define i8 @fold_umin_with_knownbits_info_fail(i8 %a, i8 %b) {\n+; CHECK-LABEL: @fold_umin_with_knownbits_info_fail(\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 1\n+; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 2\n+; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n+; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umin.i8(i8 [[SUB]], i8 3)\n+; CHECK-NEXT:    ret i8 [[VAL]]\n+;\n+entry:\n+  %a1 = or i8 %a, 1\n+  %a2 = shl i8 %b, 2\n+  %sub = sub i8 %a1, %a2\n+  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n+  ret i8 %val\n+}\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/ValueTracking.h",
+    "llvm/lib/Analysis/ValueTracking.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/minmax-intrinsics.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-intrinsics.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "PR57986",
+          "test_body": "@g = external dso_local global i32, align 4\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.umin.i1(i1, i1) #0\n\ndefine i1 @PR57986() {\n; CHECK-LABEL: @PR57986(\n; CHECK-NEXT:    ret i1 ptrtoint (ptr @g to i1)\n  %umin = call i1 @llvm.umin.i1(i1 ptrtoint (ptr @g to i1), i1 true)\n  ret i1 %umin\n}",
+          "source_program": "@g = external dso_local global i32, align 4\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.umin.i1(i1, i1) #0\n\ndefine i1 @PR57986() {\n  %umin = call i1 @llvm.umin.i1(i1 ptrtoint (ptr @g to i1), i1 true)\n  ret i1 %umin\n}\n"
+        },
+        {
+          "test_name": "fold_umax_with_knownbits_info",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @fold_umax_with_knownbits_info(i8 %a, i8 %b) {\n; CHECK-LABEL: @fold_umax_with_knownbits_info(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 1\n; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umax.i8(i8 [[SUB]], i8 1)\n; CHECK-NEXT:    ret i8 [[VAL]]\nentry:\n  %a1 = or i8 %a, 1\n  %a2 = shl i8 %b, 1\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n  ret i8 %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @fold_umax_with_knownbits_info(i8 %a, i8 %b) {\nentry:\n  %a1 = or i8 %a, 1\n  %a2 = shl i8 %b, 1\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n  ret i8 %val\n}\n"
+        },
+        {
+          "test_name": "fold_umax_with_knownbits_info_fail",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @fold_umax_with_knownbits_info_fail(i8 %a, i8 %b) {\n; CHECK-LABEL: @fold_umax_with_knownbits_info_fail(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 2\n; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 1\n; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umax.i8(i8 [[SUB]], i8 1)\n; CHECK-NEXT:    ret i8 [[VAL]]\nentry:\n  %a1 = or i8 %a, 2\n  %a2 = shl i8 %b, 1\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n  ret i8 %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @fold_umax_with_knownbits_info_fail(i8 %a, i8 %b) {\nentry:\n  %a1 = or i8 %a, 2\n  %a2 = shl i8 %b, 1\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umax.i8(i8 %sub, i8 1)\n  ret i8 %val\n}\n"
+        },
+        {
+          "test_name": "fold_umax_with_knownbits_info_undef_in_splat",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <3 x i8> @llvm.umax.v3i8(<3 x i8>, <3 x i8>) #0\n\ndefine <3 x i8> @fold_umax_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\n; CHECK-LABEL: @fold_umax_with_knownbits_info_undef_in_splat(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or <3 x i8> [[A:%.*]], <i8 1, i8 1, i8 1>\n; CHECK-NEXT:    [[A2:%.*]] = shl <3 x i8> [[B:%.*]], <i8 1, i8 1, i8 1>\n; CHECK-NEXT:    [[SUB:%.*]] = sub <3 x i8> [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call <3 x i8> @llvm.umax.v3i8(<3 x i8> [[SUB]], <3 x i8> <i8 1, i8 undef, i8 1>)\n; CHECK-NEXT:    ret <3 x i8> [[VAL]]\nentry:\n  %a1 = or <3 x i8> %a, <i8 1, i8 1, i8 1>\n  %a2 = shl <3 x i8> %b, <i8 1, i8 1, i8 1>\n  %sub = sub <3 x i8> %a1, %a2\n  %val = call <3 x i8> @llvm.umax.v3i8(<3 x i8> %sub, <3 x i8> <i8 1, i8 undef, i8 1>)\n  ret <3 x i8> %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <3 x i8> @llvm.umax.v3i8(<3 x i8>, <3 x i8>) #0\n\ndefine <3 x i8> @fold_umax_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\nentry:\n  %a1 = or <3 x i8> %a, <i8 1, i8 1, i8 1>\n  %a2 = shl <3 x i8> %b, <i8 1, i8 1, i8 1>\n  %sub = sub <3 x i8> %a1, %a2\n  %val = call <3 x i8> @llvm.umax.v3i8(<3 x i8> %sub, <3 x i8> <i8 1, i8 undef, i8 1>)\n  ret <3 x i8> %val\n}\n"
+        },
+        {
+          "test_name": "fold_umin_with_knownbits_info",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @fold_umin_with_knownbits_info(i8 %a, i8 %b) {\n; CHECK-LABEL: @fold_umin_with_knownbits_info(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 3\n; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 2\n; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umin.i8(i8 [[SUB]], i8 3)\n; CHECK-NEXT:    ret i8 [[VAL]]\nentry:\n  %a1 = or i8 %a, 3\n  %a2 = shl i8 %b, 2\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n  ret i8 %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @fold_umin_with_knownbits_info(i8 %a, i8 %b) {\nentry:\n  %a1 = or i8 %a, 3\n  %a2 = shl i8 %b, 2\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n  ret i8 %val\n}\n"
+        },
+        {
+          "test_name": "fold_umin_with_knownbits_info_fail",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @fold_umin_with_knownbits_info_fail(i8 %a, i8 %b) {\n; CHECK-LABEL: @fold_umin_with_knownbits_info_fail(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or i8 [[A:%.*]], 1\n; CHECK-NEXT:    [[A2:%.*]] = shl i8 [[B:%.*]], 2\n; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call i8 @llvm.umin.i8(i8 [[SUB]], i8 3)\n; CHECK-NEXT:    ret i8 [[VAL]]\nentry:\n  %a1 = or i8 %a, 1\n  %a2 = shl i8 %b, 2\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n  ret i8 %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @fold_umin_with_knownbits_info_fail(i8 %a, i8 %b) {\nentry:\n  %a1 = or i8 %a, 1\n  %a2 = shl i8 %b, 2\n  %sub = sub i8 %a1, %a2\n  %val = call i8 @llvm.umin.i8(i8 %sub, i8 3)\n  ret i8 %val\n}\n"
+        },
+        {
+          "test_name": "fold_umin_with_knownbits_info_undef_in_splat",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <3 x i8> @llvm.umin.v3i8(<3 x i8>, <3 x i8>) #0\n\ndefine <3 x i8> @fold_umin_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\n; CHECK-LABEL: @fold_umin_with_knownbits_info_undef_in_splat(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A1:%.*]] = or <3 x i8> [[A:%.*]], <i8 3, i8 3, i8 3>\n; CHECK-NEXT:    [[A2:%.*]] = shl <3 x i8> [[B:%.*]], <i8 2, i8 2, i8 2>\n; CHECK-NEXT:    [[SUB:%.*]] = sub <3 x i8> [[A1]], [[A2]]\n; CHECK-NEXT:    [[VAL:%.*]] = call <3 x i8> @llvm.umin.v3i8(<3 x i8> [[SUB]], <3 x i8> <i8 3, i8 undef, i8 3>)\n; CHECK-NEXT:    ret <3 x i8> [[VAL]]\nentry:\n  %a1 = or <3 x i8> %a, <i8 3, i8 3, i8 3>\n  %a2 = shl <3 x i8> %b, <i8 2, i8 2, i8 2>\n  %sub = sub <3 x i8> %a1, %a2\n  %val = call <3 x i8> @llvm.umin.v3i8(<3 x i8> %sub, <3 x i8> <i8 3, i8 undef, i8 3>)\n  ret <3 x i8> %val\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <3 x i8> @llvm.umin.v3i8(<3 x i8>, <3 x i8>) #0\n\ndefine <3 x i8> @fold_umin_with_knownbits_info_undef_in_splat(<3 x i8> %a, <3 x i8> %b) {\nentry:\n  %a1 = or <3 x i8> %a, <i8 3, i8 3, i8 3>\n  %a2 = shl <3 x i8> %b, <i8 2, i8 2, i8 2>\n  %sub = sub <3 x i8> %a1, %a2\n  %val = call <3 x i8> @llvm.umin.v3i8(<3 x i8> %sub, <3 x i8> <i8 3, i8 undef, i8 3>)\n  ret <3 x i8> %val\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

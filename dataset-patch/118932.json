@@ -1,0 +1,97 @@
+{
+  "pr_number": 118932,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/118932",
+  "title": "[InstCombine]  Widen Sel width after Cmp to generate Max/Min intrinsics.",
+  "commit_sha": "4bf300968cd3ffe22523312dad2bf9a88b89bce6",
+  "components": [
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          8781,
+          8820
+        ],
+        [
+          8890,
+          8895
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "lookThroughCast",
+        "matchSelectPattern"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex c48068afc0481..a3fb4b585096e 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -8781,40 +8781,10 @@ static SelectPatternResult matchSelectPattern(CmpInst::Predicate Pred,\n   return matchFastFloatClamp(Pred, CmpLHS, CmpRHS, TrueVal, FalseVal, LHS, RHS);\n }\n \n-/// Helps to match a select pattern in case of a type mismatch.\n-///\n-/// The function processes the case when type of true and false values of a\n-/// select instruction differs from type of the cmp instruction operands because\n-/// of a cast instruction. The function checks if it is legal to move the cast\n-/// operation after \"select\". If yes, it returns the new second value of\n-/// \"select\" (with the assumption that cast is moved):\n-/// 1. As operand of cast instruction when both values of \"select\" are same cast\n-/// instructions.\n-/// 2. As restored constant (by applying reverse cast operation) when the first\n-/// value of the \"select\" is a cast operation and the second value is a\n-/// constant.\n-/// NOTE: We return only the new second value because the first value could be\n-/// accessed as operand of cast instruction.\n-static Value *lookThroughCast(CmpInst *CmpI, Value *V1, Value *V2,\n-                              Instruction::CastOps *CastOp) {\n-  auto *Cast1 = dyn_cast<CastInst>(V1);\n-  if (!Cast1)\n-    return nullptr;\n-\n-  *CastOp = Cast1->getOpcode();\n-  Type *SrcTy = Cast1->getSrcTy();\n-  if (auto *Cast2 = dyn_cast<CastInst>(V2)) {\n-    // If V1 and V2 are both the same cast from the same type, look through V1.\n-    if (*CastOp == Cast2->getOpcode() && SrcTy == Cast2->getSrcTy())\n-      return Cast2->getOperand(0);\n-    return nullptr;\n-  }\n-\n-  auto *C = dyn_cast<Constant>(V2);\n-  if (!C)\n-    return nullptr;\n-\n+static Value *lookThroughCastConst(CmpInst *CmpI, Type *SrcTy, Constant *C,\n+                                   Instruction::CastOps *CastOp) {\n   const DataLayout &DL = CmpI->getDataLayout();\n+\n   Constant *CastedTo = nullptr;\n   switch (*CastOp) {\n   case Instruction::ZExt:\n@@ -8890,6 +8860,63 @@ static Value *lookThroughCast(CmpInst *CmpI, Value *V1, Value *V2,\n   return CastedTo;\n }\n \n+/// Helps to match a select pattern in case of a type mismatch.\n+///\n+/// The function processes the case when type of true and false values of a\n+/// select instruction differs from type of the cmp instruction operands because\n+/// of a cast instruction. The function checks if it is legal to move the cast\n+/// operation after \"select\". If yes, it returns the new second value of\n+/// \"select\" (with the assumption that cast is moved):\n+/// 1. As operand of cast instruction when both values of \"select\" are same cast\n+/// instructions.\n+/// 2. As restored constant (by applying reverse cast operation) when the first\n+/// value of the \"select\" is a cast operation and the second value is a\n+/// constant. It is implemented in lookThroughCastConst().\n+/// 3. As one operand is cast instruction and the other is not. The operands in\n+/// sel(cmp) are in different type integer.\n+/// NOTE: We return only the new second value because the first value could be\n+/// accessed as operand of cast instruction.\n+static Value *lookThroughCast(CmpInst *CmpI, Value *V1, Value *V2,\n+                              Instruction::CastOps *CastOp) {\n+  auto *Cast1 = dyn_cast<CastInst>(V1);\n+  if (!Cast1)\n+    return nullptr;\n+\n+  *CastOp = Cast1->getOpcode();\n+  Type *SrcTy = Cast1->getSrcTy();\n+  if (auto *Cast2 = dyn_cast<CastInst>(V2)) {\n+    // If V1 and V2 are both the same cast from the same type, look through V1.\n+    if (*CastOp == Cast2->getOpcode() && SrcTy == Cast2->getSrcTy())\n+      return Cast2->getOperand(0);\n+    return nullptr;\n+  }\n+\n+  auto *C = dyn_cast<Constant>(V2);\n+  if (C)\n+    return lookThroughCastConst(CmpI, SrcTy, C, CastOp);\n+\n+  Value *CastedTo = nullptr;\n+  if (*CastOp == Instruction::Trunc) {\n+    if (match(CmpI->getOperand(1), m_ZExtOrSExt(m_Specific(V2)))) {\n+      // Here we have the following case:\n+      //   %y_ext = sext iK %y to iN\n+      //   %cond = cmp iN %x, %y_ext\n+      //   %tr = trunc iN %x to iK\n+      //   %narrowsel = select i1 %cond, iK %tr, iK %y\n+      //\n+      // We can always move trunc after select operation:\n+      //   %y_ext = sext iK %y to iN\n+      //   %cond = cmp iN %x, %y_ext\n+      //   %widesel = select i1 %cond, iN %x, iN %y_ext\n+      //   %tr = trunc iN %widesel to iK\n+      assert(V2->getType() == Cast1->getType() &&\n+             \"V2 and Cast1 should be the same type.\");\n+      CastedTo = CmpI->getOperand(1);\n+    }\n+  }\n+\n+  return CastedTo;\n+}\n SelectPatternResult llvm::matchSelectPattern(Value *V, Value *&LHS, Value *&RHS,\n                                              Instruction::CastOps *CastOp,\n                                              unsigned Depth) {\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/minmax-fold.ll b/llvm/test/Transforms/InstCombine/minmax-fold.ll\nindex ccdf4400b16b5..0dbcae91bf97f 100644\n--- a/llvm/test/Transforms/InstCombine/minmax-fold.ll\n+++ b/llvm/test/Transforms/InstCombine/minmax-fold.ll\n@@ -697,6 +697,34 @@ define zeroext i8 @look_through_cast2(i32 %x) {\n   ret i8 %res\n }\n \n+define i8 @look_through_cast_int_min(i8 %a, i32 %min) {\n+; CHECK-LABEL: @look_through_cast_int_min(\n+; CHECK-NEXT:    [[A32:%.*]] = sext i8 [[A:%.*]] to i32\n+; CHECK-NEXT:    [[SEL1:%.*]] = call i32 @llvm.smin.i32(i32 [[MIN:%.*]], i32 [[A32]])\n+; CHECK-NEXT:    [[SEL:%.*]] = trunc i32 [[SEL1]] to i8\n+; CHECK-NEXT:    ret i8 [[SEL]]\n+;\n+  %a32 = sext i8 %a to i32\n+  %cmp = icmp slt i32 %a32, %min\n+  %min8 = trunc i32 %min to i8\n+  %sel = select i1 %cmp, i8 %a, i8 %min8\n+  ret i8 %sel\n+}\n+\n+define i16 @look_through_cast_int_max(i16 %a, i32 %max) {\n+; CHECK-LABEL: @look_through_cast_int_max(\n+; CHECK-NEXT:    [[A32:%.*]] = zext i16 [[A:%.*]] to i32\n+; CHECK-NEXT:    [[SEL1:%.*]] = call i32 @llvm.smax.i32(i32 [[MAX:%.*]], i32 [[A32]])\n+; CHECK-NEXT:    [[SEL:%.*]] = trunc i32 [[SEL1]] to i16\n+; CHECK-NEXT:    ret i16 [[SEL]]\n+;\n+  %a32 = zext i16 %a to i32\n+  %cmp = icmp sgt i32 %max, %a32\n+  %max8 = trunc i32 %max to i16\n+  %sel = select i1 %cmp, i16 %max8, i16 %a\n+  ret i16 %sel\n+}\n+\n define <2 x i8> @min_through_cast_vec1(<2 x i32> %x) {\n ; CHECK-LABEL: @min_through_cast_vec1(\n ; CHECK-NEXT:    [[RES1:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[X:%.*]], <2 x i32> <i32 510, i32 511>)\n@@ -721,6 +749,34 @@ define <2 x i8> @min_through_cast_vec2(<2 x i32> %x) {\n   ret <2 x i8> %res\n }\n \n+define <8 x i8> @look_through_cast_int_min_vec(<8 x i8> %a, <8 x i32> %min) {\n+; CHECK-LABEL: @look_through_cast_int_min_vec(\n+; CHECK-NEXT:    [[A32:%.*]] = sext <8 x i8> [[A:%.*]] to <8 x i32>\n+; CHECK-NEXT:    [[SEL1:%.*]] = call <8 x i32> @llvm.umin.v8i32(<8 x i32> [[MIN:%.*]], <8 x i32> [[A32]])\n+; CHECK-NEXT:    [[SEL:%.*]] = trunc <8 x i32> [[SEL1]] to <8 x i8>\n+; CHECK-NEXT:    ret <8 x i8> [[SEL]]\n+;\n+  %a32 = sext <8 x i8> %a to <8 x i32>\n+  %cmp = icmp ult <8 x i32> %a32, %min\n+  %min8 = trunc <8 x i32> %min to <8 x i8>\n+  %sel = select <8 x i1> %cmp, <8 x i8> %a, <8 x i8> %min8\n+  ret <8 x i8> %sel\n+}\n+\n+define <8 x i32> @look_through_cast_int_max_vec(<8 x i32> %a, <8 x i64> %max) {\n+; CHECK-LABEL: @look_through_cast_int_max_vec(\n+; CHECK-NEXT:    [[A32:%.*]] = zext <8 x i32> [[A:%.*]] to <8 x i64>\n+; CHECK-NEXT:    [[SEL1:%.*]] = call <8 x i64> @llvm.smax.v8i64(<8 x i64> [[MAX:%.*]], <8 x i64> [[A32]])\n+; CHECK-NEXT:    [[SEL:%.*]] = trunc <8 x i64> [[SEL1]] to <8 x i32>\n+; CHECK-NEXT:    ret <8 x i32> [[SEL]]\n+;\n+  %a32 = zext <8 x i32> %a to <8 x i64>\n+  %cmp = icmp sgt <8 x i64> %a32, %max\n+  %max8 = trunc <8 x i64> %max to <8 x i32>\n+  %sel = select <8 x i1> %cmp, <8 x i32> %a, <8 x i32> %max8\n+  ret <8 x i32> %sel\n+}\n+\n ; Remove a min/max op in a sequence with a common operand.\n ; PR35717: https://bugs.llvm.org/show_bug.cgi?id=35717\n \n",
+  "source_files": [
+    "llvm/lib/Analysis/ValueTracking.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/minmax-fold.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fold.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "look_through_cast2",
+          "test_body": "define zeroext i8 @look_through_cast2(i32 %x) {\n; CHECK-LABEL: @look_through_cast2(\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp slt i32 [[X:%.*]], 510\n; CHECK-NEXT:    [[X_TRUNC:%.*]] = trunc i32 [[X]] to i8\n; CHECK-NEXT:    [[RES:%.*]] = select i1 [[CMP1]], i8 [[X_TRUNC]], i8 -1\n; CHECK-NEXT:    ret i8 [[RES]]\n  %cmp1 = icmp slt i32 %x, 510\n  %x_trunc = trunc i32 %x to i8\n  %res = select i1 %cmp1, i8 %x_trunc, i8 -1\n  ret i8 %res\n}",
+          "source_program": "define zeroext i8 @look_through_cast2(i32 %x) {\n  %cmp1 = icmp slt i32 %x, 510\n  %x_trunc = trunc i32 %x to i8\n  %res = select i1 %cmp1, i8 %x_trunc, i8 -1\n  ret i8 %res\n}\n"
+        },
+        {
+          "test_name": "look_through_cast_int_max",
+          "test_body": "define zeroext i16 @look_through_cast_int_max(i16 %a, i32 %max) {\n; CHECK-LABEL: @look_through_cast_int_max(\n; CHECK-NEXT:    [[A32:%.*]] = sext i16 [[A:%.*]] to i32\n; CHECK-NEXT:    [[SEL1:%.*]] = call i32 @llvm.smax.i32(i32 [[MAX:%.*]], i32 [[A32]])\n; CHECK-NEXT:    [[SEL:%.*]] = trunc i32 [[SEL1]] to i16\n; CHECK-NEXT:    ret i16 [[SEL]]\n  %a32 = sext i16 %a to i32\n  %cmp = icmp sgt i32 %max, %a32\n  %max8 = trunc i32 %max to i16\n  %sel = select i1 %cmp, i16 %max8, i16 %a\n  ret i16 %sel\n}",
+          "source_program": "define zeroext i16 @look_through_cast_int_max(i16 %a, i32 %max) {\n  %a32 = sext i16 %a to i32\n  %cmp = icmp sgt i32 %max, %a32\n  %max8 = trunc i32 %max to i16\n  %sel = select i1 %cmp, i16 %max8, i16 %a\n  ret i16 %sel\n}\n"
+        },
+        {
+          "test_name": "look_through_cast_int_max_vec",
+          "test_body": "define <8 x i32> @look_through_cast_int_max_vec(<8 x i32> %a, <8 x i64> %max) {\n; CHECK-LABEL: @look_through_cast_int_max_vec(\n; CHECK-NEXT:    [[A32:%.*]] = sext <8 x i32> [[A:%.*]] to <8 x i64>\n; CHECK-NEXT:    [[SEL1:%.*]] = call <8 x i64> @llvm.smax.v8i64(<8 x i64> [[MAX:%.*]], <8 x i64> [[A32]])\n; CHECK-NEXT:    [[SEL:%.*]] = trunc <8 x i64> [[SEL1]] to <8 x i32>\n; CHECK-NEXT:    ret <8 x i32> [[SEL]]\n  %a32 = sext <8 x i32> %a to <8 x i64>\n  %cmp = icmp sgt <8 x i64> %a32, %max\n  %max8 = trunc <8 x i64> %max to <8 x i32>\n  %sel = select <8 x i1> %cmp, <8 x i32> %a, <8 x i32> %max8\n  ret <8 x i32> %sel\n}",
+          "source_program": "define <8 x i32> @look_through_cast_int_max_vec(<8 x i32> %a, <8 x i64> %max) {\n  %a32 = sext <8 x i32> %a to <8 x i64>\n  %cmp = icmp sgt <8 x i64> %a32, %max\n  %max8 = trunc <8 x i64> %max to <8 x i32>\n  %sel = select <8 x i1> %cmp, <8 x i32> %a, <8 x i32> %max8\n  ret <8 x i32> %sel\n}\n"
+        },
+        {
+          "test_name": "look_through_cast_int_min",
+          "test_body": "define zeroext i8 @look_through_cast_int_min(i8 %a, i32 %min) {\n; CHECK-LABEL: @look_through_cast_int_min(\n; CHECK-NEXT:    [[A32:%.*]] = sext i8 [[A:%.*]] to i32\n; CHECK-NEXT:    [[SEL1:%.*]] = call i32 @llvm.smin.i32(i32 [[MIN:%.*]], i32 [[A32]])\n; CHECK-NEXT:    [[SEL:%.*]] = trunc i32 [[SEL1]] to i8\n; CHECK-NEXT:    ret i8 [[SEL]]\n  %a32 = sext i8 %a to i32\n  %cmp = icmp slt i32 %a32, %min\n  %min8 = trunc i32 %min to i8\n  %sel = select i1 %cmp, i8 %a, i8 %min8\n  ret i8 %sel\n}",
+          "source_program": "define zeroext i8 @look_through_cast_int_min(i8 %a, i32 %min) {\n  %a32 = sext i8 %a to i32\n  %cmp = icmp slt i32 %a32, %min\n  %min8 = trunc i32 %min to i8\n  %sel = select i1 %cmp, i8 %a, i8 %min8\n  ret i8 %sel\n}\n"
+        },
+        {
+          "test_name": "look_through_cast_int_min_vec",
+          "test_body": "define <8 x i8> @look_through_cast_int_min_vec(<8 x i8> %a, <8 x i32> %min) {\n; CHECK-LABEL: @look_through_cast_int_min_vec(\n; CHECK-NEXT:    [[A32:%.*]] = sext <8 x i8> [[A:%.*]] to <8 x i32>\n; CHECK-NEXT:    [[SEL1:%.*]] = call <8 x i32> @llvm.smin.v8i32(<8 x i32> [[MIN:%.*]], <8 x i32> [[A32]])\n; CHECK-NEXT:    [[SEL:%.*]] = trunc <8 x i32> [[SEL1]] to <8 x i8>\n; CHECK-NEXT:    ret <8 x i8> [[SEL]]\n  %a32 = sext <8 x i8> %a to <8 x i32>\n  %cmp = icmp slt <8 x i32> %a32, %min\n  %min8 = trunc <8 x i32> %min to <8 x i8>\n  %sel = select <8 x i1> %cmp, <8 x i8> %a, <8 x i8> %min8\n  ret <8 x i8> %sel\n}",
+          "source_program": "define <8 x i8> @look_through_cast_int_min_vec(<8 x i8> %a, <8 x i32> %min) {\n  %a32 = sext <8 x i8> %a to <8 x i32>\n  %cmp = icmp slt <8 x i32> %a32, %min\n  %min8 = trunc <8 x i32> %min to <8 x i8>\n  %sel = select <8 x i1> %cmp, <8 x i8> %a, <8 x i8> %min8\n  ret <8 x i8> %sel\n}\n"
+        },
+        {
+          "test_name": "min_through_cast_vec1",
+          "test_body": "define <2 x i8> @min_through_cast_vec1(<2 x i32> %x) {\n; CHECK-LABEL: @min_through_cast_vec1(\n; CHECK-NEXT:    [[RES1:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[X:%.*]], <2 x i32> <i32 510, i32 511>)\n; CHECK-NEXT:    [[RES:%.*]] = trunc <2 x i32> [[RES1]] to <2 x i8>\n; CHECK-NEXT:    ret <2 x i8> [[RES]]\n  %cmp = icmp slt <2 x i32> %x, <i32 510, i32 511>\n  %x_trunc = trunc <2 x i32> %x to <2 x i8>\n  %res = select <2 x i1> %cmp, <2 x i8> %x_trunc, <2 x i8> <i8 -2, i8 -1>\n  ret <2 x i8> %res\n}",
+          "source_program": "define <2 x i8> @min_through_cast_vec1(<2 x i32> %x) {\n  %cmp = icmp slt <2 x i32> %x, <i32 510, i32 511>\n  %x_trunc = trunc <2 x i32> %x to <2 x i8>\n  %res = select <2 x i1> %cmp, <2 x i8> %x_trunc, <2 x i8> <i8 -2, i8 -1>\n  ret <2 x i8> %res\n}\n"
+        },
+        {
+          "test_name": "min_through_cast_vec2",
+          "test_body": "define <2 x i8> @min_through_cast_vec2(<2 x i32> %x) {\n; CHECK-LABEL: @min_through_cast_vec2(\n; CHECK-NEXT:    [[RES1:%.*]] = call <2 x i32> @llvm.smin.v2i32(<2 x i32> [[X:%.*]], <2 x i32> splat (i32 511))\n; CHECK-NEXT:    [[RES:%.*]] = trunc <2 x i32> [[RES1]] to <2 x i8>\n; CHECK-NEXT:    ret <2 x i8> [[RES]]\n  %cmp = icmp slt <2 x i32> %x, <i32 511, i32 511>\n  %x_trunc = trunc <2 x i32> %x to <2 x i8>\n  %res = select <2 x i1> %cmp, <2 x i8> %x_trunc, <2 x i8> <i8 -1, i8 -1>\n  ret <2 x i8> %res\n}",
+          "source_program": "define <2 x i8> @min_through_cast_vec2(<2 x i32> %x) {\n  %cmp = icmp slt <2 x i32> %x, <i32 511, i32 511>\n  %x_trunc = trunc <2 x i32> %x to <2 x i8>\n  %res = select <2 x i1> %cmp, <2 x i8> %x_trunc, <2 x i8> <i8 -1, i8 -1>\n  ret <2 x i8> %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

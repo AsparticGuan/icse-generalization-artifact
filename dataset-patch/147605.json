@@ -1,0 +1,190 @@
+{
+  "pr_number": 147605,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/147605",
+  "title": "[InstCombine] Optimize (select %x, op(%x), 0) to op(%x) for operations where op(0) == 0 ",
+  "commit_sha": "71274501af5c708b1cb1986caab90d0ec12033b5",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          878,
+          884
+        ],
+        [
+          900,
+          909
+        ],
+        [
+          914,
+          922
+        ],
+        [
+          4104,
+          4110
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::visitSelectInst",
+        "foldSelectZeroOrMul",
+        "foldSetClearBits"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 73ba0f78e8053..eb4332fbc0959 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -878,7 +878,11 @@ static Instruction *foldSetClearBits(SelectInst &Sel,\n // is a vector consisting of 0 and undefs. If a constant compared with x\n // is a scalar undefined value or undefined vector then an expression\n // should be already folded into a constant.\n-static Instruction *foldSelectZeroOrMul(SelectInst &SI, InstCombinerImpl &IC) {\n+//\n+// This also holds all operations such that Op(0) == 0\n+// e.g. Shl, Umin, etc\n+static Instruction *foldSelectZeroOrFixedOp(SelectInst &SI,\n+                                            InstCombinerImpl &IC) {\n   auto *CondVal = SI.getCondition();\n   auto *TrueVal = SI.getTrueValue();\n   auto *FalseVal = SI.getFalseValue();\n@@ -900,10 +904,23 @@ static Instruction *foldSelectZeroOrMul(SelectInst &SI, InstCombinerImpl &IC) {\n   // non-zero elements that are masked by undef elements in the compare\n   // constant.\n   auto *TrueValC = dyn_cast<Constant>(TrueVal);\n-  if (TrueValC == nullptr ||\n-      !match(FalseVal, m_c_Mul(m_Specific(X), m_Value(Y))) ||\n-      !isa<Instruction>(FalseVal))\n+  if (TrueValC == nullptr || !isa<Instruction>(FalseVal))\n+    return nullptr;\n+\n+  bool FreezeY;\n+  if (match(FalseVal, m_c_Mul(m_Specific(X), m_Value(Y))) ||\n+      match(FalseVal, m_c_And(m_Specific(X), m_Value(Y))) ||\n+      match(FalseVal, m_FShl(m_Specific(X), m_Specific(X), m_Value(Y))) ||\n+      match(FalseVal, m_FShr(m_Specific(X), m_Specific(X), m_Value(Y))) ||\n+      match(FalseVal,\n+            m_c_Intrinsic<Intrinsic::umin>(m_Specific(X), m_Value(Y)))) {\n+    FreezeY = true;\n+  } else if (match(FalseVal, m_IDiv(m_Specific(X), m_Value(Y))) ||\n+             match(FalseVal, m_IRem(m_Specific(X), m_Value(Y)))) {\n+    FreezeY = false;\n+  } else {\n     return nullptr;\n+  }\n \n   auto *ZeroC = cast<Constant>(cast<Instruction>(CondVal)->getOperand(1));\n   auto *MergedC = Constant::mergeUndefsWith(TrueValC, ZeroC);\n@@ -914,9 +931,15 @@ static Instruction *foldSelectZeroOrMul(SelectInst &SI, InstCombinerImpl &IC) {\n     return nullptr;\n \n   auto *FalseValI = cast<Instruction>(FalseVal);\n-  auto *FrY = IC.InsertNewInstBefore(new FreezeInst(Y, Y->getName() + \".fr\"),\n-                                     FalseValI->getIterator());\n-  IC.replaceOperand(*FalseValI, FalseValI->getOperand(0) == Y ? 0 : 1, FrY);\n+  if (FreezeY) {\n+    auto *FrY = IC.InsertNewInstBefore(new FreezeInst(Y, Y->getName() + \".fr\"),\n+                                       FalseValI->getIterator());\n+    IC.replaceOperand(*FalseValI,\n+                      FalseValI->getOperand(0) == Y\n+                          ? 0\n+                          : (FalseValI->getOperand(1) == Y ? 1 : 2),\n+                      FrY);\n+  }\n   return IC.replaceInstUsesWith(SI, FalseValI);\n }\n \n@@ -4104,7 +4127,7 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     return Add;\n   if (Instruction *Or = foldSetClearBits(SI, Builder))\n     return Or;\n-  if (Instruction *Mul = foldSelectZeroOrMul(SI, *this))\n+  if (Instruction *Mul = foldSelectZeroOrFixedOp(SI, *this))\n     return Mul;\n \n   // Turn (select C, (op X, Y), (op X, Z)) -> (op X, (select C, Y, Z))\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/icmp-select.ll b/llvm/test/Transforms/InstCombine/icmp-select.ll\nindex a038731abbc48..c6c0ba385a6fd 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-select.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-select.ll\n@@ -248,10 +248,9 @@ define i1 @icmp_select_implied_cond_relational_off_by_one(i8 %x, i8 %y) {\n \n define i1 @umin_seq_comparison(i8 %x, i8 %y) {\n ; CHECK-LABEL: @umin_seq_comparison(\n-; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i8 [[X:%.*]], 0\n-; CHECK-NEXT:    [[CMP21:%.*]] = icmp ule i8 [[X]], [[Y:%.*]]\n-; CHECK-NEXT:    [[CMP2:%.*]] = select i1 [[CMP1]], i1 true, i1 [[CMP21]]\n-; CHECK-NEXT:    ret i1 [[CMP2]]\n+; CHECK-NEXT:    [[Y:%.*]] = freeze i8 [[Y1:%.*]]\n+; CHECK-NEXT:    [[CMP21:%.*]] = icmp ule i8 [[X:%.*]], [[Y]]\n+; CHECK-NEXT:    ret i1 [[CMP21]]\n ;\n   %min = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n   %cmp1 = icmp eq i8 %x, 0\ndiff --git a/llvm/test/Transforms/InstCombine/select-fixed-zero.ll b/llvm/test/Transforms/InstCombine/select-fixed-zero.ll\nnew file mode 100644\nindex 0000000000000..7f326d158776b\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/select-fixed-zero.ll\n@@ -0,0 +1,221 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt -S -passes=instcombine < %s | FileCheck %s\n+\n+; (select (icmp x, 0, eq), 0, (umin x, y)) -> (umin x, y)\n+define i64 @umin_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @umin_select(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[UMIN:%.*]] = call i64 @llvm.umin.i64(i64 [[A:%.*]], i64 [[B_FR]])\n+; CHECK-NEXT:    ret i64 [[UMIN]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %umin = call i64 @llvm.umin.i64(i64 %a, i64 %b)\n+  %select = select i1 %cond, i64 0, i64 %umin\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (mul x, y)) -> (mul x, y)\n+define i64 @mul_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @mul_select(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i64 [[A:%.*]], [[B_FR]]\n+; CHECK-NEXT:    ret i64 [[MUL]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %mul = mul i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %mul\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (mul x, y)) -> (mul x, y)\n+define i64 @mul_select_comm(i64 %a, i64 %b) {\n+; CHECK-LABEL: @mul_select_comm(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i64 [[B_FR]], [[A:%.*]]\n+; CHECK-NEXT:    ret i64 [[MUL]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %mul = mul i64 %b, %a\n+  %select = select i1 %cond, i64 0, i64 %mul\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (shl x, y)) -> (shl x, y)\n+define i64 @shl_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @shl_select(\n+; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n+; CHECK-NEXT:    [[SHL:%.*]] = shl i64 [[A]], [[B_FR:%.*]]\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[SHL]]\n+; CHECK-NEXT:    ret i64 [[SELECT]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %shl = shl i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %shl\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (and x, y)) -> (and x, y)\n+define i64 @and_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @and_select(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[AND:%.*]] = and i64 [[A:%.*]], [[B_FR]]\n+; CHECK-NEXT:    ret i64 [[AND]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %and = and i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %and\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (and x, y)) -> (and x, y)\n+define i64 @and_select_comm(i64 %a, i64 %b) {\n+; CHECK-LABEL: @and_select_comm(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[AND:%.*]] = and i64 [[B_FR]], [[A:%.*]]\n+; CHECK-NEXT:    ret i64 [[AND]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %and = and i64 %b, %a\n+  %select = select i1 %cond, i64 0, i64 %and\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, ne), (ashr x, y), 0) -> (ashr x, y)\n+define i64 @ashr_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @ashr_select(\n+; CHECK-NEXT:    [[COND_NOT:%.*]] = icmp eq i64 [[A:%.*]], 0\n+; CHECK-NEXT:    [[ASHR:%.*]] = ashr i64 [[A]], [[B_FR:%.*]]\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND_NOT]], i64 0, i64 [[ASHR]]\n+; CHECK-NEXT:    ret i64 [[SELECT]]\n+;\n+  %cond = icmp ne i64 0, %a\n+  %ashr = ashr i64 %a, %b\n+  %select = select i1 %cond, i64 %ashr, i64 0\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, ne), (lshr x, y), 0) -> (lshr x, y)\n+define i64 @lshr_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @lshr_select(\n+; CHECK-NEXT:    [[COND_NOT:%.*]] = icmp eq i64 [[A:%.*]], 0\n+; CHECK-NEXT:    [[LSHR:%.*]] = lshr i64 [[A]], [[B_FR:%.*]]\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND_NOT]], i64 0, i64 [[LSHR]]\n+; CHECK-NEXT:    ret i64 [[SELECT]]\n+;\n+  %cond = icmp ne i64 0, %a\n+  %lshr = lshr i64 %a, %b\n+  %select = select i1 %cond, i64 %lshr, i64 0\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, fshr(x, x, y)) -> fshr(x, x, y)\n+define i64 @fshr_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @fshr_select(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[FSHR:%.*]] = call i64 @llvm.fshr.i64(i64 [[A:%.*]], i64 [[A]], i64 [[B_FR]])\n+; CHECK-NEXT:    ret i64 [[FSHR]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %a, i64 %b)\n+  %select = select i1 %cond, i64 0, i64 %fshr\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (fshl x, x, y)) -> (fshl x, x, y)\n+define i64 @fshl_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @fshl_select(\n+; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n+; CHECK-NEXT:    [[FSHL:%.*]] = call i64 @llvm.fshl.i64(i64 [[A:%.*]], i64 [[A]], i64 [[B_FR]])\n+; CHECK-NEXT:    ret i64 [[FSHL]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %fshl = call i64 @llvm.fshl.i64(i64 %a, i64 %a, i64 %b)\n+  %select = select i1 %cond, i64 0, i64 %fshl\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (fshr x, z, y)) -> leave as is\n+define i64 @fshr_select_no_combine(i64 %a, i64 %b, i64 %c) {\n+; CHECK-LABEL: @fshr_select_no_combine(\n+; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n+; CHECK-NEXT:    [[FSHR:%.*]] = call i64 @llvm.fshr.i64(i64 [[A]], i64 [[B:%.*]], i64 [[C:%.*]])\n+; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[FSHR]]\n+; CHECK-NEXT:    ret i64 [[SELECT]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %b, i64 %c)\n+  %select = select i1 %cond, i64 0, i64 %fshr\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (sdiv x, y)) -> (sdiv x, y)\n+define i64 @sdiv_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @sdiv_select(\n+; CHECK-NEXT:    [[DIV:%.*]] = sdiv i64 [[A:%.*]], [[B_FR:%.*]]\n+; CHECK-NEXT:    ret i64 [[DIV]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %div = sdiv i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %div\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (udiv x, y)) -> (udiv x, y)\n+define i64 @udiv_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @udiv_select(\n+; CHECK-NEXT:    [[DIV:%.*]] = udiv i64 [[A:%.*]], [[B_FR:%.*]]\n+; CHECK-NEXT:    ret i64 [[DIV]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %div = udiv i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %div\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (srem x, y)) -> (srem x, y)\n+define i64 @srem_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @srem_select(\n+; CHECK-NEXT:    [[REM:%.*]] = srem i64 [[A:%.*]], [[B:%.*]]\n+; CHECK-NEXT:    ret i64 [[REM]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %rem = srem i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %rem\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (urem x, y)) -> (urem x, y)\n+define i64 @urem_select(i64 %a, i64 %b) {\n+; CHECK-LABEL: @urem_select(\n+; CHECK-NEXT:    [[REM:%.*]] = urem i64 [[A:%.*]], [[B:%.*]]\n+; CHECK-NEXT:    ret i64 [[REM]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %rem = urem i64 %a, %b\n+  %select = select i1 %cond, i64 0, i64 %rem\n+  ret i64 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (icmp x, 0, slt)) -> (icmp x, 0, slt)\n+define i1 @icmp_slt_select(i64 %a) {\n+; CHECK-LABEL: @icmp_slt_select(\n+; CHECK-NEXT:    [[ICMP:%.*]] = icmp slt i64 [[A:%.*]], 0\n+; CHECK-NEXT:    ret i1 [[ICMP]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %icmp = icmp slt i64 %a, 0\n+  %select = select i1 %cond, i1 0, i1 %icmp\n+  ret i1 %select\n+}\n+\n+; (select (icmp x, 0, eq), 0, (sub 0, x)) -> (sub 0, x)\n+define i64 @sub_select(i64 %a) {\n+; CHECK-LABEL: @sub_select(\n+; CHECK-NEXT:    [[SUB:%.*]] = sub i64 0, [[A:%.*]]\n+; CHECK-NEXT:    ret i64 [[SUB]]\n+;\n+  %cond = icmp eq i64 %a, 0\n+  %sub = sub i64 0, %a\n+  %select = select i1 %cond, i64 0, i64 %sub\n+  ret i64 %select\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/select.ll b/llvm/test/Transforms/InstCombine/select.ll\nindex ef5874ffd46ad..1f9ee83536016 100644\n--- a/llvm/test/Transforms/InstCombine/select.ll\n+++ b/llvm/test/Transforms/InstCombine/select.ll\n@@ -893,10 +893,9 @@ define i32 @test56(i16 %x) {\n \n define i32 @test57(i32 %x, i32 %y) {\n ; CHECK-LABEL: @test57(\n-; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], [[Y:%.*]]\n-; CHECK-NEXT:    [[TOBOOL:%.*]] = icmp eq i32 [[X]], 0\n-; CHECK-NEXT:    [[DOTAND:%.*]] = select i1 [[TOBOOL]], i32 0, i32 [[AND]]\n-; CHECK-NEXT:    ret i32 [[DOTAND]]\n+; CHECK-NEXT:    [[Y:%.*]] = freeze i32 [[Y1:%.*]]\n+; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], [[Y]]\n+; CHECK-NEXT:    ret i32 [[AND]]\n ;\n   %and = and i32 %x, %y\n   %tobool = icmp eq i32 %x, 0\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/icmp-select.ll",
+    "llvm/test/Transforms/InstCombine/select-fixed-zero.ll",
+    "llvm/test/Transforms/InstCombine/select.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-select.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_select_implied_cond_relational_off_by_one",
+          "test_body": "declare void @use.i1(i1)\n\ndefine i1 @icmp_select_implied_cond_relational_off_by_one(i8 %x, i8 %y) {\n; CHECK-LABEL: @icmp_select_implied_cond_relational_off_by_one(\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i8 [[X:%.*]], 10\n; CHECK-NEXT:    call void @use.i1(i1 [[CMP1]])\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP1]], i8 11, i8 [[Y:%.*]]\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp ult i8 [[SEL]], [[X]]\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ugt i8 %x, 10\n  call void @use.i1(i1 %cmp1)\n  %sel = select i1 %cmp1, i8 11, i8 %y\n  %cmp2 = icmp ult i8 %sel, %x\n  ret i1 %cmp2\n}",
+          "source_program": "declare void @use.i1(i1)\n\ndefine i1 @icmp_select_implied_cond_relational_off_by_one(i8 %x, i8 %y) {\n  %cmp1 = icmp ugt i8 %x, 10\n  call void @use.i1(i1 %cmp1)\n  %sel = select i1 %cmp1, i8 11, i8 %y\n  %cmp2 = icmp ult i8 %sel, %x\n  ret i1 %cmp2\n}\n"
+        },
+        {
+          "test_name": "umin_seq_comparison",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @umin_seq_comparison(i8 %x, i8 %y) {\n; CHECK-LABEL: @umin_seq_comparison(\n; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i8 [[X:%.*]], 0\n; CHECK-NEXT:    [[CMP21:%.*]] = icmp ule i8 [[X]], [[Y:%.*]]\n; CHECK-NEXT:    [[CMP2:%.*]] = select i1 [[CMP1]], i1 true, i1 [[CMP21]]\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %min = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %cmp1 = icmp eq i8 %x, 0\n  %sel = select i1 %cmp1, i8 0, i8 %min\n  %cmp2 = icmp eq i8 %sel, %x\n  ret i1 %cmp2\n}",
+          "source_program": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @umin_seq_comparison(i8 %x, i8 %y) {\n  %min = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %cmp1 = icmp eq i8 %x, 0\n  %sel = select i1 %cmp1, i8 0, i8 %min\n  %cmp2 = icmp eq i8 %sel, %x\n  ret i1 %cmp2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-fixed-zero.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "and_select",
+          "test_body": "define i64 @and_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @and_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[AND:%.*]] = and i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[AND]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %and = and i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %and\n  ret i64 %select\n}",
+          "source_program": "define i64 @and_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %and = and i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %and\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "ashr_select",
+          "test_body": "define i64 @ashr_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @ashr_select(\n; CHECK-NEXT:    [[COND_NOT:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[ASHR:%.*]] = ashr i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND_NOT]], i64 0, i64 [[ASHR]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp ne i64 0, %a\n  %ashr = ashr i64 %a, %b\n  %select = select i1 %cond, i64 %ashr, i64 0\n  ret i64 %select\n}",
+          "source_program": "define i64 @ashr_select(i64 %a, i64 %b) {\n  %cond = icmp ne i64 0, %a\n  %ashr = ashr i64 %a, %b\n  %select = select i1 %cond, i64 %ashr, i64 0\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "fshl_select",
+          "test_body": "define i64 @fshl_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @fshl_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[FSHL:%.*]] = call i64 @llvm.fshl.i64(i64 [[A]], i64 [[A]], i64 [[B_FR:%.*]])\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[FSHL]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %fshl = call i64 @llvm.fshl.i64(i64 %a, i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %fshl\n  ret i64 %select\n}",
+          "source_program": "define i64 @fshl_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %fshl = call i64 @llvm.fshl.i64(i64 %a, i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %fshl\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "fshr_select",
+          "test_body": "define i64 @fshr_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @fshr_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[FSHR:%.*]] = call i64 @llvm.fshr.i64(i64 [[A]], i64 [[A]], i64 [[B_FR:%.*]])\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[FSHR]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %fshr\n  ret i64 %select\n}",
+          "source_program": "define i64 @fshr_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %fshr\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "fshr_select_no_combine",
+          "test_body": "define i64 @fshr_select_no_combine(i64 %a, i64 %b, i64 %c) {\n; CHECK-LABEL: @fshr_select_no_combine(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[FSHR:%.*]] = call i64 @llvm.fshr.i64(i64 [[A]], i64 [[B:%.*]], i64 [[C:%.*]])\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[FSHR]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %b, i64 %c)\n  %select = select i1 %cond, i64 0, i64 %fshr\n  ret i64 %select\n}",
+          "source_program": "define i64 @fshr_select_no_combine(i64 %a, i64 %b, i64 %c) {\n  %cond = icmp eq i64 %a, 0\n  %fshr = call i64 @llvm.fshr.i64(i64 %a, i64 %b, i64 %c)\n  %select = select i1 %cond, i64 0, i64 %fshr\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_select",
+          "test_body": "define i1 @icmp_slt_select(i64 %a) {\n; CHECK-LABEL: @icmp_slt_select(\n; CHECK-NEXT:    [[ICMP:%.*]] = icmp slt i64 [[A:%.*]], 0\n; CHECK-NEXT:    ret i1 [[ICMP]]\n  %cond = icmp eq i64 %a, 0\n  %icmp = icmp slt i64 %a, 0\n  %select = select i1 %cond, i1 false, i1 %icmp\n  ret i1 %select\n}",
+          "source_program": "define i1 @icmp_slt_select(i64 %a) {\n  %cond = icmp eq i64 %a, 0\n  %icmp = icmp slt i64 %a, 0\n  %select = select i1 %cond, i1 false, i1 %icmp\n  ret i1 %select\n}\n"
+        },
+        {
+          "test_name": "lshr_select",
+          "test_body": "define i64 @lshr_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @lshr_select(\n; CHECK-NEXT:    [[COND_NOT:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[LSHR:%.*]] = lshr i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND_NOT]], i64 0, i64 [[LSHR]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp ne i64 0, %a\n  %lshr = lshr i64 %a, %b\n  %select = select i1 %cond, i64 %lshr, i64 0\n  ret i64 %select\n}",
+          "source_program": "define i64 @lshr_select(i64 %a, i64 %b) {\n  %cond = icmp ne i64 0, %a\n  %lshr = lshr i64 %a, %b\n  %select = select i1 %cond, i64 %lshr, i64 0\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "mul_select",
+          "test_body": "define i64 @mul_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @mul_select(\n; CHECK-NEXT:    [[B_FR:%.*]] = freeze i64 [[B:%.*]]\n; CHECK-NEXT:    [[MUL:%.*]] = mul i64 [[A:%.*]], [[B_FR]]\n; CHECK-NEXT:    ret i64 [[MUL]]\n  %cond = icmp eq i64 %a, 0\n  %mul = mul i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %mul\n  ret i64 %select\n}",
+          "source_program": "define i64 @mul_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %mul = mul i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %mul\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "sdiv_select",
+          "test_body": "define i64 @sdiv_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @sdiv_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[DIV:%.*]] = sdiv i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[DIV]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %div = sdiv i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %div\n  ret i64 %select\n}",
+          "source_program": "define i64 @sdiv_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %div = sdiv i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %div\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "shl_select",
+          "test_body": "define i64 @shl_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @shl_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[SHL:%.*]] = shl i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[SHL]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %shl = shl i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %shl\n  ret i64 %select\n}",
+          "source_program": "define i64 @shl_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %shl = shl i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %shl\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "srem_select",
+          "test_body": "define i64 @srem_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @srem_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[REM:%.*]] = srem i64 [[A]], [[B:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[REM]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %rem = srem i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %rem\n  ret i64 %select\n}",
+          "source_program": "define i64 @srem_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %rem = srem i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %rem\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "sub_select",
+          "test_body": "define i64 @sub_select(i64 %a) {\n; CHECK-LABEL: @sub_select(\n; CHECK-NEXT:    [[SUB:%.*]] = sub i64 0, [[A:%.*]]\n; CHECK-NEXT:    ret i64 [[SUB]]\n  %cond = icmp eq i64 %a, 0\n  %sub = sub i64 0, %a\n  %select = select i1 %cond, i64 0, i64 %sub\n  ret i64 %select\n}",
+          "source_program": "define i64 @sub_select(i64 %a) {\n  %cond = icmp eq i64 %a, 0\n  %sub = sub i64 0, %a\n  %select = select i1 %cond, i64 0, i64 %sub\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "udiv_select",
+          "test_body": "define i64 @udiv_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @udiv_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i64 [[A]], [[B_FR:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[DIV]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %div = udiv i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %div\n  ret i64 %select\n}",
+          "source_program": "define i64 @udiv_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %div = udiv i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %div\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "umin_select",
+          "test_body": "define i64 @umin_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @umin_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[UMIN:%.*]] = call i64 @llvm.umin.i64(i64 [[A]], i64 [[B_FR:%.*]])\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[UMIN]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %umin = call i64 @llvm.umin.i64(i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %umin\n  ret i64 %select\n}",
+          "source_program": "define i64 @umin_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %umin = call i64 @llvm.umin.i64(i64 %a, i64 %b)\n  %select = select i1 %cond, i64 0, i64 %umin\n  ret i64 %select\n}\n"
+        },
+        {
+          "test_name": "urem_select",
+          "test_body": "define i64 @urem_select(i64 %a, i64 %b) {\n; CHECK-LABEL: @urem_select(\n; CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[A:%.*]], 0\n; CHECK-NEXT:    [[REM:%.*]] = urem i64 [[A]], [[B:%.*]]\n; CHECK-NEXT:    [[SELECT:%.*]] = select i1 [[COND]], i64 0, i64 [[REM]]\n; CHECK-NEXT:    ret i64 [[SELECT]]\n  %cond = icmp eq i64 %a, 0\n  %rem = urem i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %rem\n  ret i64 %select\n}",
+          "source_program": "define i64 @urem_select(i64 %a, i64 %b) {\n  %cond = icmp eq i64 %a, 0\n  %rem = urem i64 %a, %b\n  %select = select i1 %cond, i64 0, i64 %rem\n  ret i64 %select\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test56",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @test56(i16 %x) {\n; CHECK-LABEL: @test56(\n; CHECK-NEXT:    [[CONV:%.*]] = zext i16 [[X:%.*]] to i32\n; CHECK-NEXT:    ret i32 [[CONV]]\n  %tobool = icmp eq i16 %x, 0\n  %conv = zext i16 %x to i32\n  %cond = select i1 %tobool, i32 0, i32 %conv\n  ret i32 %cond\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @test56(i16 %x) {\n  %tobool = icmp eq i16 %x, 0\n  %conv = zext i16 %x to i32\n  %cond = select i1 %tobool, i32 0, i32 %conv\n  ret i32 %cond\n}\n"
+        },
+        {
+          "test_name": "test57",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @test57(i32 %x, i32 %y) {\n; CHECK-LABEL: @test57(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[TOBOOL:%.*]] = icmp eq i32 [[X]], 0\n; CHECK-NEXT:    [[DOTAND:%.*]] = select i1 [[TOBOOL]], i32 0, i32 [[AND]]\n; CHECK-NEXT:    ret i32 [[DOTAND]]\n  %and = and i32 %x, %y\n  %tobool = icmp eq i32 %x, 0\n  %.and = select i1 %tobool, i32 0, i32 %and\n  ret i32 %.and\n}",
+          "source_program": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @test57(i32 %x, i32 %y) {\n  %and = and i32 %x, %y\n  %tobool = icmp eq i32 %x, 0\n  %.and = select i1 %tobool, i32 0, i32 %and\n  ret i32 %.and\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

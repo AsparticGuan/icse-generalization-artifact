@@ -20,6 +20,21 @@ OUTPUT_RESULTS_DIR = os.environ.get(
     os.path.join(os.path.dirname(__file__), "..", "results", "generalize"),
 )
 
+OVERALL_SUMMARY_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "results", "generalize-summaries", "overall_summary.md"
+)
+
+
+def _load_overall_summary() -> str:
+    """Load overall summary content from file; return empty string if file missing."""
+    try:
+        with open(OVERALL_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+OVERALL_SUMMARY = _load_overall_summary()
+
 TOKEN = os.environ.get("LAB_LLM_TOKEN")
 BASE_URL = os.environ.get("LAB_LLM_URL")
 MODEL_NAME = os.environ.get("LAB_LLM_MODEL", "qwen/qwen3-235b-a22b-2507")
@@ -41,64 +56,43 @@ You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, 
 I found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.
 
 Your tasks:
+
 1) Understand the missed optimization from my single example.
-2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).
+2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.
 3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.
-4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).
-5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.
 
----
+## Reference: common missed elements and patterns
 
-## How to expand examples (optimization-oriented guidance)
-When generating more cases, expand along two main lines:
+When generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. 
 
-### (1) Semantically equivalent but structurally diverse IR variants
-Goal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.
-Systematically vary:
-- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).
-- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and "noise" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).
-- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.
-
-### (2) Boundary conditions & context perturbations
-Goal: validate "only under some constraints" and reveal why InstCombine might be conservative.
-Systematically vary:
-- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.
-- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.
-- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.
-
-Use these dimensions to generate grouped variants (e.g., "only bitwidth changes", then "only flags changes"), so each new case remains attributable and easy to debug.
-
----
+{overall_summary}
 
 ## Output format requirement (strict)
+
 Return **ONLY** JSON (a single JSON object). No Markdown, no extra text.
 
 ## What I will provide
+
 - The original LLVM IR snippet (minimal reproducer).
-- The target triple/datalayout if relevant.
-- What I expected InstCombine to do vs what it does today.
-- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).
+- The target triple/datalayout if relevant. 
 
 ## What you must output (in JSON)
+
 Include the following top-level keys (you may add more keys if useful):
-- "summary"
-- "before_after" (describe the rewrite)
-- "preconditions" (legality constraints, including poison/undef/flags)
+
 - "pattern" (generalized pattern description)
-- "testcases" (an array of testcase objects; include both positive and negative cases)
-- "implementation_notes" (InstCombine-oriented notes)
-- "regression_test_notes" (how to test with opt/FileCheck)
-- "clarifying_questions" (ask at most 3, only if truly needed)
+- "testcases" (an array of testcase objects; include only positive cases)
 
 Each testcase object must include at least:
+
 - "name"
 - "ir" (the input IR for this case)
 - "expected_optimized_ir" (what InstCombine should produce, at least the key simplified instructions; full function preferred)
-- "why" (one sentence)
 
 ---
 
 ## Here is my single example 
+
 {source_code}
 {expected_optmized_code}
 """.strip()
@@ -270,6 +264,7 @@ def process_issue(issue_id: str) -> None:
         return
 
     prompt = PROMPT_TEMPLATE.format(
+        overall_summary=OVERALL_SUMMARY,
         source_code=source_program,
         expected_optmized_code=expect_optimized_program,
     )

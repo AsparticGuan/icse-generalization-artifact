@@ -1,0 +1,349 @@
+{
+  "pr_number": 143958,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/143958",
+  "title": "[InstCombine] remove dead loads, such as memcpy from undef",
+  "commit_sha": "450eb079e97f1a20ab2547567d81c176fec06cfb",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          3277,
+          3288
+        ],
+        [
+          3291,
+          3297
+        ],
+        [
+          3306,
+          3315
+        ],
+        [
+          3329,
+          3335
+        ],
+        [
+          3339,
+          3352
+        ],
+        [
+          3365,
+          3375
+        ],
+        [
+          3383,
+          3394
+        ],
+        [
+          3396,
+          3402
+        ],
+        [
+          3424,
+          3433
+        ],
+        [
+          3444,
+          3449
+        ],
+        [
+          3466,
+          3472
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::visitAllocSite",
+        "isAllocSiteRemovable",
+        "isRemovableWrite"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex afd3359e22ff3..bcc73090277aa 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -3277,12 +3277,13 @@ static bool isRemovableWrite(CallBase &CB, Value *UsedV,\n   return Dest && Dest->Ptr == UsedV;\n }\n \n-static bool isAllocSiteRemovable(Instruction *AI,\n-                                 SmallVectorImpl<WeakTrackingVH> &Users,\n-                                 const TargetLibraryInfo &TLI) {\n+static std::optional<ModRefInfo>\n+isAllocSiteRemovable(Instruction *AI, SmallVectorImpl<WeakTrackingVH> &Users,\n+                     const TargetLibraryInfo &TLI, bool KnowInit) {\n   SmallVector<Instruction*, 4> Worklist;\n   const std::optional<StringRef> Family = getAllocationFamily(AI, &TLI);\n   Worklist.push_back(AI);\n+  ModRefInfo Access = KnowInit ? ModRefInfo::NoModRef : ModRefInfo::Mod;\n \n   do {\n     Instruction *PI = Worklist.pop_back_val();\n@@ -3291,7 +3292,7 @@ static bool isAllocSiteRemovable(Instruction *AI,\n       switch (I->getOpcode()) {\n       default:\n         // Give up the moment we see something we can't handle.\n-        return false;\n+        return std::nullopt;\n \n       case Instruction::AddrSpaceCast:\n       case Instruction::BitCast:\n@@ -3306,10 +3307,10 @@ static bool isAllocSiteRemovable(Instruction *AI,\n         // We also fold comparisons in some conditions provided the alloc has\n         // not escaped (see isNeverEqualToUnescapedAlloc).\n         if (!ICI->isEquality())\n-          return false;\n+          return std::nullopt;\n         unsigned OtherIndex = (ICI->getOperand(0) == PI) ? 1 : 0;\n         if (!isNeverEqualToUnescapedAlloc(ICI->getOperand(OtherIndex), TLI, AI))\n-          return false;\n+          return std::nullopt;\n \n         // Do not fold compares to aligned_alloc calls, as they may have to\n         // return null in case the required alignment cannot be satisfied,\n@@ -3329,7 +3330,7 @@ static bool isAllocSiteRemovable(Instruction *AI,\n         if (CB && TLI.getLibFunc(*CB->getCalledFunction(), TheLibFunc) &&\n             TLI.has(TheLibFunc) && TheLibFunc == LibFunc_aligned_alloc &&\n             !AlignmentAndSizeKnownValid(CB))\n-          return false;\n+          return std::nullopt;\n         Users.emplace_back(I);\n         continue;\n       }\n@@ -3339,14 +3340,21 @@ static bool isAllocSiteRemovable(Instruction *AI,\n         if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {\n           switch (II->getIntrinsicID()) {\n           default:\n-            return false;\n+            return std::nullopt;\n \n           case Intrinsic::memmove:\n           case Intrinsic::memcpy:\n           case Intrinsic::memset: {\n             MemIntrinsic *MI = cast<MemIntrinsic>(II);\n-            if (MI->isVolatile() || MI->getRawDest() != PI)\n-              return false;\n+            if (MI->isVolatile())\n+              return std::nullopt;\n+            // Note: this could also be ModRef, but we can still interpret that\n+            // as just Mod in that case.\n+            ModRefInfo NewAccess =\n+                MI->getRawDest() == PI ? ModRefInfo::Mod : ModRefInfo::Ref;\n+            if ((Access & ~NewAccess) != ModRefInfo::NoModRef)\n+              return std::nullopt;\n+            Access |= NewAccess;\n             [[fallthrough]];\n           }\n           case Intrinsic::assume:\n@@ -3365,11 +3373,6 @@ static bool isAllocSiteRemovable(Instruction *AI,\n           }\n         }\n \n-        if (isRemovableWrite(*cast<CallBase>(I), PI, TLI)) {\n-          Users.emplace_back(I);\n-          continue;\n-        }\n-\n         if (Family && getFreedOperand(cast<CallBase>(I), &TLI) == PI &&\n             getAllocationFamily(I, &TLI) == Family) {\n           Users.emplace_back(I);\n@@ -3383,12 +3386,33 @@ static bool isAllocSiteRemovable(Instruction *AI,\n           continue;\n         }\n \n-        return false;\n+        if (!isRefSet(Access) &&\n+            isRemovableWrite(*cast<CallBase>(I), PI, TLI)) {\n+          Access |= ModRefInfo::Mod;\n+          Users.emplace_back(I);\n+          continue;\n+        }\n+\n+        return std::nullopt;\n \n       case Instruction::Store: {\n         StoreInst *SI = cast<StoreInst>(I);\n         if (SI->isVolatile() || SI->getPointerOperand() != PI)\n-          return false;\n+          return std::nullopt;\n+        if (isRefSet(Access))\n+          return std::nullopt;\n+        Access |= ModRefInfo::Mod;\n+        Users.emplace_back(I);\n+        continue;\n+      }\n+\n+      case Instruction::Load: {\n+        LoadInst *LI = cast<LoadInst>(I);\n+        if (LI->isVolatile() || LI->getPointerOperand() != PI)\n+          return std::nullopt;\n+        if (isModSet(Access))\n+          return std::nullopt;\n+        Access |= ModRefInfo::Ref;\n         Users.emplace_back(I);\n         continue;\n       }\n@@ -3396,7 +3420,9 @@ static bool isAllocSiteRemovable(Instruction *AI,\n       llvm_unreachable(\"missing a return?\");\n     }\n   } while (!Worklist.empty());\n-  return true;\n+\n+  assert(Access != ModRefInfo::ModRef);\n+  return Access;\n }\n \n Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {\n@@ -3424,10 +3450,31 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {\n     DIB.reset(new DIBuilder(*MI.getModule(), /*AllowUnresolved=*/false));\n   }\n \n-  if (isAllocSiteRemovable(&MI, Users, TLI)) {\n+  // Determine what getInitialValueOfAllocation would return without actually\n+  // allocating the result.\n+  bool KnowInitUndef = false;\n+  bool KnowInitZero = false;\n+  Constant *Init =\n+      getInitialValueOfAllocation(&MI, &TLI, Type::getInt8Ty(MI.getContext()));\n+  if (Init) {\n+    if (isa<UndefValue>(Init))\n+      KnowInitUndef = true;\n+    else if (Init->isNullValue())\n+      KnowInitZero = true;\n+  }\n+  // The various sanitizers don't actually return undef memory, but rather\n+  // memory initialized with special forms of runtime poison\n+  auto &F = *MI.getFunction();\n+  if (F.hasFnAttribute(Attribute::SanitizeMemory) ||\n+      F.hasFnAttribute(Attribute::SanitizeAddress))\n+    KnowInitUndef = false;\n+\n+  auto Removable =\n+      isAllocSiteRemovable(&MI, Users, TLI, KnowInitZero | KnowInitUndef);\n+  if (Removable) {\n     for (unsigned i = 0, e = Users.size(); i != e; ++i) {\n-      // Lowering all @llvm.objectsize calls first because they may\n-      // use a bitcast/GEP of the alloca we are removing.\n+      // Lowering all @llvm.objectsize and MTI calls first because they may use\n+      // a bitcast/GEP of the alloca we are removing.\n       if (!Users[i])\n        continue;\n \n@@ -3444,6 +3491,17 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {\n           eraseInstFromFunction(*I);\n           Users[i] = nullptr; // Skip examining in the next loop.\n         }\n+        if (auto *MTI = dyn_cast<MemTransferInst>(I)) {\n+          if (KnowInitZero && isRefSet(*Removable)) {\n+            IRBuilderBase::InsertPointGuard Guard(Builder);\n+            Builder.SetInsertPoint(MTI);\n+            auto *M = Builder.CreateMemSet(\n+                MTI->getRawDest(),\n+                ConstantInt::get(Type::getInt8Ty(MI.getContext()), 0),\n+                MTI->getLength(), MTI->getDestAlign());\n+            M->copyMetadata(*MTI);\n+          }\n+        }\n       }\n     }\n     for (unsigned i = 0, e = Users.size(); i != e; ++i) {\n@@ -3466,7 +3524,14 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {\n       } else {\n         // Casts, GEP, or anything else: we're about to delete this instruction,\n         // so it can not have any valid uses.\n-        replaceInstUsesWith(*I, PoisonValue::get(I->getType()));\n+        Constant *Replace;\n+        if (isa<LoadInst>(I)) {\n+          assert(KnowInitZero || KnowInitUndef);\n+          Replace = KnowInitUndef ? UndefValue::get(I->getType())\n+                                  : Constant::getNullValue(I->getType());\n+        } else\n+          Replace = PoisonValue::get(I->getType());\n+        replaceInstUsesWith(*I, Replace);\n       }\n       eraseInstFromFunction(*I);\n     }\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/and-or-icmps.ll b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\nindex 8824ae48417b0..42e5020748129 100644\n--- a/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n+++ b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n@@ -364,23 +364,77 @@ define <2 x i1> @and_ne_with_diff_one_splatvec(<2 x i32> %x) {\n \n define void @simplify_before_foldAndOfICmps(ptr %p) {\n ; CHECK-LABEL: @simplify_before_foldAndOfICmps(\n-; CHECK-NEXT:    [[A8:%.*]] = alloca i16, align 2\n-; CHECK-NEXT:    [[L7:%.*]] = load i16, ptr [[A8]], align 2\n+; CHECK-NEXT:    store i1 true, ptr [[P:%.*]], align 1\n+; CHECK-NEXT:    store ptr null, ptr [[P]], align 8\n+; CHECK-NEXT:    ret void\n+;\n+  %A8 = alloca i16\n+  %L7 = load i16, ptr %A8\n+  %G21 = getelementptr i16, ptr %A8, i8 -1\n+  %B11 = udiv i16 %L7, -1\n+  %G4 = getelementptr i16, ptr %A8, i16 %B11\n+  %L2 = load i16, ptr %G4\n+  %L = load i16, ptr %G4\n+  %B23 = mul i16 %B11, %B11\n+  %L4 = load i16, ptr %A8\n+  %B21 = sdiv i16 %L7, %L4\n+  %B7 = sub i16 0, %B21\n+  %B18 = mul i16 %B23, %B7\n+  %C10 = icmp ugt i16 %L, %B11\n+  %B20 = and i16 %L7, %L2\n+  %B1 = mul i1 %C10, true\n+  %C5 = icmp sle i16 %B21, %L\n+  %C11 = icmp ule i16 %B21, %L\n+  %C7 = icmp slt i16 %B20, 0\n+  %B29 = srem i16 %L4, %B18\n+  %B15 = add i1 %C7, %C10\n+  %B19 = add i1 %C11, %B15\n+  %C6 = icmp sge i1 %C11, %B19\n+  %B33 = or i16 %B29, %L4\n+  %C13 = icmp uge i1 %C5, %B1\n+  %C3 = icmp ult i1 %C13, %C6\n+  store i16 undef, ptr %G21\n+  %C18 = icmp ule i1 %C10, %C7\n+  %G26 = getelementptr i1, ptr null, i1 %C3\n+  store i16 %B33, ptr %p\n+  store i1 %C18, ptr %p\n+  store ptr %G26, ptr %p\n+  ret void\n+}\n+\n+define void @simplify_before_foldAndOfICmps2(ptr %p, ptr %A8) \"instcombine-no-verify-fixpoint\" {\n+; CHECK-LABEL: @simplify_before_foldAndOfICmps2(\n+; CHECK-NEXT:    [[L7:%.*]] = load i16, ptr [[A8:%.*]], align 2\n ; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i16 [[L7]], -1\n ; CHECK-NEXT:    [[B11:%.*]] = zext i1 [[TMP1]] to i16\n-; CHECK-NEXT:    [[C10:%.*]] = icmp ugt i16 [[L7]], [[B11]]\n-; CHECK-NEXT:    [[C7:%.*]] = icmp slt i16 [[L7]], 0\n-; CHECK-NEXT:    [[C3:%.*]] = and i1 [[C7]], [[C10]]\n-; CHECK-NEXT:    [[TMP2:%.*]] = xor i1 [[C10]], true\n-; CHECK-NEXT:    [[C18:%.*]] = or i1 [[C7]], [[TMP2]]\n-; CHECK-NEXT:    [[TMP3:%.*]] = sext i1 [[C3]] to i64\n+; CHECK-NEXT:    [[TMP2:%.*]] = zext i1 [[TMP1]] to i64\n+; CHECK-NEXT:    [[G4:%.*]] = getelementptr i16, ptr [[A8]], i64 [[TMP2]]\n+; CHECK-NEXT:    [[L2:%.*]] = load i16, ptr [[G4]], align 2\n+; CHECK-NEXT:    [[L4:%.*]] = load i16, ptr [[A8]], align 2\n+; CHECK-NEXT:    [[B21:%.*]] = sdiv i16 [[L7]], [[L4]]\n+; CHECK-NEXT:    [[TMP5:%.*]] = select i1 [[TMP1]], i16 [[B21]], i16 0\n+; CHECK-NEXT:    [[B18:%.*]] = sub i16 0, [[TMP5]]\n+; CHECK-NEXT:    [[C11:%.*]] = icmp ugt i16 [[L2]], [[B11]]\n+; CHECK-NEXT:    [[B20:%.*]] = and i16 [[L7]], [[L2]]\n+; CHECK-NEXT:    [[C5:%.*]] = icmp sgt i16 [[B21]], [[L2]]\n+; CHECK-NEXT:    [[C12:%.*]] = icmp ule i16 [[B21]], [[L2]]\n+; CHECK-NEXT:    [[C10:%.*]] = icmp slt i16 [[B20]], 0\n+; CHECK-NEXT:    [[B29:%.*]] = srem i16 [[L4]], [[B18]]\n+; CHECK-NEXT:    [[B15:%.*]] = xor i1 [[C10]], [[C11]]\n+; CHECK-NEXT:    [[TMP6:%.*]] = and i1 [[C12]], [[B15]]\n+; CHECK-NEXT:    [[C6:%.*]] = xor i1 [[TMP6]], true\n+; CHECK-NEXT:    [[B33:%.*]] = or i16 [[B29]], [[L4]]\n+; CHECK-NEXT:    [[C3:%.*]] = and i1 [[C5]], [[C6]]\n+; CHECK-NEXT:    [[C4:%.*]] = and i1 [[C3]], [[C11]]\n+; CHECK-NEXT:    [[TMP4:%.*]] = xor i1 [[C11]], true\n+; CHECK-NEXT:    [[C18:%.*]] = or i1 [[C10]], [[TMP4]]\n+; CHECK-NEXT:    [[TMP3:%.*]] = sext i1 [[C4]] to i64\n ; CHECK-NEXT:    [[G26:%.*]] = getelementptr i1, ptr null, i64 [[TMP3]]\n-; CHECK-NEXT:    store i16 [[L7]], ptr [[P:%.*]], align 2\n+; CHECK-NEXT:    store i16 [[B33]], ptr [[P:%.*]], align 2\n ; CHECK-NEXT:    store i1 [[C18]], ptr [[P]], align 1\n ; CHECK-NEXT:    store ptr [[G26]], ptr [[P]], align 8\n ; CHECK-NEXT:    ret void\n ;\n-  %A8 = alloca i16\n   %L7 = load i16, ptr %A8\n   %G21 = getelementptr i16, ptr %A8, i8 -1\n   %B11 = udiv i16 %L7, -1\ndiff --git a/llvm/test/Transforms/InstCombine/apint-shift.ll b/llvm/test/Transforms/InstCombine/apint-shift.ll\nindex 3cc530bdbd021..4dd0811bb7ecb 100644\n--- a/llvm/test/Transforms/InstCombine/apint-shift.ll\n+++ b/llvm/test/Transforms/InstCombine/apint-shift.ll\n@@ -562,11 +562,10 @@ define i40 @test26(i40 %A) {\n \n ; OSS-Fuzz #9880\n ; https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=9880\n-define i177 @ossfuzz_9880(i177 %X) {\n+define i177 @ossfuzz_9880(i177 %X, ptr %A) {\n ; CHECK-LABEL: @ossfuzz_9880(\n ; CHECK-NEXT:    ret i177 0\n ;\n-  %A = alloca i177\n   %L1 = load i177, ptr %A\n   %B = or i177 0, -1\n   %B5 = udiv i177 %L1, %B\ndiff --git a/llvm/test/Transforms/InstCombine/call-cast-target.ll b/llvm/test/Transforms/InstCombine/call-cast-target.ll\nindex 2cedc6c81d735..2f4b4ad2409e6 100644\n--- a/llvm/test/Transforms/InstCombine/call-cast-target.ll\n+++ b/llvm/test/Transforms/InstCombine/call-cast-target.ll\n@@ -110,19 +110,17 @@ entry:\n \n declare i1 @fn5(ptr byval({ i32, i32 }) align 4 %r)\n \n-define i1 @test5() {\n-; CHECK-LABEL: define i1 @test5() {\n-; CHECK-NEXT:    [[TMP1:%.*]] = alloca { i32, i32 }, align 4\n-; CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[TMP1]], align 4\n-; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds nuw i8, ptr [[TMP1]], i32 4\n+define i1 @test5(ptr %ptr) {\n+; CHECK-LABEL: define i1 @test5(ptr %ptr) {\n+; CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[PTR:%.*]], align 4\n+; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds nuw i8, ptr [[PTR]], i32 4\n ; CHECK-NEXT:    [[TMP4:%.*]] = load i32, ptr [[TMP3]], align 4\n ; CHECK-NEXT:    [[TMP5:%.*]] = call i1 @fn5(i32 [[TMP2]], i32 [[TMP4]])\n ; CHECK-NEXT:    ret i1 [[TMP5]]\n ;\n-  %1 = alloca { i32, i32 }, align 4\n-  %2 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 0\n+  %2 = getelementptr inbounds { i32, i32 }, ptr %ptr, i32 0, i32 0\n   %3 = load i32, ptr %2, align 4\n-  %4 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 1\n+  %4 = getelementptr inbounds { i32, i32 }, ptr %ptr, i32 0, i32 1\n   %5 = load i32, ptr %4, align 4\n   %6 = call i1 @fn5(i32 %3, i32 %5)\n   ret i1 %6\ndiff --git a/llvm/test/Transforms/InstCombine/dead-alloc-elim.ll b/llvm/test/Transforms/InstCombine/dead-alloc-elim.ll\nnew file mode 100644\nindex 0000000000000..b135f76f709f1\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/dead-alloc-elim.ll\n@@ -0,0 +1,140 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+declare noalias ptr @calloc(i32, i32) nounwind allockind(\"alloc,zeroed\") allocsize(0,1) \"alloc-family\"=\"malloc\"\n+declare void @free(ptr) allockind(\"free\") \"alloc-family\"=\"malloc\"\n+\n+; Test load from uninitialized alloca - should be removed and replaced with undef\n+define i32 @test_load_uninitialized_alloca() {\n+; CHECK-LABEL: @test_load_uninitialized_alloca(\n+; CHECK-NEXT:    ret i32 undef\n+;\n+  %a = alloca i32\n+  %v = load i32, ptr %a\n+  ret i32 %v\n+}\n+\n+; Test load from zero-initialized malloc - should be removed and replaced with zero\n+define i32 @test_load_zero_initialized_malloc() {\n+; CHECK-LABEL: @test_load_zero_initialized_malloc(\n+; CHECK-NEXT:    ret i32 0\n+;\n+  %a = call ptr @calloc(i32 1, i32 4)\n+  %v = load i32, ptr %a\n+  call void @free(ptr %a)\n+  ret i32 %v\n+}\n+\n+; Test memcpy from uninitialized source - should be removed\n+define void @test_memcpy_from_uninitialized_alloca(ptr %dest) {\n+; CHECK-LABEL: @test_memcpy_from_uninitialized_alloca(\n+; CHECK-NEXT:    ret void\n+;\n+  %src = alloca i32, align 1\n+  call void @llvm.memcpy.p0.p0.i32(ptr %src, ptr %src, i32 4, i1 false)\n+  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 4, i1 false)\n+  ret void\n+}\n+\n+; Test memcpy from zeroed source - should transform to memset with zero\n+define void @test_memcpy_from_uninitialized_calloc(ptr %dest) {\n+; CHECK-LABEL: @test_memcpy_from_uninitialized_calloc(\n+; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr noundef nonnull align 1 dereferenceable(16) [[DEST:%.*]], i8 0, i32 16, i1 false)\n+; CHECK-NEXT:    ret void\n+;\n+  %src = call ptr @calloc(i32 1, i32 16)\n+  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 16, i1 false)\n+  call void @free(ptr %src)\n+  ret void\n+}\n+\n+; Test mixed read/write pattern - should not be removable due to write before read\n+define i32 @test_write_then_read_alloca() {\n+; CHECK-LABEL: @test_write_then_read_alloca(\n+; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n+; CHECK-NEXT:    store i8 42, ptr [[A]], align 1\n+; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[A]], align 4\n+; CHECK-NEXT:    ret i32 [[V]]\n+;\n+  %a = alloca i32\n+  store i8 42, ptr %a\n+  %v = load i32, ptr %a\n+  ret i32 %v\n+}\n+\n+; Test read then write pattern - should not be removable due to conflicting access\n+define void @test_read_then_write_alloca() {\n+; CHECK-LABEL: @test_read_then_write_alloca(\n+; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n+; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[A]], align 4\n+; CHECK-NEXT:    [[V8:%.*]] = trunc i32 [[V]] to i8\n+; CHECK-NEXT:    store i8 [[V8]], ptr [[A]], align 1\n+; CHECK-NEXT:    ret void\n+;\n+  %a = alloca i32\n+  %v = load i32, ptr %a\n+  %v8 = trunc i32 %v to i8\n+  store i8 %v8, ptr %a\n+  ret void\n+}\n+\n+; Test load through GEP from uninitialized alloca\n+define i8 @test_load_gep_uninitialized_alloca() {\n+; CHECK-LABEL: @test_load_gep_uninitialized_alloca(\n+; CHECK-NEXT:    ret i8 undef\n+;\n+  %a = alloca [4 x i8]\n+  %gep = getelementptr [4 x i8], ptr %a, i32 0, i32 2\n+  %v = load i8, ptr %gep\n+  ret i8 %v\n+}\n+\n+; Test load through bitcast from uninitialized alloca\n+define i16 @test_load_bitcast_uninitialized_alloca() {\n+; CHECK-LABEL: @test_load_bitcast_uninitialized_alloca(\n+; CHECK-NEXT:    ret i16 undef\n+;\n+  %a = alloca i32\n+  %bc = bitcast ptr %a to ptr\n+  %v = load i16, ptr %bc\n+  ret i16 %v\n+}\n+\n+; Test memmove from zero-initialized malloc\n+define void @test_memmove_from_zero_initialized_malloc(ptr %dest) {\n+; CHECK-LABEL: @test_memmove_from_zero_initialized_malloc(\n+; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr noundef nonnull align 1 dereferenceable(32) [[DEST:%.*]], i8 0, i32 32, i1 false)\n+; CHECK-NEXT:    ret void\n+;\n+  %src = call ptr @calloc(i32 8, i32 4)\n+  call void @llvm.memmove.p0.p0.i32(ptr %dest, ptr %src, i32 32, i1 false)\n+  call void @free(ptr %src)\n+  ret void\n+}\n+\n+; Test multiple loads from same uninitialized alloca\n+define { i32, i32 } @test_multiple_loads_uninitialized_alloca() {\n+; CHECK-LABEL: @test_multiple_loads_uninitialized_alloca(\n+; CHECK-NEXT:    ret { i32, i32 } undef\n+;\n+  %a = alloca [2 x i32]\n+  %gep1 = getelementptr [2 x i32], ptr %a, i32 0, i32 0\n+  %gep2 = getelementptr [2 x i32], ptr %a, i32 0, i32 1\n+  %v1 = load i32, ptr %gep1\n+  %v2 = load i32, ptr %gep2\n+  %ret = insertvalue { i32, i32 } { i32 undef, i32 poison }, i32 %v1, 0\n+  %ret2 = insertvalue { i32, i32 } %ret, i32 %v2, 1\n+  ret { i32, i32 } %ret2\n+}\n+\n+; Test that volatile operations prevent removal\n+define i32 @test_volatile_load_prevents_removal() {\n+; CHECK-LABEL: @test_volatile_load_prevents_removal(\n+; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n+; CHECK-NEXT:    [[V:%.*]] = load volatile i32, ptr [[A]], align 4\n+; CHECK-NEXT:    ret i32 [[V]]\n+;\n+  %a = alloca i32\n+  %v = load volatile i32, ptr %a\n+  ret i32 %v\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll b/llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll\nindex 15eb3e15ea44a..af18a427ee372 100644\n--- a/llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll\n+++ b/llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll\n@@ -12,11 +12,11 @@ target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:1\n @\"\\01L_OBJC_METH_VAR_NAME_112\" = internal global [15 x i8] c\"whiteComponent\\00\", section \"__TEXT,__cstring,cstring_literals\"\n @\"\\01L_OBJC_SELECTOR_REFERENCES_81\" = internal global ptr @\"\\01L_OBJC_METH_VAR_NAME_112\", section \"__OBJC,__message_refs,literal_pointers,no_dead_strip\"\n \n-define void @bork() nounwind  {\n+define void @bork(ptr %color, ptr %color.466) nounwind  {\n ; CHECK-LABEL: @bork(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[COLOR:%.*]] = alloca ptr, align 8\n-; CHECK-NEXT:    [[TMP103:%.*]] = load ptr, ptr [[COLOR]], align 4\n+; CHECK-NEXT:    [[TMP103:%.*]] = load ptr, ptr [[COLOR:%.*]], align 4\n+; CHECK-NEXT:    store ptr [[TMP103]], ptr [[COLOR_466:%.*]], align 4\n ; CHECK-NEXT:    [[TMP105:%.*]] = load ptr, ptr @\"\\01L_OBJC_SELECTOR_REFERENCES_81\", align 4\n ; CHECK-NEXT:    [[TMP107:%.*]] = call float @objc_msgSend_fpret(ptr [[TMP103]], ptr [[TMP105]]) #[[ATTR0:[0-9]+]]\n ; CHECK-NEXT:    br label [[EXIT:%.*]]\n@@ -24,8 +24,6 @@ define void @bork() nounwind  {\n ; CHECK-NEXT:    ret void\n ;\n entry:\n-  %color = alloca ptr\n-  %color.466 = alloca ptr\n   %tmp103 = load ptr, ptr %color, align 4\n   store ptr %tmp103, ptr %color.466, align 4\n   %tmp105 = load ptr, ptr @\"\\01L_OBJC_SELECTOR_REFERENCES_81\", align 4\ndiff --git a/llvm/test/Transforms/InstCombine/getelementptr.ll b/llvm/test/Transforms/InstCombine/getelementptr.ll\nindex e78d70058c146..7568c6edc429c 100644\n--- a/llvm/test/Transforms/InstCombine/getelementptr.ll\n+++ b/llvm/test/Transforms/InstCombine/getelementptr.ll\n@@ -580,13 +580,11 @@ define i32 @test20_as1(ptr addrspace(1) %P, i32 %A, i32 %B) {\n }\n \n \n-define i32 @test21() {\n+define i32 @test21(ptr %pbob1) {\n ; CHECK-LABEL: @test21(\n-; CHECK-NEXT:    [[PBOB1:%.*]] = alloca [[INTSTRUCT:%.*]], align 8\n-; CHECK-NEXT:    [[RVAL:%.*]] = load i32, ptr [[PBOB1]], align 4\n+; CHECK-NEXT:    [[RVAL:%.*]] = load i32, ptr [[PBOB1:%.*]], align 4\n ; CHECK-NEXT:    ret i32 [[RVAL]]\n ;\n-  %pbob1 = alloca %intstruct\n   %pbob2 = getelementptr %intstruct, ptr %pbob1\n   %rval = load i32, ptr %pbob2\n   ret i32 %rval\n@@ -654,18 +652,16 @@ define i1 @test26(ptr %arr) {\n   %struct.siginfo_t = type { i32, i32, i32, { { i32, i32, [0 x i8], %struct.sigval_t, i32 }, [88 x i8] } }\n   %struct.sigval_t = type { ptr }\n \n-define i32 @test27(ptr %to, ptr %from) {\n+define i32 @test27(ptr %to, ptr %from, ptr %from_addr) {\n ; CHECK-LABEL: @test27(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[FROM_ADDR:%.*]] = alloca ptr, align 8\n-; CHECK-NEXT:    [[T344:%.*]] = load ptr, ptr [[FROM_ADDR]], align 8\n+; CHECK-NEXT:    [[T344:%.*]] = load ptr, ptr [[FROM_ADDR:%.*]], align 8\n ; CHECK-NEXT:    [[T348:%.*]] = getelementptr i8, ptr [[T344]], i64 24\n ; CHECK-NEXT:    [[T351:%.*]] = load i32, ptr [[T348]], align 8\n ; CHECK-NEXT:    [[T360:%.*]] = call i32 asm sideeffect \"...\", \"=r,ir,*m,i,0,~{dirflag},~{fpsr},~{flags}\"(i32 [[T351]], ptr elementtype([[STRUCT___LARGE_STRUCT:%.*]]) null, i32 -14, i32 0) #[[ATTR0:[0-9]+]]\n ; CHECK-NEXT:    unreachable\n ;\n entry:\n-  %from_addr = alloca ptr\n   %t344 = load ptr, ptr %from_addr, align 8\n   %t345 = getelementptr %struct.siginfo_t, ptr %t344, i32 0, i32 3\n   %t346 = getelementptr { { i32, i32, [0 x i8], %struct.sigval_t, i32 }, [88 x i8] }, ptr %t345, i32 0, i32 0\n@@ -1345,10 +1341,7 @@ declare noalias ptr @malloc(i64) nounwind allockind(\"alloc,uninitialized\") alloc\n define i32 @test_gep_bitcast_malloc(ptr %a) {\n ; CHECK-LABEL: @test_gep_bitcast_malloc(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[CALL:%.*]] = call noalias dereferenceable_or_null(16) ptr @malloc(i64 16)\n-; CHECK-NEXT:    [[G3:%.*]] = getelementptr i8, ptr [[CALL]], i64 12\n-; CHECK-NEXT:    [[A_C:%.*]] = load i32, ptr [[G3]], align 4\n-; CHECK-NEXT:    ret i32 [[A_C]]\n+; CHECK-NEXT:    ret i32 undef\n ;\n entry:\n   %call = call noalias ptr @malloc(i64 16) #2\ndiff --git a/llvm/test/Transforms/InstCombine/malloc-free.ll b/llvm/test/Transforms/InstCombine/malloc-free.ll\nindex 1f556821270a2..989074f97aaf6 100644\n--- a/llvm/test/Transforms/InstCombine/malloc-free.ll\n+++ b/llvm/test/Transforms/InstCombine/malloc-free.ll\n@@ -133,17 +133,13 @@ define void @test4() {\n \n define void @test5(ptr %ptr, ptr %esc) {\n ; CHECK-LABEL: @test5(\n-; CHECK-NEXT:    [[A:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n-; CHECK-NEXT:    [[B:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n ; CHECK-NEXT:    [[C:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n ; CHECK-NEXT:    [[D:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n ; CHECK-NEXT:    [[E:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n ; CHECK-NEXT:    [[F:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n ; CHECK-NEXT:    [[G:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n-; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i32(ptr noundef nonnull align 1 dereferenceable(32) [[PTR:%.*]], ptr noundef nonnull align 1 dereferenceable(32) [[A]], i32 32, i1 false)\n-; CHECK-NEXT:    call void @llvm.memmove.p0.p0.i32(ptr noundef nonnull align 1 dereferenceable(32) [[PTR]], ptr noundef nonnull align 1 dereferenceable(32) [[B]], i32 32, i1 false)\n ; CHECK-NEXT:    store ptr [[C]], ptr [[ESC:%.*]], align 4\n-; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i32(ptr [[D]], ptr [[PTR]], i32 32, i1 true)\n+; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i32(ptr [[D]], ptr [[PTR:%.*]], i32 32, i1 true)\n ; CHECK-NEXT:    call void @llvm.memmove.p0.p0.i32(ptr [[E]], ptr [[PTR]], i32 32, i1 true)\n ; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr [[F]], i8 5, i32 32, i1 true)\n ; CHECK-NEXT:    store volatile i8 4, ptr [[G]], align 1\ndiff --git a/llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll b/llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll\nindex 38fca0314ae11..5d3512e10f418 100644\n--- a/llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll\n+++ b/llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll\n@@ -1,20 +1,16 @@\n ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n ; RUN: opt < %s -passes=instcombine -S -data-layout=\"E-m:e-i1:8:16-i8:8:16-i64:64-f128:64-v128:64-a:8:16-n32:64\" | FileCheck %s\n \n-define void @PR35618(ptr %st1, ptr %st2) {\n+define void @PR35618(ptr %st1, ptr %st2, ptr %y1, ptr %z1) {\n ; CHECK-LABEL: @PR35618(\n-; CHECK-NEXT:    [[Y1:%.*]] = alloca double, align 8\n-; CHECK-NEXT:    [[Z1:%.*]] = alloca double, align 8\n-; CHECK-NEXT:    [[LD1:%.*]] = load double, ptr [[Y1]], align 8\n-; CHECK-NEXT:    [[LD2:%.*]] = load double, ptr [[Z1]], align 8\n+; CHECK-NEXT:    [[LD1:%.*]] = load double, ptr [[Y1:%.*]], align 8\n+; CHECK-NEXT:    [[LD2:%.*]] = load double, ptr [[Z1:%.*]], align 8\n ; CHECK-NEXT:    [[TMP:%.*]] = fcmp olt double [[LD1]], [[LD2]]\n ; CHECK-NEXT:    [[TMP12_V:%.*]] = select i1 [[TMP]], double [[LD1]], double [[LD2]]\n ; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST1:%.*]], align 8\n ; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST2:%.*]], align 8\n ; CHECK-NEXT:    ret void\n ;\n-  %y1 = alloca double\n-  %z1 = alloca double\n   %ld1 = load double, ptr %y1\n   %ld2 = load double, ptr %z1\n   %tmp = fcmp olt double %ld1, %ld2\n@@ -25,20 +21,16 @@ define void @PR35618(ptr %st1, ptr %st2) {\n   ret void\n }\n \n-define void @PR35618_asan(ptr %st1, ptr %st2) sanitize_address {\n+define void @PR35618_asan(ptr %st1, ptr %st2, ptr %y1, ptr %z1) sanitize_address {\n ; CHECK-LABEL: @PR35618_asan(\n-; CHECK-NEXT:    [[Y1:%.*]] = alloca double, align 8\n-; CHECK-NEXT:    [[Z1:%.*]] = alloca double, align 8\n-; CHECK-NEXT:    [[LD1:%.*]] = load double, ptr [[Y1]], align 8\n-; CHECK-NEXT:    [[LD2:%.*]] = load double, ptr [[Z1]], align 8\n+; CHECK-NEXT:    [[LD1:%.*]] = load double, ptr [[Y1:%.*]], align 8\n+; CHECK-NEXT:    [[LD2:%.*]] = load double, ptr [[Z1:%.*]], align 8\n ; CHECK-NEXT:    [[TMP:%.*]] = fcmp olt double [[LD1]], [[LD2]]\n ; CHECK-NEXT:    [[TMP12_V:%.*]] = select i1 [[TMP]], double [[LD1]], double [[LD2]]\n ; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST1:%.*]], align 8\n ; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST2:%.*]], align 8\n ; CHECK-NEXT:    ret void\n ;\n-  %y1 = alloca double\n-  %z1 = alloca double\n   %ld1 = load double, ptr %y1\n   %ld2 = load double, ptr %z1\n   %tmp = fcmp olt double %ld1, %ld2\ndiff --git a/llvm/test/Transforms/InstCombine/objsize.ll b/llvm/test/Transforms/InstCombine/objsize.ll\nindex 1c33412303c19..39f6f493782d2 100644\n--- a/llvm/test/Transforms/InstCombine/objsize.ll\n+++ b/llvm/test/Transforms/InstCombine/objsize.ll\n@@ -14,19 +14,17 @@ define i32 @foo() nounwind {\n   ret i32 %1\n }\n \n-define ptr @bar() nounwind {\n+define ptr @bar(ptr %retval) nounwind {\n ; CHECK-LABEL: @bar(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[RETVAL:%.*]] = alloca ptr, align 4\n ; CHECK-NEXT:    br i1 true, label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]\n ; CHECK:       cond.true:\n-; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[RETVAL]], align 4\n-; CHECK-NEXT:    ret ptr [[TMP0]]\n+; CHECK-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[RETVAL:%.*]], align 4\n+; CHECK-NEXT:    ret ptr [[TMP1]]\n ; CHECK:       cond.false:\n ; CHECK-NEXT:    ret ptr poison\n ;\n entry:\n-  %retval = alloca ptr\n   %0 = call i32 @llvm.objectsize.i32.p0(ptr @a, i1 false, i1 false, i1 false)\n   %cmp = icmp ne i32 %0, -1\n   br i1 %cmp, label %cond.true, label %cond.false\ndiff --git a/llvm/test/Transforms/InstCombine/select-load.ll b/llvm/test/Transforms/InstCombine/select-load.ll\nindex 36883423aea36..308dc25bf780c 100644\n--- a/llvm/test/Transforms/InstCombine/select-load.ll\n+++ b/llvm/test/Transforms/InstCombine/select-load.ll\n@@ -4,19 +4,14 @@\n target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n target triple = \"x86_64-grtev4-linux-gnu\"\n \n-define i32 @test_plain(i1 %f) {\n+define i32 @test_plain(i1 %f, ptr %a, ptr %b) {\n ; CHECK-LABEL: @test_plain(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 8\n-; CHECK-NEXT:    [[B:%.*]] = alloca i32, align 8\n-; CHECK-NEXT:    [[A_VAL:%.*]] = load i32, ptr [[A]], align 8\n+; CHECK-NEXT:    [[B:%.*]] = select i1 [[F:%.*]], ptr [[A:%.*]], ptr [[B1:%.*]]\n ; CHECK-NEXT:    [[B_VAL:%.*]] = load i32, ptr [[B]], align 8\n-; CHECK-NEXT:    [[L:%.*]] = select i1 [[F:%.*]], i32 [[A_VAL]], i32 [[B_VAL]]\n-; CHECK-NEXT:    ret i32 [[L]]\n+; CHECK-NEXT:    ret i32 [[B_VAL]]\n ;\n entry:\n-  %a = alloca i32, align 8\n-  %b = alloca i32, align 8\n   %sel = select i1 %f, ptr %a, ptr %b\n   %l = load i32, ptr %sel, align 8\n   ret i32 %l\n@@ -82,19 +77,14 @@ entry:\n \n ; Msan just propagates shadow, even if speculated load accesses uninitialized\n ; value, instrumentation will select shadow of the desired value anyway.\n-define i32 @test_msan(i1 %f) sanitize_memory {\n+define i32 @test_msan(i1 %f, ptr %a, ptr %b) sanitize_memory {\n ; CHECK-LABEL: @test_msan(\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 8\n-; CHECK-NEXT:    [[B:%.*]] = alloca i32, align 8\n-; CHECK-NEXT:    [[A_VAL:%.*]] = load i32, ptr [[A]], align 8\n+; CHECK-NEXT:    [[B:%.*]] = select i1 [[F:%.*]], ptr [[A:%.*]], ptr [[B1:%.*]]\n ; CHECK-NEXT:    [[B_VAL:%.*]] = load i32, ptr [[B]], align 8\n-; CHECK-NEXT:    [[L:%.*]] = select i1 [[F:%.*]], i32 [[A_VAL]], i32 [[B_VAL]]\n-; CHECK-NEXT:    ret i32 [[L]]\n+; CHECK-NEXT:    ret i32 [[B_VAL]]\n ;\n entry:\n-  %a = alloca i32, align 8\n-  %b = alloca i32, align 8\n   %sel = select i1 %f, ptr %a, ptr %b\n   %l = load i32, ptr %sel, align 8\n   ret i32 %l\ndiff --git a/llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll b/llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll\nindex b4c606f037d56..abae2c6b9ab8e 100644\n--- a/llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll\n+++ b/llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll\n@@ -156,11 +156,10 @@ define i32 @t11_shl_nsw_flag_preservation(i32 %x, i32 %y) {\n \n ; Reduced from https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=15587\n @X = external global i32\n-define i64 @constantexpr() {\n-; CHECK-LABEL: @constantexpr(\n+define i64 @constantexpr(ptr %A) {\n+; CHECK-LABEL: @constantexpr(ptr %A) {\n ; CHECK-NEXT:    ret i64 0\n ;\n-  %A = alloca i64\n   %L = load i64, ptr %A\n   %V = add i64 ptrtoint (ptr @X to i64), 0\n   %B2 = shl i64 %V, 0\ndiff --git a/llvm/test/Transforms/InstCombine/vscale_gep.ll b/llvm/test/Transforms/InstCombine/vscale_gep.ll\nindex 84019e613d233..5d39ad4e01afe 100644\n--- a/llvm/test/Transforms/InstCombine/vscale_gep.ll\n+++ b/llvm/test/Transforms/InstCombine/vscale_gep.ll\n@@ -41,31 +41,27 @@ define void @gep_bitcast(ptr %p) {\n \n ; These tests serve to verify code changes when underlying gep ptr is alloca.\n ; This test is to verify 'inbounds' is added when it's valid to accumulate constant offset.\n-define i32 @gep_alloca_inbounds_vscale_zero() {\n+define i32 @gep_alloca_inbounds_vscale_zero(ptr %a) {\n ; CHECK-LABEL: @gep_alloca_inbounds_vscale_zero(\n-; CHECK-NEXT:    [[A:%.*]] = alloca <vscale x 4 x i32>, align 16\n-; CHECK-NEXT:    [[TMP:%.*]] = getelementptr inbounds nuw i8, ptr [[A]], i64 8\n+; CHECK-NEXT:    [[TMP:%.*]] = getelementptr i8, ptr [[A:%.*]], i64 8\n ; CHECK-NEXT:    [[LOAD:%.*]] = load i32, ptr [[TMP]], align 4\n ; CHECK-NEXT:    ret i32 [[LOAD]]\n ;\n-  %a = alloca <vscale x 4 x i32>\n   %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 0, i32 2\n   %load = load i32, ptr %tmp\n   ret i32 %load\n }\n \n ; This test is to verify 'inbounds' is not added when a constant offset can not be determined at compile-time.\n-define i32 @gep_alloca_inbounds_vscale_nonzero() {\n+define i32 @gep_alloca_inbounds_vscale_nonzero(ptr %a) {\n ; CHECK-LABEL: @gep_alloca_inbounds_vscale_nonzero(\n-; CHECK-NEXT:    [[A:%.*]] = alloca <vscale x 4 x i32>, align 16\n ; CHECK-NEXT:    [[TMP1:%.*]] = call i64 @llvm.vscale.i64()\n ; CHECK-NEXT:    [[TMP2:%.*]] = shl nuw i64 [[TMP1]], 4\n-; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr i8, ptr [[A]], i64 [[TMP2]]\n+; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr i8, ptr [[A:%.*]], i64 [[TMP2]]\n ; CHECK-NEXT:    [[TMP:%.*]] = getelementptr i8, ptr [[TMP3]], i64 8\n ; CHECK-NEXT:    [[LOAD:%.*]] = load i32, ptr [[TMP]], align 4\n ; CHECK-NEXT:    ret i32 [[LOAD]]\n ;\n-  %a = alloca <vscale x 4 x i32>\n   %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 1, i32 2\n   %load = load i32, ptr %tmp\n   ret i32 %load\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+    "llvm/test/Transforms/InstCombine/apint-shift.ll",
+    "llvm/test/Transforms/InstCombine/call-cast-target.ll",
+    "llvm/test/Transforms/InstCombine/dead-alloc-elim.ll",
+    "llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll",
+    "llvm/test/Transforms/InstCombine/getelementptr.ll",
+    "llvm/test/Transforms/InstCombine/malloc-free.ll",
+    "llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll",
+    "llvm/test/Transforms/InstCombine/objsize.ll",
+    "llvm/test/Transforms/InstCombine/select-load.ll",
+    "llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll",
+    "llvm/test/Transforms/InstCombine/vscale_gep.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/apint-shift.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "ossfuzz_9880",
+          "test_body": "define i177 @ossfuzz_9880(i177 %X) {\n; CHECK-LABEL: @ossfuzz_9880(\n; CHECK-NEXT:    ret i177 0\n  %A = alloca i177, align 8\n  %L1 = load i177, ptr %A, align 4\n  %B = or i177 0, -1\n  %B5 = udiv i177 %L1, %B\n  %B4 = add i177 %B5, %B\n  %B2 = add i177 %B, %B4\n  %B6 = mul i177 %B5, %B2\n  %B20 = shl i177 %L1, %B6\n  %B14 = sub i177 %B20, %B5\n  %B1 = udiv i177 %B14, %B6\n  ret i177 %B1\n}",
+          "source_program": "define i177 @ossfuzz_9880(i177 %X) {\n  %A = alloca i177, align 8\n  %L1 = load i177, ptr %A, align 4\n  %B = or i177 0, -1\n  %B5 = udiv i177 %L1, %B\n  %B4 = add i177 %B5, %B\n  %B2 = add i177 %B, %B4\n  %B6 = mul i177 %B5, %B2\n  %B20 = shl i177 %L1, %B6\n  %B14 = sub i177 %B20, %B5\n  %B1 = udiv i177 %B14, %B6\n  ret i177 %B1\n}\n"
+        },
+        {
+          "test_name": "test26",
+          "test_body": "define i40 @test26(i40 %A) {\n; CHECK-LABEL: @test26(\n; CHECK-NEXT:    [[B:%.*]] = and i40 [[A:%.*]], -2\n; CHECK-NEXT:    ret i40 [[B]]\n  %B = lshr i40 %A, 1\n  %C = bitcast i40 %B to i40\n  %D = shl i40 %C, 1\n  ret i40 %D\n}",
+          "source_program": "define i40 @test26(i40 %A) {\n  %B = lshr i40 %A, 1\n  %C = bitcast i40 %B to i40\n  %D = shl i40 %C, 1\n  ret i40 %D\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/call-cast-target.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test5",
+          "test_body": "target datalayout = \"e-p:32:32\"\ntarget triple = \"i686-pc-linux-gnu\"\n\ndeclare i1 @fn5(ptr byval({ i32, i32 }) align 4)\n\ndefine i1 @test5() {\n; CHECK-LABEL: define i1 @test5() {\n; CHECK-NEXT:    [[TMP1:%.*]] = alloca { i32, i32 }, align 4\n; CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[TMP1]], align 4\n; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds nuw i8, ptr [[TMP1]], i32 4\n; CHECK-NEXT:    [[TMP4:%.*]] = load i32, ptr [[TMP3]], align 4\n; CHECK-NEXT:    [[TMP5:%.*]] = call i1 @fn5(i32 [[TMP2]], i32 [[TMP4]])\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %1 = alloca { i32, i32 }, align 4\n  %2 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 0\n  %3 = load i32, ptr %2, align 4\n  %4 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 1\n  %5 = load i32, ptr %4, align 4\n  %6 = call i1 @fn5(i32 %3, i32 %5)\n  ret i1 %6\n}",
+          "source_program": "target datalayout = \"e-p:32:32\"\ntarget triple = \"i686-pc-linux-gnu\"\n\ndeclare i1 @fn5(ptr byval({ i32, i32 }) align 4)\n\ndefine i1 @test5() {\n  %1 = alloca { i32, i32 }, align 4\n  %2 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 0\n  %3 = load i32, ptr %2, align 4\n  %4 = getelementptr inbounds { i32, i32 }, ptr %1, i32 0, i32 1\n  %5 = load i32, ptr %4, align 4\n  %6 = call i1 @fn5(i32 %3, i32 %5)\n  ret i1 %6\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/dead-alloc-elim.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_load_bitcast_uninitialized_alloca",
+          "test_body": "define i16 @test_load_bitcast_uninitialized_alloca() {\n; CHECK-LABEL: @test_load_bitcast_uninitialized_alloca(\n; CHECK-NEXT:    ret i16 undef\n  %a = alloca i32, align 4\n  %bc = bitcast ptr %a to ptr\n  %v = load i16, ptr %bc, align 2\n  ret i16 %v\n}",
+          "source_program": "define i16 @test_load_bitcast_uninitialized_alloca() {\n  %a = alloca i32, align 4\n  %bc = bitcast ptr %a to ptr\n  %v = load i16, ptr %bc, align 2\n  ret i16 %v\n}\n"
+        },
+        {
+          "test_name": "test_load_gep_uninitialized_alloca",
+          "test_body": "define i8 @test_load_gep_uninitialized_alloca() {\n; CHECK-LABEL: @test_load_gep_uninitialized_alloca(\n; CHECK-NEXT:    ret i8 undef\n  %a = alloca [4 x i8], align 1\n  %gep = getelementptr [4 x i8], ptr %a, i32 0, i32 2\n  %v = load i8, ptr %gep, align 1\n  ret i8 %v\n}",
+          "source_program": "define i8 @test_load_gep_uninitialized_alloca() {\n  %a = alloca [4 x i8], align 1\n  %gep = getelementptr [4 x i8], ptr %a, i32 0, i32 2\n  %v = load i8, ptr %gep, align 1\n  ret i8 %v\n}\n"
+        },
+        {
+          "test_name": "test_load_uninitialized_alloca",
+          "test_body": "define i32 @test_load_uninitialized_alloca() {\n; CHECK-LABEL: @test_load_uninitialized_alloca(\n; CHECK-NEXT:    ret i32 undef\n  %a = alloca i32, align 4\n  %v = load i32, ptr %a, align 4\n  ret i32 %v\n}",
+          "source_program": "define i32 @test_load_uninitialized_alloca() {\n  %a = alloca i32, align 4\n  %v = load i32, ptr %a, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "test_load_zero_initialized_malloc",
+          "test_body": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine i32 @test_load_zero_initialized_malloc() {\n; CHECK-LABEL: @test_load_zero_initialized_malloc(\n; CHECK-NEXT:    ret i32 0\n  %a = call ptr @calloc(i32 1, i32 4)\n  %v = load i32, ptr %a, align 4\n  call void @free(ptr %a)\n  ret i32 %v\n}",
+          "source_program": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine i32 @test_load_zero_initialized_malloc() {\n  %a = call ptr @calloc(i32 1, i32 4)\n  %v = load i32, ptr %a, align 4\n  call void @free(ptr %a)\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "test_memcpy_from_uninitialized_alloca",
+          "test_body": "define void @test_memcpy_from_uninitialized_alloca(ptr %dest) {\n; CHECK-LABEL: @test_memcpy_from_uninitialized_alloca(\n; CHECK-NEXT:    ret void\n  %src = alloca i32, align 1\n  call void @llvm.memcpy.p0.p0.i32(ptr %src, ptr %src, i32 4, i1 false)\n  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 4, i1 false)\n  ret void\n}",
+          "source_program": "define void @test_memcpy_from_uninitialized_alloca(ptr %dest) {\n  %src = alloca i32, align 1\n  call void @llvm.memcpy.p0.p0.i32(ptr %src, ptr %src, i32 4, i1 false)\n  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 4, i1 false)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_memcpy_from_uninitialized_calloc",
+          "test_body": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test_memcpy_from_uninitialized_calloc(ptr %dest) {\n; CHECK-LABEL: @test_memcpy_from_uninitialized_calloc(\n; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr noundef nonnull align 1 dereferenceable(16) [[DEST:%.*]], i8 0, i32 16, i1 false)\n; CHECK-NEXT:    ret void\n  %src = call ptr @calloc(i32 1, i32 16)\n  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 16, i1 false)\n  call void @free(ptr %src)\n  ret void\n}",
+          "source_program": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test_memcpy_from_uninitialized_calloc(ptr %dest) {\n  %src = call ptr @calloc(i32 1, i32 16)\n  call void @llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 16, i1 false)\n  call void @free(ptr %src)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_memmove_from_zero_initialized_malloc",
+          "test_body": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test_memmove_from_zero_initialized_malloc(ptr %dest) {\n; CHECK-LABEL: @test_memmove_from_zero_initialized_malloc(\n; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr noundef nonnull align 1 dereferenceable(32) [[DEST:%.*]], i8 0, i32 32, i1 false)\n; CHECK-NEXT:    ret void\n  %src = call ptr @calloc(i32 8, i32 4)\n  call void @llvm.memmove.p0.p0.i32(ptr %dest, ptr %src, i32 32, i1 false)\n  call void @free(ptr %src)\n  ret void\n}",
+          "source_program": "; Function Attrs: nounwind allockind(\"alloc,zeroed\") allocsize(0,1)\ndeclare noalias ptr @calloc(i32, i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test_memmove_from_zero_initialized_malloc(ptr %dest) {\n  %src = call ptr @calloc(i32 8, i32 4)\n  call void @llvm.memmove.p0.p0.i32(ptr %dest, ptr %src, i32 32, i1 false)\n  call void @free(ptr %src)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_multiple_loads_uninitialized_alloca",
+          "test_body": "define { i32, i32 } @test_multiple_loads_uninitialized_alloca() {\n; CHECK-LABEL: @test_multiple_loads_uninitialized_alloca(\n; CHECK-NEXT:    ret { i32, i32 } undef\n  %a = alloca [2 x i32], align 4\n  %gep1 = getelementptr [2 x i32], ptr %a, i32 0, i32 0\n  %gep2 = getelementptr [2 x i32], ptr %a, i32 0, i32 1\n  %v1 = load i32, ptr %gep1, align 4\n  %v2 = load i32, ptr %gep2, align 4\n  %ret = insertvalue { i32, i32 } { i32 undef, i32 poison }, i32 %v1, 0\n  %ret2 = insertvalue { i32, i32 } %ret, i32 %v2, 1\n  ret { i32, i32 } %ret2\n}",
+          "source_program": "define { i32, i32 } @test_multiple_loads_uninitialized_alloca() {\n  %a = alloca [2 x i32], align 4\n  %gep1 = getelementptr [2 x i32], ptr %a, i32 0, i32 0\n  %gep2 = getelementptr [2 x i32], ptr %a, i32 0, i32 1\n  %v1 = load i32, ptr %gep1, align 4\n  %v2 = load i32, ptr %gep2, align 4\n  %ret = insertvalue { i32, i32 } { i32 undef, i32 poison }, i32 %v1, 0\n  %ret2 = insertvalue { i32, i32 } %ret, i32 %v2, 1\n  ret { i32, i32 } %ret2\n}\n"
+        },
+        {
+          "test_name": "test_read_then_write_alloca",
+          "test_body": "define void @test_read_then_write_alloca() {\n; CHECK-LABEL: @test_read_then_write_alloca(\n; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[A]], align 4\n; CHECK-NEXT:    [[V8:%.*]] = trunc i32 [[V]] to i8\n; CHECK-NEXT:    store i8 [[V8]], ptr [[A]], align 1\n; CHECK-NEXT:    ret void\n  %a = alloca i32, align 4\n  %v = load i32, ptr %a, align 4\n  %v8 = trunc i32 %v to i8\n  store i8 %v8, ptr %a, align 1\n  ret void\n}",
+          "source_program": "define void @test_read_then_write_alloca() {\n  %a = alloca i32, align 4\n  %v = load i32, ptr %a, align 4\n  %v8 = trunc i32 %v to i8\n  store i8 %v8, ptr %a, align 1\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_volatile_load_prevents_removal",
+          "test_body": "define i32 @test_volatile_load_prevents_removal() {\n; CHECK-LABEL: @test_volatile_load_prevents_removal(\n; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n; CHECK-NEXT:    [[V:%.*]] = load volatile i32, ptr [[A]], align 4\n; CHECK-NEXT:    ret i32 [[V]]\n  %a = alloca i32, align 4\n  %v = load volatile i32, ptr %a, align 4\n  ret i32 %v\n}",
+          "source_program": "define i32 @test_volatile_load_prevents_removal() {\n  %a = alloca i32, align 4\n  %v = load volatile i32, ptr %a, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "test_write_then_read_alloca",
+          "test_body": "define i32 @test_write_then_read_alloca() {\n; CHECK-LABEL: @test_write_then_read_alloca(\n; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n; CHECK-NEXT:    store i8 42, ptr [[A]], align 1\n; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[A]], align 4\n; CHECK-NEXT:    ret i32 [[V]]\n  %a = alloca i32, align 4\n  store i8 42, ptr %a, align 1\n  %v = load i32, ptr %a, align 4\n  ret i32 %v\n}",
+          "source_program": "define i32 @test_write_then_read_alloca() {\n  %a = alloca i32, align 4\n  store i8 42, ptr %a, align 1\n  %v = load i32, ptr %a, align 4\n  ret i32 %v\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fp-ret-bitcast.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "bork",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n@\"\\01L_OBJC_SELECTOR_REFERENCES_81\" = external hidden global ptr, section \"__OBJC,__message_refs,literal_pointers,no_dead_strip\"\n\n; Function Attrs: nounwind\ndefine void @bork() #0 {",
+          "source_program": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n@\"\\01L_OBJC_SELECTOR_REFERENCES_81\" = external hidden global ptr, section \"__OBJC,__message_refs,literal_pointers,no_dead_strip\"\n\n; Function Attrs: nounwind\ndefine void @bork() #0 {\nentry:\n  %color = alloca ptr, align 8\n  %color.466 = alloca ptr, align 8\n  %tmp103 = load ptr, ptr %color, align 4\n  store ptr %tmp103, ptr %color.466, align 4\n  %tmp105 = load ptr, ptr @\"\\01L_OBJC_SELECTOR_REFERENCES_81\", align 4\n  %tmp106 = load ptr, ptr %color.466, align 4\n  %tmp107 = call float @objc_msgSend_fpret(ptr %tmp106, ptr %tmp105) #0\n  br label %exit\n\nexit:                                             ; preds = %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/malloc-free.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test4",
+          "test_body": "target datalayout = \"p:32:32:32\"\n\n; Function Attrs: allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare noalias ptr @malloc(i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test4() {\n; CHECK-LABEL: @test4(\n; CHECK-NEXT:    ret void\n  %A = call ptr @malloc(i32 16000)\n  call void @free(ptr %A)\n  ret void\n}",
+          "source_program": "target datalayout = \"p:32:32:32\"\n\n; Function Attrs: allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare noalias ptr @malloc(i32) #0\n\n; Function Attrs: allockind(\"free\")\ndeclare void @free(ptr) #1\n\ndefine void @test4() {\n  %A = call ptr @malloc(i32 16000)\n  call void @free(ptr %A)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test5",
+          "test_body": "target datalayout = \"p:32:32:32\"\n\n; Function Attrs: allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare noalias ptr @malloc(i32) #0\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg) #1\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memmove.p0.p0.i32(ptr nocapture writeonly, ptr nocapture readonly, i32, i1 immarg) #1\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i32(ptr nocapture writeonly, i8, i32, i1 immarg) #2\n\ndefine void @test5(ptr %ptr, ptr %esc) {\n; CHECK-LABEL: @test5(\n; CHECK-NEXT:    [[C:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n; CHECK-NEXT:    [[D:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n; CHECK-NEXT:    [[E:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n; CHECK-NEXT:    [[F:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n; CHECK-NEXT:    [[G:%.*]] = call dereferenceable_or_null(700) ptr @malloc(i32 700)\n; CHECK-NEXT:    store ptr [[C]], ptr [[ESC:%.*]], align 4\n; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i32(ptr [[D]], ptr [[PTR:%.*]], i32 32, i1 true)\n; CHECK-NEXT:    call void @llvm.memmove.p0.p0.i32(ptr [[E]], ptr [[PTR]], i32 32, i1 true)\n; CHECK-NEXT:    call void @llvm.memset.p0.i32(ptr [[F]], i8 5, i32 32, i1 true)\n; CHECK-NEXT:    store volatile i8 4, ptr [[G]], align 1\n; CHECK-NEXT:    ret void\n  %a = call ptr @malloc(i32 700)\n  %b = call ptr @malloc(i32 700)\n  %c = call ptr @malloc(i32 700)\n  %d = call ptr @malloc(i32 700)\n  %e = call ptr @malloc(i32 700)\n  %f = call ptr @malloc(i32 700)\n  %g = call ptr @malloc(i32 700)\n  call void @llvm.memcpy.p0.p0.i32(ptr %ptr, ptr %a, i32 32, i1 false)\n  call void @llvm.memmove.p0.p0.i32(ptr %ptr, ptr %b, i32 32, i1 false)\n  store ptr %c, ptr %esc, align 4\n  call void @llvm.memcpy.p0.p0.i32(ptr %d, ptr %ptr, i32 32, i1 true)\n  call void @llvm.memmove.p0.p0.i32(ptr %e, ptr %ptr, i32 32, i1 true)\n  call void @llvm.memset.p0.i32(ptr %f, i8 5, i32 32, i1 true)\n  store volatile i8 4, ptr %g, align 1\n  ret void\n}",
+          "source_program": "target datalayout = \"p:32:32:32\"\n\n; Function Attrs: allockind(\"alloc,uninitialized\") allocsize(0)\ndeclare noalias ptr @malloc(i32) #0\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg) #1\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memmove.p0.p0.i32(ptr nocapture writeonly, ptr nocapture readonly, i32, i1 immarg) #1\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i32(ptr nocapture writeonly, i8, i32, i1 immarg) #2\n\ndefine void @test5(ptr %ptr, ptr %esc) {\n  %a = call ptr @malloc(i32 700)\n  %b = call ptr @malloc(i32 700)\n  %c = call ptr @malloc(i32 700)\n  %d = call ptr @malloc(i32 700)\n  %e = call ptr @malloc(i32 700)\n  %f = call ptr @malloc(i32 700)\n  %g = call ptr @malloc(i32 700)\n  call void @llvm.memcpy.p0.p0.i32(ptr %ptr, ptr %a, i32 32, i1 false)\n  call void @llvm.memmove.p0.p0.i32(ptr %ptr, ptr %b, i32 32, i1 false)\n  store ptr %c, ptr %esc, align 4\n  call void @llvm.memcpy.p0.p0.i32(ptr %d, ptr %ptr, i32 32, i1 true)\n  call void @llvm.memmove.p0.p0.i32(ptr %e, ptr %ptr, i32 32, i1 true)\n  call void @llvm.memset.p0.i32(ptr %f, i8 5, i32 32, i1 true)\n  store volatile i8 4, ptr %g, align 1\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/multiple-uses-load-bitcast-select.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S -data-layout=\"E-m:e-i1:8:16-i8:8:16-i64:64-f128:64-v128:64-a:8:16-n32:64\"",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "PR35618",
+          "test_body": "define void @PR35618(ptr %st1, ptr %st2) {\n; CHECK-LABEL: @PR35618(\n; CHECK-NEXT:    [[Y1:%.*]] = alloca double, align 8\n; CHECK-NEXT:    [[Z1:%.*]] = alloca double, align 8\n; CHECK-NEXT:    [[LD1:%.*]] = load double, ptr [[Y1]], align 8\n; CHECK-NEXT:    [[LD2:%.*]] = load double, ptr [[Z1]], align 8\n; CHECK-NEXT:    [[TMP:%.*]] = fcmp olt double [[LD1]], [[LD2]]\n; CHECK-NEXT:    [[TMP12_V:%.*]] = select i1 [[TMP]], double [[LD1]], double [[LD2]]\n; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST1:%.*]], align 8\n; CHECK-NEXT:    store double [[TMP12_V]], ptr [[ST2:%.*]], align 8\n; CHECK-NEXT:    ret void\n  %y1 = alloca double, align 8\n  %z1 = alloca double, align 8\n  %ld1 = load double, ptr %y1, align 8\n  %ld2 = load double, ptr %z1, align 8\n  %tmp = fcmp olt double %ld1, %ld2\n  %sel = select i1 %tmp, ptr %y1, ptr %z1\n  %tmp12 = load i64, ptr %sel, align 4\n  store i64 %tmp12, ptr %st1, align 4\n  store i64 %tmp12, ptr %st2, align 4\n  ret void\n}",
+          "source_program": "define void @PR35618(ptr %st1, ptr %st2) {\n  %y1 = alloca double, align 8\n  %z1 = alloca double, align 8\n  %ld1 = load double, ptr %y1, align 8\n  %ld2 = load double, ptr %z1, align 8\n  %tmp = fcmp olt double %ld1, %ld2\n  %sel = select i1 %tmp, ptr %y1, ptr %z1\n  %tmp12 = load i64, ptr %sel, align 4\n  store i64 %tmp12, ptr %st1, align 4\n  store i64 %tmp12, ptr %st2, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "PR35618_asan",
+          "test_body": "; Function Attrs: sanitize_address\ndefine void @PR35618_asan(ptr %st1, ptr %st2) #0 {",
+          "source_program": "; Function Attrs: sanitize_address\ndefine void @PR35618_asan(ptr %st1, ptr %st2) #0 {\n  %y1 = alloca double, align 8\n  %z1 = alloca double, align 8\n  %ld1 = load double, ptr %y1, align 8\n  %ld2 = load double, ptr %z1, align 8\n  %tmp = fcmp olt double %ld1, %ld2\n  %sel = select i1 %tmp, ptr %y1, ptr %z1\n  %tmp12 = load i64, ptr %sel, align 4\n  store i64 %tmp12, ptr %st1, align 4\n  store i64 %tmp12, ptr %st2, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/objsize.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "bar",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@a = external hidden global [60 x i8], align 1\n\n; Function Attrs: nounwind\ndefine ptr @bar() #0 {",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@a = external hidden global [60 x i8], align 1\n\n; Function Attrs: nounwind\ndefine ptr @bar() #0 {\nentry:\n  %retval = alloca ptr, align 4\n  %0 = call i32 @llvm.objectsize.i32.p0(ptr @a, i1 false, i1 false, i1 false)\n  %cmp = icmp ne i32 %0, -1\n  br i1 %cmp, label %cond.true, label %cond.false\n\ncond.true:                                        ; preds = %entry\n  %1 = load ptr, ptr %retval, align 4\n  ret ptr %1\n\ncond.false:                                       ; preds = %entry\n  %2 = load ptr, ptr %retval, align 4\n  ret ptr %2\n}\n"
+        },
+        {
+          "test_name": "foo",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@a = external hidden global [60 x i8], align 1\n\n; Function Attrs: nounwind\ndefine i32 @foo() #0 {",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@a = external hidden global [60 x i8], align 1\n\n; Function Attrs: nounwind\ndefine i32 @foo() #0 {\n  %1 = call i32 @llvm.objectsize.i32.p0(ptr @a, i1 false, i1 false, i1 false)\n  ret i32 %1\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-load.ll",
+      "commands": [
+        [
+          "opt -passes=instcombine -S < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_msan",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-grtev4-linux-gnu\"\n\n; Function Attrs: sanitize_memory\ndefine i32 @test_msan(i1 %f) #0 {",
+          "source_program": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-grtev4-linux-gnu\"\n\n; Function Attrs: sanitize_memory\ndefine i32 @test_msan(i1 %f) #0 {\nentry:\n  %a = alloca i32, align 8\n  %b = alloca i32, align 8\n  %sel = select i1 %f, ptr %a, ptr %b\n  %l = load i32, ptr %sel, align 8\n  ret i32 %l\n}\n"
+        },
+        {
+          "test_name": "test_plain",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-grtev4-linux-gnu\"\n\ndefine i32 @test_plain(i1 %f) {\n; CHECK-LABEL: @test_plain(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 8\n; CHECK-NEXT:    [[B:%.*]] = alloca i32, align 8\n; CHECK-NEXT:    [[A_VAL:%.*]] = load i32, ptr [[A]], align 8\n; CHECK-NEXT:    [[B_VAL:%.*]] = load i32, ptr [[B]], align 8\n; CHECK-NEXT:    [[L:%.*]] = select i1 [[F:%.*]], i32 [[A_VAL]], i32 [[B_VAL]]\n; CHECK-NEXT:    ret i32 [[L]]\nentry:\n  %a = alloca i32, align 8\n  %b = alloca i32, align 8\n  %sel = select i1 %f, ptr %a, ptr %b\n  %l = load i32, ptr %sel, align 8\n  ret i32 %l\n}",
+          "source_program": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-grtev4-linux-gnu\"\n\ndefine i32 @test_plain(i1 %f) {\nentry:\n  %a = alloca i32, align 8\n  %b = alloca i32, align 8\n  %sel = select i1 %f, ptr %a, ptr %b\n  %l = load i32, ptr %sel, align 8\n  ret i32 %l\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shift-amount-reassociation.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "constantexpr",
+          "test_body": "@X = external global i32\n\ndefine i64 @constantexpr() {\n; CHECK-LABEL: @constantexpr(\n; CHECK-NEXT:    ret i64 0\n  %A = alloca i64, align 8\n  %L = load i64, ptr %A, align 4\n  %V = add i64 ptrtoint (ptr @X to i64), 0\n  %B2 = shl i64 %V, 0\n  %B4 = ashr i64 %B2, %L\n  %B = and i64 undef, %B4\n  ret i64 %B\n}",
+          "source_program": "@X = external global i32\n\ndefine i64 @constantexpr() {\n  %A = alloca i64, align 8\n  %L = load i64, ptr %A, align 4\n  %V = add i64 ptrtoint (ptr @X to i64), 0\n  %B2 = shl i64 %V, 0\n  %B4 = ashr i64 %B2, %L\n  %B = and i64 undef, %B4\n  ret i64 %B\n}\n"
+        },
+        {
+          "test_name": "t11_shl_nsw_flag_preservation",
+          "test_body": "define i32 @t11_shl_nsw_flag_preservation(i32 %x, i32 %y) {\n; CHECK-LABEL: @t11_shl_nsw_flag_preservation(\n; CHECK-NEXT:    [[T3:%.*]] = shl nsw i32 [[X:%.*]], 30\n; CHECK-NEXT:    ret i32 [[T3]]\n  %t0 = sub i32 32, %y\n  %t1 = shl nsw i32 %x, %t0\n  %t2 = add i32 %y, -2\n  %t3 = shl nuw nsw i32 %t1, %t2\n  ret i32 %t3\n}",
+          "source_program": "define i32 @t11_shl_nsw_flag_preservation(i32 %x, i32 %y) {\n  %t0 = sub i32 32, %y\n  %t1 = shl nsw i32 %x, %t0\n  %t2 = add i32 %y, -2\n  %t3 = shl nuw nsw i32 %t1, %t2\n  ret i32 %t3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/vscale_gep.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "gep_alloca_inbounds_vscale_nonzero",
+          "test_body": "define i32 @gep_alloca_inbounds_vscale_nonzero() {\n; CHECK-LABEL: @gep_alloca_inbounds_vscale_nonzero(\n; CHECK-NEXT:    [[A:%.*]] = alloca <vscale x 4 x i32>, align 16\n; CHECK-NEXT:    [[TMP1:%.*]] = call i64 @llvm.vscale.i64()\n; CHECK-NEXT:    [[TMP2:%.*]] = shl i64 [[TMP1]], 4\n; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr i8, ptr [[A]], i64 [[TMP2]]\n; CHECK-NEXT:    [[TMP:%.*]] = getelementptr i8, ptr [[TMP3]], i64 8\n; CHECK-NEXT:    [[LOAD:%.*]] = load i32, ptr [[TMP]], align 4\n; CHECK-NEXT:    ret i32 [[LOAD]]\n  %a = alloca <vscale x 4 x i32>, align 16\n  %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 1, i32 2\n  %load = load i32, ptr %tmp, align 4\n  ret i32 %load\n}",
+          "source_program": "define i32 @gep_alloca_inbounds_vscale_nonzero() {\n  %a = alloca <vscale x 4 x i32>, align 16\n  %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 1, i32 2\n  %load = load i32, ptr %tmp, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "gep_alloca_inbounds_vscale_zero",
+          "test_body": "define i32 @gep_alloca_inbounds_vscale_zero() {\n; CHECK-LABEL: @gep_alloca_inbounds_vscale_zero(\n; CHECK-NEXT:    [[A:%.*]] = alloca <vscale x 4 x i32>, align 16\n; CHECK-NEXT:    [[TMP:%.*]] = getelementptr inbounds nuw i8, ptr [[A]], i64 8\n; CHECK-NEXT:    [[LOAD:%.*]] = load i32, ptr [[TMP]], align 4\n; CHECK-NEXT:    ret i32 [[LOAD]]\n  %a = alloca <vscale x 4 x i32>, align 16\n  %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 0, i32 2\n  %load = load i32, ptr %tmp, align 4\n  ret i32 %load\n}",
+          "source_program": "define i32 @gep_alloca_inbounds_vscale_zero() {\n  %a = alloca <vscale x 4 x i32>, align 16\n  %tmp = getelementptr <vscale x 4 x i32>, ptr %a, i32 0, i32 2\n  %load = load i32, ptr %tmp, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "gep_bitcast",
+          "test_body": "define void @gep_bitcast(ptr %p) {\n; CHECK-LABEL: @gep_bitcast(\n; CHECK-NEXT:    store <vscale x 16 x i8> zeroinitializer, ptr [[P:%.*]], align 16\n; CHECK-NEXT:    [[TMP1:%.*]] = call i64 @llvm.vscale.i64()\n; CHECK-NEXT:    [[TMP2:%.*]] = shl i64 [[TMP1]], 4\n; CHECK-NEXT:    [[GEP2:%.*]] = getelementptr i8, ptr [[P]], i64 [[TMP2]]\n; CHECK-NEXT:    store <vscale x 16 x i8> zeroinitializer, ptr [[GEP2]], align 16\n; CHECK-NEXT:    ret void\n  store <vscale x 16 x i8> zeroinitializer, ptr %p, align 16\n  %gep2 = getelementptr <vscale x 16 x i8>, ptr %p, i64 1\n  store <vscale x 16 x i8> zeroinitializer, ptr %gep2, align 16\n  ret void\n}",
+          "source_program": "define void @gep_bitcast(ptr %p) {\n  store <vscale x 16 x i8> zeroinitializer, ptr %p, align 16\n  %gep2 = getelementptr <vscale x 16 x i8>, ptr %p, i64 1\n  store <vscale x 16 x i8> zeroinitializer, ptr %gep2, align 16\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "pr_number": 150383,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/150383",
+  "title": "[InstCombine] Lower multi-dimensional GEP to ptradd",
+  "commit_sha": "269f0ddde13fb6b95bcf530cf071ceaca109f037",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          2997,
+          3002
+        ],
+        [
+          3017,
+          3022
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombiner::getFreelyInvertedImpl",
+        "shouldCanonicalizeGEPToPtrAdd"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 5ee3bb1abe86e..b60b7c7c352af 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2997,6 +2997,78 @@ Value *InstCombiner::getFreelyInvertedImpl(Value *V, bool WillInvertAllUses,\n   return nullptr;\n }\n \n+/// Accumulate constant indices from GEPs with all-constant indices, then\n+/// check if the outermost GEP (with one variable index) is flattenable.\n+/// Matches and returns true for multi-dimensional array geps with only one\n+/// variable index. The pointer could also be another gep with all constant\n+/// indices. For ex:\n+/// -getelementptr [9 x [9 x [9 x i32]]], ptr @arr, i64 0, i64 %i, i64 2, i64 3\n+/// -getelementptr [9 x [9 x [9 x i32]]],\n+///                <another gep>, i64 0, i64 %i, i64 2, i64 3\n+static bool ismultiDimGepFlattenable(const GetElementPtrInst &GEP) {\n+  // Collect all indices, outermost last\n+  SmallVector<const GEPOperator *, 4> GEPChain;\n+  const Value *Base = &GEP;\n+\n+  // Go over GEPs with all constant indices\n+  while (auto *CurGep = dyn_cast<GEPOperator>(Base)) {\n+    bool AllConst = true;\n+    for (unsigned I = 1; I < CurGep->getNumOperands(); ++I)\n+      if (!isa<ConstantInt>(CurGep->getOperand(I)))\n+        AllConst = false;\n+    if (!AllConst)\n+      break;\n+    GEPChain.push_back(CurGep);\n+    Base = CurGep->getOperand(0)->stripPointerCasts();\n+  }\n+\n+  // Accumulate all indices from innermost to outermost\n+  SmallVector<Value *, 8> Indices;\n+  for (int I = GEPChain.size() - 1; I >= 0; --I) {\n+    const GEPOperator *GO = GEPChain[I];\n+    for (unsigned J = 1; J < GO->getNumOperands(); ++J)\n+      Indices.push_back(GO->getOperand(J));\n+  }\n+\n+  // Add indices from the main GEP (skip pointer operand)\n+  for (unsigned J = 1; J < GEP.getNumOperands(); ++J)\n+    Indices.push_back(GEP.getOperand(J));\n+\n+  if (Indices.empty())\n+    return false;\n+\n+  // First index must be constant zero (array base)\n+  if (!isa<ConstantInt>(Indices[0]) || !cast<ConstantInt>(Indices[0])->isZero())\n+    return false;\n+\n+  unsigned NumDims = Indices.size() - 1;\n+\n+  // Limit lowering for arrays with 3 or more dimensions\n+  if (NumDims < 3)\n+    return false;\n+\n+  // Check that it's arrays all the way\n+  Type *CurTy = GEP.getSourceElementType();\n+  unsigned NumVar = 0;\n+  for (unsigned I = 1; I < Indices.size(); ++I) {\n+    auto *ArrTy = dyn_cast<ArrayType>(CurTy);\n+    if (!ArrTy)\n+      return false;\n+    if (!isa<ConstantInt>(Indices[I]))\n+      ++NumVar;\n+    CurTy = ArrTy->getElementType();\n+  }\n+\n+  // Limit lowering only for one variable index\n+  if (NumVar != 1)\n+    return false;\n+\n+  if (!CurTy->isIntegerTy() || CurTy->getIntegerBitWidth() > 128)\n+    return false;\n+\n+  return true;\n+}\n+\n /// Return true if we should canonicalize the gep to an i8 ptradd.\n static bool shouldCanonicalizeGEPToPtrAdd(GetElementPtrInst &GEP) {\n   Value *PtrOp = GEP.getOperand(0);\n@@ -3017,6 +3089,9 @@ static bool shouldCanonicalizeGEPToPtrAdd(GetElementPtrInst &GEP) {\n                                  m_Shl(m_Value(), m_ConstantInt())))))\n     return true;\n \n+  if (ismultiDimGepFlattenable(GEP))\n+    return true;\n+\n   // gep (gep %p, C1), %x, C2 is expanded so the two constants can\n   // possibly be merged together.\n   auto PtrOpGep = dyn_cast<GEPOperator>(PtrOp);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll b/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\nindex 07c8a8c6b90e1..1a1b3d1a746ed 100644\n--- a/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\n+++ b/llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll\n@@ -2,6 +2,9 @@\n ; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n \n @glob = internal global [10 x [10 x [10 x i32]]] zeroinitializer\n+@glob_i8 = internal global [10 x [10 x [10 x i8]]] zeroinitializer\n+@glob_i16 = internal global [10 x [10 x [10 x i16]]] zeroinitializer\n+@glob_i64 = internal global [10 x [10 x [10 x i64]]] zeroinitializer\n \n define ptr @x12(i64 %x) {\n ; CHECK-LABEL: define ptr @x12(\n@@ -78,3 +81,61 @@ entry:\n   %c = add i32 %a, %b\n   ret i32 %c\n }\n+\n+define i8* @flat_gep8(i64 %x) {\n+; CHECK-LABEL: define ptr @flat_gep8(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul i64 [[X]], 100\n+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr @glob_i8, i64 [[GEP_IDX]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 35\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+entry:\n+  %gep = getelementptr [10 x [10 x [10 x i8]]], ptr @glob_i8, i64 0, i64 %x, i64 3, i64 5\n+  ret ptr %gep\n+}\n+\n+define i16* @flat_gep16(i64 %x) {\n+; CHECK-LABEL: define ptr @flat_gep16(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul i64 [[X]], 200\n+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr @glob_i16, i64 [[GEP_IDX]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 46\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+entry:\n+  %gep = getelementptr [10 x [10 x [10 x i16]]], ptr @glob_i16, i64 0, i64 %x, i64 2, i64 3\n+  ret ptr %gep\n+}\n+\n+define i32* @flat_gep(i64 %x) {\n+; CHECK-LABEL: define ptr @flat_gep(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul i64 [[X]], 400\n+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr @glob, i64 [[GEP_IDX]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 100\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+entry:\n+  %gep = getelementptr [10 x [10 x [10 x i32]]], ptr @glob, i64 0, i64 %x, i64 2, i64 5\n+  ret ptr %gep\n+}\n+\n+define i64* @flat_gep64(i64 %x) {\n+; CHECK-LABEL: define ptr @flat_gep64(\n+; CHECK-SAME: i64 [[X:%.*]]) {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul i64 [[X]], 800\n+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr @glob_i64, i64 [[GEP_IDX]]\n+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr [[TMP0]], i64 288\n+; CHECK-NEXT:    ret ptr [[GEP]]\n+;\n+entry:\n+  %gep = getelementptr [10 x [10 x [10 x i64]]], ptr @glob_i64, i64 0, i64 %x, i64 3, i64 6\n+  ret ptr %gep\n+}\n+\n+\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "x12",
+          "test_body": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x12(i64 %x) {\n; CHECK-LABEL: define ptr @x12(\n; CHECK-SAME: i64 [[X:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[GEP_IDX:%.*]] = mul nsw i64 [[X]], 400\n; CHECK-NEXT:    [[GEP:%.*]] = getelementptr i8, ptr getelementptr inbounds nuw (i8, ptr @glob, i64 84), i64 [[GEP_IDX]]\n; CHECK-NEXT:    ret ptr [[GEP]]\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 1, i64 2\n  ret ptr %gep\n}",
+          "source_program": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @x12(i64 %x) {\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 36), i64 0, i64 %x, i64 1, i64 2\n  ret ptr %gep\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

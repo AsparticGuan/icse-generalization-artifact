@@ -1,0 +1,113 @@
+{
+  "pr_number": 124577,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/124577",
+  "title": "[InstCombine] Simple store-to-load forwaring between fixed/scalable vectors",
+  "commit_sha": "091c45d903128e20bd087498f5518f198d2a656e",
+  "components": [
+    "InstCombine",
+    "Loads"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "Loads"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/Loads.h": [
+        [
+          154,
+          161
+        ]
+      ],
+      "llvm/lib/Analysis/Loads.cpp": [
+        [
+          538,
+          544
+        ],
+        [
+          584,
+          589
+        ],
+        [
+          655,
+          662
+        ],
+        [
+          711,
+          717
+        ],
+        [
+          734,
+          741
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          3389,
+          3405
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/Loads.h": [
+        "FindAvailableLoadedValue"
+      ],
+      "llvm/lib/Analysis/Loads.cpp": [
+        "areNonOverlapSameBaseLoadAndStore",
+        "getAvailableLoadStore",
+        "llvm::FindAvailableLoadedValue",
+        "llvm::findAvailablePtrLoadStore"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitCallInst"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/Loads.h b/llvm/include/llvm/Analysis/Loads.h\nindex 639070c07897b..0cadbc5fede9b 100644\n--- a/llvm/include/llvm/Analysis/Loads.h\n+++ b/llvm/include/llvm/Analysis/Loads.h\n@@ -154,8 +154,12 @@ Value *FindAvailableLoadedValue(LoadInst *Load, BasicBlock *ScanBB,\n /// FindAvailableLoadedValue() for the case where we are not interested in\n /// finding the closest clobbering instruction if no available load is found.\n /// This overload cannot be used to scan across multiple blocks.\n+/// If \\p VectorKindChange is not nullptr, this is a out parameter that is true\n+/// if a value was found, but it is a scalable vector instead of a requested\n+/// fixed-sized one (or the other way round).\n Value *FindAvailableLoadedValue(LoadInst *Load, BatchAAResults &AA,\n                                 bool *IsLoadCSE,\n+                                bool *IsVectorKindChange = nullptr,\n                                 unsigned MaxInstsToScan = DefMaxInstsToScan);\n \n /// Scan backwards to see if we have the value of the given pointer available\ndiff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp\nindex 691d7e4a3edcf..e4bd59fbf2d30 100644\n--- a/llvm/lib/Analysis/Loads.cpp\n+++ b/llvm/lib/Analysis/Loads.cpp\n@@ -538,7 +538,8 @@ static bool areNonOverlapSameBaseLoadAndStore(const Value *LoadPtr,\n \n static Value *getAvailableLoadStore(Instruction *Inst, const Value *Ptr,\n                                     Type *AccessTy, bool AtLeastAtomic,\n-                                    const DataLayout &DL, bool *IsLoadCSE) {\n+                                    const DataLayout &DL, bool *IsLoadCSE,\n+                                    bool *IsVectorKindChange) {\n   // If this is a load of Ptr, the loaded value is available.\n   // (This is true even if the load is volatile or atomic, although\n   // those cases are unlikely.)\n@@ -584,6 +585,25 @@ static Value *getAvailableLoadStore(Instruction *Inst, const Value *Ptr,\n     if (TypeSize::isKnownLE(LoadSize, StoreSize))\n       if (auto *C = dyn_cast<Constant>(Val))\n         return ConstantFoldLoadFromConst(C, AccessTy, DL);\n+\n+    if (IsVectorKindChange && Val->getType()->isVectorTy() &&\n+        AccessTy->isVectorTy()) {\n+      auto Attrs = Inst->getFunction()->getAttributes().getFnAttrs();\n+      unsigned VScale = Attrs.getVScaleRangeMin();\n+      if (Attrs.getVScaleRangeMax() != VScale)\n+        return nullptr;\n+\n+      unsigned FixedStoreSize =\n+          (StoreSize.isFixed() ? StoreSize : StoreSize * VScale)\n+              .getKnownMinValue();\n+      unsigned FixedLoadSize =\n+          (LoadSize.isFixed() ? LoadSize : LoadSize * VScale)\n+              .getKnownMinValue();\n+      if (FixedStoreSize == FixedLoadSize) {\n+        *IsVectorKindChange = true;\n+        return Val;\n+      }\n+    }\n   }\n \n   if (auto *MSI = dyn_cast<MemSetInst>(Inst)) {\n@@ -655,8 +675,8 @@ Value *llvm::findAvailablePtrLoadStore(\n \n     --ScanFrom;\n \n-    if (Value *Available = getAvailableLoadStore(Inst, StrippedPtr, AccessTy,\n-                                                 AtLeastAtomic, DL, IsLoadCSE))\n+    if (Value *Available = getAvailableLoadStore(\n+            Inst, StrippedPtr, AccessTy, AtLeastAtomic, DL, IsLoadCSE, nullptr))\n       return Available;\n \n     // Try to get the store size for the type.\n@@ -711,7 +731,7 @@ Value *llvm::findAvailablePtrLoadStore(\n }\n \n Value *llvm::FindAvailableLoadedValue(LoadInst *Load, BatchAAResults &AA,\n-                                      bool *IsLoadCSE,\n+                                      bool *IsLoadCSE, bool *IsVectorKindChange,\n                                       unsigned MaxInstsToScan) {\n   const DataLayout &DL = Load->getDataLayout();\n   Value *StrippedPtr = Load->getPointerOperand()->stripPointerCasts();\n@@ -734,8 +754,9 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load, BatchAAResults &AA,\n     if (MaxInstsToScan-- == 0)\n       return nullptr;\n \n-    Available = getAvailableLoadStore(&Inst, StrippedPtr, AccessTy,\n-                                      AtLeastAtomic, DL, IsLoadCSE);\n+    Available =\n+        getAvailableLoadStore(&Inst, StrippedPtr, AccessTy, AtLeastAtomic, DL,\n+                              IsLoadCSE, IsVectorKindChange);\n     if (Available)\n       break;\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex f748f78524e0d..f463fe3e7d504 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3389,17 +3389,34 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n     Value *Vec = II->getArgOperand(0);\n     Value *SubVec = II->getArgOperand(1);\n     Value *Idx = II->getArgOperand(2);\n-    auto *DstTy = dyn_cast<FixedVectorType>(II->getType());\n-    auto *VecTy = dyn_cast<FixedVectorType>(Vec->getType());\n-    auto *SubVecTy = dyn_cast<FixedVectorType>(SubVec->getType());\n+    auto *DstTy = cast<VectorType>(II->getType());\n+    auto *VecTy = cast<VectorType>(Vec->getType());\n+    auto *SubVecTy = cast<VectorType>(SubVec->getType());\n+    unsigned IdxN = cast<ConstantInt>(Idx)->getZExtValue();\n+\n+    // Try store-to-load forwarding where the stored value has the same\n+    // type as this intrinsic, and the loaded value is the inserted\n+    // vector. This has to be done here because a temporary insert of\n+    // a scalable vector (the available value) into a fixed-sized one\n+    // (the second operand of this intrinisc) cannot be created.\n+    if (auto *LI = dyn_cast<LoadInst>(SubVec);\n+        LI && IdxN == 0 && DstTy->isScalableTy() && !SubVecTy->isScalableTy()) {\n+      bool IsVectorKindChange = false;\n+      BatchAAResults BatchAA(*AA);\n+      if (Value *AvilVal = FindAvailableLoadedValue(LI, BatchAA, nullptr,\n+                                                    &IsVectorKindChange);\n+          AvilVal && IsVectorKindChange && AvilVal->getType() == DstTy) {\n+        return replaceInstUsesWith(CI, AvilVal);\n+      }\n+    }\n \n     // Only canonicalize if the destination vector, Vec, and SubVec are all\n     // fixed vectors.\n-    if (DstTy && VecTy && SubVecTy) {\n-      unsigned DstNumElts = DstTy->getNumElements();\n-      unsigned VecNumElts = VecTy->getNumElements();\n-      unsigned SubVecNumElts = SubVecTy->getNumElements();\n-      unsigned IdxN = cast<ConstantInt>(Idx)->getZExtValue();\n+    if (!DstTy->isScalableTy() && !VecTy->isScalableTy() &&\n+        !SubVecTy->isScalableTy()) {\n+      unsigned DstNumElts = DstTy->getElementCount().getFixedValue();\n+      unsigned VecNumElts = VecTy->getElementCount().getFixedValue();\n+      unsigned SubVecNumElts = SubVecTy->getElementCount().getFixedValue();\n \n       // An insert that entirely overwrites Vec with SubVec is a nop.\n       if (VecNumElts == SubVecNumElts)\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/store-load-vector-insert.ll b/llvm/test/Transforms/InstCombine/store-load-vector-insert.ll\nnew file mode 100644\nindex 0000000000000..73685fe8c3762\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/store-load-vector-insert.ll\n@@ -0,0 +1,66 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 5\n+; RUN: opt -S -passes=instcombine < %s | FileCheck %s\n+\n+%struct.svfloat32_wrapped_t = type { <16 x float> }\n+\n+define <vscale x 4 x float> @store_to_vector_load_different_type(<vscale x 4 x float> %.coerce) #0 {\n+; CHECK-LABEL: define <vscale x 4 x float> @store_to_vector_load_different_type(\n+; CHECK-SAME: <vscale x 4 x float> [[DOTCOERCE:%.*]]) #[[ATTR0:[0-9]+]] {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[TMP0:%.*]] = fadd <vscale x 4 x float> [[DOTCOERCE]], [[DOTCOERCE]]\n+; CHECK-NEXT:    ret <vscale x 4 x float> [[TMP0]]\n+;\n+entry:\n+  %retval = alloca %struct.svfloat32_wrapped_t\n+  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n+  store <vscale x 4 x float> %0, ptr %retval\n+  %1 = load <16 x float>, ptr %retval\n+  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n+  ret <vscale x 4 x float> %cast.scalable\n+}\n+\n+define <vscale x 4 x float> @vscale_not_fixed(<vscale x 4 x float> %.coerce) #1 {\n+; CHECK-LABEL: define <vscale x 4 x float> @vscale_not_fixed(\n+; CHECK-SAME: <vscale x 4 x float> [[DOTCOERCE:%.*]]) #[[ATTR1:[0-9]+]] {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[RETVAL:%.*]] = alloca [[STRUCT_SVFLOAT32_WRAPPED_T:%.*]], align 64\n+; CHECK-NEXT:    [[TMP0:%.*]] = fadd <vscale x 4 x float> [[DOTCOERCE]], [[DOTCOERCE]]\n+; CHECK-NEXT:    store <vscale x 4 x float> [[TMP0]], ptr [[RETVAL]], align 16\n+; CHECK-NEXT:    [[TMP1:%.*]] = load <16 x float>, ptr [[RETVAL]], align 64\n+; CHECK-NEXT:    [[CAST_SCALABLE:%.*]] = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> [[TMP1]], i64 0)\n+; CHECK-NEXT:    ret <vscale x 4 x float> [[CAST_SCALABLE]]\n+;\n+entry:\n+  %retval = alloca %struct.svfloat32_wrapped_t\n+  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n+  store <vscale x 4 x float> %0, ptr %retval\n+  %1 = load <16 x float>, ptr %retval\n+  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n+  ret <vscale x 4 x float> %cast.scalable\n+}\n+\n+define <vscale x 4 x float> @sizes_do_not_match(<vscale x 4 x float> %.coerce) #0 {\n+; CHECK-LABEL: define <vscale x 4 x float> @sizes_do_not_match(\n+; CHECK-SAME: <vscale x 4 x float> [[DOTCOERCE:%.*]]) #[[ATTR0]] {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[RETVAL:%.*]] = alloca [[STRUCT_SVFLOAT32_WRAPPED_T:%.*]], align 64\n+; CHECK-NEXT:    [[TMP0:%.*]] = fadd <vscale x 4 x float> [[DOTCOERCE]], [[DOTCOERCE]]\n+; CHECK-NEXT:    store <vscale x 4 x float> [[TMP0]], ptr [[RETVAL]], align 16\n+; CHECK-NEXT:    [[TMP1:%.*]] = load <8 x float>, ptr [[RETVAL]], align 32\n+; CHECK-NEXT:    [[CAST_SCALABLE:%.*]] = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float> poison, <8 x float> [[TMP1]], i64 0)\n+; CHECK-NEXT:    ret <vscale x 4 x float> [[CAST_SCALABLE]]\n+;\n+entry:\n+  %retval = alloca %struct.svfloat32_wrapped_t\n+  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n+  store <vscale x 4 x float> %0, ptr %retval\n+  %1 = load <8 x float>, ptr %retval\n+  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float> poison, <8 x float> %1, i64 0)\n+  ret <vscale x 4 x float> %cast.scalable\n+}\n+\n+declare <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float>, <16 x float>, i64 immarg)\n+declare <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float>, <8 x float>, i64 immarg)\n+\n+attributes #0 = { vscale_range(4,4) }\n+attributes #1 = { vscale_range(1,16) }\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/Loads.h",
+    "llvm/lib/Analysis/Loads.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/store-load-vector-insert.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/store-load-vector-insert.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "sizes_do_not_match",
+          "test_body": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @sizes_do_not_match(<vscale x 4 x float> %.coerce) #0 {\n; CHECK-LABEL: define <vscale x 4 x float> @sizes_do_not_match(\n; CHECK-SAME: <vscale x 4 x float> [[DOTCOERCE:%.*]]) #[[ATTR0]] {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[RETVAL:%.*]] = alloca [[STRUCT_SVFLOAT32_WRAPPED_T:%.*]], align 64\n; CHECK-NEXT:    [[TMP0:%.*]] = fadd <vscale x 4 x float> [[DOTCOERCE]], [[DOTCOERCE]]\n; CHECK-NEXT:    store <vscale x 4 x float> [[TMP0]], ptr [[RETVAL]], align 16\n; CHECK-NEXT:    [[TMP1:%.*]] = load <8 x float>, ptr [[RETVAL]], align 32\n; CHECK-NEXT:    [[CAST_SCALABLE:%.*]] = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float> poison, <8 x float> [[TMP1]], i64 0)\n; CHECK-NEXT:    ret <vscale x 4 x float> [[CAST_SCALABLE]]\nentry:\n  %retval = alloca %struct.svfloat32_wrapped_t, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <8 x float>, ptr %retval, align 32\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float> poison, <8 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}",
+          "source_program": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @sizes_do_not_match(<vscale x 4 x float> %.coerce) #0 {\nentry:\n  %retval = alloca %struct.svfloat32_wrapped_t, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <8 x float>, ptr %retval, align 32\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v8f32(<vscale x 4 x float> poison, <8 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}\n"
+        },
+        {
+          "test_name": "store_to_vector_load_different_type",
+          "test_body": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @store_to_vector_load_different_type(<vscale x 4 x float> %.coerce) #0 {\n; CHECK-LABEL: define <vscale x 4 x float> @store_to_vector_load_different_type(\n; CHECK-SAME: <vscale x 4 x float> [[DOTCOERCE:%.*]]) #[[ATTR0:[0-9]+]] {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[RETVAL:%.*]] = alloca [[STRUCT_SVFLOAT32_WRAPPED_T:%.*]], align 64\n; CHECK-NEXT:    [[TMP0:%.*]] = fadd <vscale x 4 x float> [[DOTCOERCE]], [[DOTCOERCE]]\n; CHECK-NEXT:    store <vscale x 4 x float> [[TMP0]], ptr [[RETVAL]], align 16\n; CHECK-NEXT:    [[TMP1:%.*]] = load <16 x float>, ptr [[RETVAL]], align 64\n; CHECK-NEXT:    [[CAST_SCALABLE:%.*]] = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> [[TMP1]], i64 0)\n; CHECK-NEXT:    ret <vscale x 4 x float> [[CAST_SCALABLE]]\nentry:\n  %retval = alloca %struct.svfloat32_wrapped_t, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <16 x float>, ptr %retval, align 64\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}",
+          "source_program": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @store_to_vector_load_different_type(<vscale x 4 x float> %.coerce) #0 {\nentry:\n  %retval = alloca %struct.svfloat32_wrapped_t, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <16 x float>, ptr %retval, align 64\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}\n"
+        },
+        {
+          "test_name": "vscale_not_fixed",
+          "test_body": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(1,16)\ndefine <vscale x 4 x float> @vscale_not_fixed(<vscale x 4 x float> %.coerce) #0 {",
+          "source_program": "%struct.svfloat32_wrapped_t = type { <16 x float> }\n\n; Function Attrs: vscale_range(1,16)\ndefine <vscale x 4 x float> @vscale_not_fixed(<vscale x 4 x float> %.coerce) #0 {\nentry:\n  %retval = alloca %struct.svfloat32_wrapped_t, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <16 x float>, ptr %retval, align 64\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

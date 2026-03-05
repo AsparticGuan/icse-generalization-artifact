@@ -1,0 +1,196 @@
+{
+  "pr_number": 139109,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/139109",
+  "title": "[InstCombine] Introduce `foldICmpBinOpWithConstantViaTruthTable` folding",
+  "commit_sha": "1bfd94b1b90d57beeecea587bfee1a325ee4a1eb",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        [
+          1966,
+          1995
+        ],
+        [
+          3110,
+          3115
+        ],
+        [
+          4014,
+          4020
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          736,
+          741
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+        "InstCombinerImpl::foldICmpAndConstant",
+        "InstCombinerImpl::foldICmpBinOpWithConstant",
+        "createLogicFromTable"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 252781e54ab06..00b0f05f18f03 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -1966,30 +1966,6 @@ Instruction *InstCombinerImpl::foldICmpAndConstant(ICmpInst &Cmp,\n     return new ICmpInst(NewPred, X, SubOne(cast<Constant>(Cmp.getOperand(1))));\n   }\n \n-  // If we are testing the intersection of 2 select-of-nonzero-constants with no\n-  // common bits set, it's the same as checking if exactly one select condition\n-  // is set:\n-  // ((A ? TC : FC) & (B ? TC : FC)) == 0 --> xor A, B\n-  // ((A ? TC : FC) & (B ? TC : FC)) != 0 --> not(xor A, B)\n-  // TODO: Generalize for non-constant values.\n-  // TODO: Handle signed/unsigned predicates.\n-  // TODO: Handle other bitwise logic connectors.\n-  // TODO: Extend to handle a non-zero compare constant.\n-  if (C.isZero() && (Pred == CmpInst::ICMP_EQ || And->hasOneUse())) {\n-    assert(Cmp.isEquality() && \"Not expecting non-equality predicates\");\n-    Value *A, *B;\n-    const APInt *TC, *FC;\n-    if (match(X, m_Select(m_Value(A), m_APInt(TC), m_APInt(FC))) &&\n-        match(Y,\n-              m_Select(m_Value(B), m_SpecificInt(*TC), m_SpecificInt(*FC))) &&\n-        !TC->isZero() && !FC->isZero() && !TC->intersects(*FC)) {\n-      Value *R = Builder.CreateXor(A, B);\n-      if (Pred == CmpInst::ICMP_NE)\n-        R = Builder.CreateNot(R);\n-      return replaceInstUsesWith(Cmp, R);\n-    }\n-  }\n-\n   // ((zext i1 X) & Y) == 0 --> !((trunc Y) & X)\n   // ((zext i1 X) & Y) != 0 -->  ((trunc Y) & X)\n   // ((zext i1 X) & Y) == 1 -->  ((trunc Y) & X)\n@@ -3110,6 +3086,44 @@ static Value *createLogicFromTable(const std::bitset<4> &Table, Value *Op0,\n   return nullptr;\n }\n \n+Instruction *InstCombinerImpl::foldICmpBinOpWithConstantViaTruthTable(\n+    ICmpInst &Cmp, BinaryOperator *BO, const APInt &C) {\n+  Value *A, *B;\n+  Constant *C1, *C2, *C3, *C4;\n+  if (!(match(BO->getOperand(0),\n+              m_Select(m_Value(A), m_Constant(C1), m_Constant(C2)))) ||\n+      !match(BO->getOperand(1),\n+             m_Select(m_Value(B), m_Constant(C3), m_Constant(C4))) ||\n+      Cmp.getType() != A->getType())\n+    return nullptr;\n+\n+  std::bitset<4> Table;\n+  auto ComputeTable = [&](bool First, bool Second) -> std::optional<bool> {\n+    Constant *L = First ? C1 : C2;\n+    Constant *R = Second ? C3 : C4;\n+    if (auto *Res = ConstantFoldBinaryOpOperands(BO->getOpcode(), L, R, DL)) {\n+      auto *Val = Res->getType()->isVectorTy() ? Res->getSplatValue() : Res;\n+      if (auto *CI = dyn_cast_or_null<ConstantInt>(Val))\n+        return ICmpInst::compare(CI->getValue(), C, Cmp.getPredicate());\n+    }\n+    return std::nullopt;\n+  };\n+\n+  for (unsigned I = 0; I < 4; ++I) {\n+    bool First = (I >> 1) & 1;\n+    bool Second = I & 1;\n+    if (auto Res = ComputeTable(First, Second))\n+      Table[I] = *Res;\n+    else\n+      return nullptr;\n+  }\n+\n+  // Synthesize optimal logic.\n+  if (auto *Cond = createLogicFromTable(Table, A, B, Builder, BO->hasOneUse()))\n+    return replaceInstUsesWith(Cmp, Cond);\n+  return nullptr;\n+}\n+\n /// Fold icmp (add X, Y), C.\n Instruction *InstCombinerImpl::foldICmpAddConstant(ICmpInst &Cmp,\n                                                    BinaryOperator *Add,\n@@ -4014,7 +4028,13 @@ Instruction *InstCombinerImpl::foldICmpBinOpWithConstant(ICmpInst &Cmp,\n   }\n \n   // TODO: These folds could be refactored to be part of the above calls.\n-  return foldICmpBinOpEqualityWithConstant(Cmp, BO, C);\n+  if (Instruction *I = foldICmpBinOpEqualityWithConstant(Cmp, BO, C))\n+    return I;\n+\n+  // Fall back to handling `icmp pred (select A ? C1 : C2) binop (select B ? C3\n+  // : C4), C5` pattern, by computing a truth table of the four constant\n+  // variants.\n+  return foldICmpBinOpWithConstantViaTruthTable(Cmp, BO, C);\n }\n \n static Instruction *\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 324738ef8c88e..8b657b3f8555c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -736,6 +736,9 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   Instruction *foldICmpShlConstConst(ICmpInst &I, Value *ShAmt, const APInt &C1,\n                                      const APInt &C2);\n \n+  Instruction *foldICmpBinOpWithConstantViaTruthTable(ICmpInst &Cmp,\n+                                                      BinaryOperator *BO,\n+                                                      const APInt &C);\n   Instruction *foldICmpBinOpEqualityWithConstant(ICmpInst &Cmp,\n                                                  BinaryOperator *BO,\n                                                  const APInt &C);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/icmp-binop.ll b/llvm/test/Transforms/InstCombine/icmp-binop.ll\nindex 356489716fff9..161b290151e5a 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-binop.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-binop.ll\n@@ -359,3 +359,131 @@ define i1 @test_icmp_sgt_and_negpow2_invalid_c(i32 %add) {\n   %cmp = icmp sgt i32 %and, 48\n   ret i1 %cmp\n }\n+\n+define i1 @icmp_eq_or_of_selects_with_constant(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant(\n+; CHECK-NEXT:    [[CMP:%.*]] = and i1 [[A:%.*]], [[B:%.*]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %s1 = select i1 %a, i64 65536, i64 0\n+  %s2 = select i1 %b, i64 256, i64 0\n+  %or = or i64 %s1, %s2\n+  %cmp = icmp eq i64 %or, 65792\n+  ret i1 %cmp\n+}\n+\n+define i1 @icmp_slt_and_of_selects_with_constant(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_slt_and_of_selects_with_constant(\n+; CHECK-NEXT:    [[TMP1:%.*]] = or i1 [[A:%.*]], [[B:%.*]]\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[TMP1]], true\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %s1 = select i1 %a, i8 1, i8 254\n+  %s2 = select i1 %b, i8 1, i8 253\n+  %and = and i8 %s1, %s2\n+  %cmp = icmp slt i8 %and, 254\n+  ret i1 %cmp\n+}\n+\n+define i1 @icmp_sge_add_of_selects_with_constant(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_sge_add_of_selects_with_constant(\n+; CHECK-NEXT:    ret i1 true\n+;\n+  %s1 = select i1 %a, i8 248, i8 7\n+  %s2 = select i1 %b, i8 16, i8 0\n+  %add = add i8 %s1, %s2\n+  %cmp = icmp sge i8 %add, 247\n+  ret i1 %cmp\n+}\n+\n+define i1 @icmp_eq_or_of_selects_with_constant_multiuse_foldable(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_multiuse_foldable(\n+; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 65536, i64 0\n+; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 256, i64 0\n+; CHECK-NEXT:    [[OR:%.*]] = or disjoint i64 [[S1]], [[S2]]\n+; CHECK-NEXT:    call void @use64(i64 [[OR]])\n+; CHECK-NEXT:    [[CMP:%.*]] = and i1 [[A]], [[B]]\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %s1 = select i1 %a, i64 65536, i64 0\n+  %s2 = select i1 %b, i64 256, i64 0\n+  %or = or i64 %s1, %s2\n+  call void @use64(i64 %or)\n+  %cmp = icmp eq i64 %or, 65792\n+  ret i1 %cmp\n+}\n+\n+define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized(<2 x i1> %a, <2 x i1> %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_vectorized(\n+; CHECK-NEXT:    [[CMP:%.*]] = and <2 x i1> [[A:%.*]], [[B:%.*]]\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n+  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n+  %or = or <2 x i64> %s1, %s2\n+  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n+  ret <2 x i1> %cmp\n+}\n+\n+define <2 x i1> @icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized(\n+; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n+; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], <2 x i64> splat (i64 256), <2 x i64> zeroinitializer\n+; CHECK-NEXT:    [[OR:%.*]] = or disjoint <2 x i64> [[S1]], [[S2]]\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i64> [[OR]], splat (i64 65792)\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %s1 = select i1 %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n+  %s2 = select i1 %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n+  %or  = or <2 x i64> %s1, %s2\n+  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n+  ret <2 x i1> %cmp\n+}\n+\n+; Negative tests.\n+define i1 @icmp_eq_or_of_selects_with_constant_and_arg(i1 %a, i1 %b, i64 %arg) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_and_arg(\n+; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 65536, i64 [[ARG:%.*]]\n+; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 256, i64 0\n+; CHECK-NEXT:    [[OR:%.*]] = or i64 [[S1]], [[S2]]\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %s1 = select i1 %a, i64 65536, i64 %arg\n+  %s2 = select i1 %b, i64 256, i64 0\n+  %or = or i64 %s1, %s2\n+  %cmp = icmp eq i64 %or, 65792\n+  ret i1 %cmp\n+}\n+\n+define i1 @icmp_eq_or_of_selects_with_constant_multiuse(i1 %a, i1 %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_multiuse(\n+; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 0, i64 65536\n+; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 0, i64 256\n+; CHECK-NEXT:    [[OR:%.*]] = or disjoint i64 [[S1]], [[S2]]\n+; CHECK-NEXT:    call void @use64(i64 [[OR]])\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n+; CHECK-NEXT:    ret i1 [[CMP]]\n+;\n+  %s1 = select i1 %a, i64 0, i64 65536\n+  %s2 = select i1 %b, i64 0, i64 256\n+  %or = or i64 %s1, %s2\n+  call void @use64(i64 %or)\n+  %cmp = icmp eq i64 %or, 65792\n+  ret i1 %cmp\n+}\n+\n+define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(<2 x i1> %a, <2 x i1> %b) {\n+; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(\n+; CHECK-NEXT:    [[S1:%.*]] = select <2 x i1> [[A:%.*]], <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n+; CHECK-NEXT:    [[S2:%.*]] = select <2 x i1> [[B:%.*]], <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n+; CHECK-NEXT:    [[OR:%.*]] = or disjoint <2 x i64> [[S1]], [[S2]]\n+; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i64> [[OR]], <i64 65792, i64 65664>\n+; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n+;\n+  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n+  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n+  %or = or <2 x i64> %s1, %s2\n+  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65664>\n+  ret <2 x i1> %cmp\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/icmp-select.ll b/llvm/test/Transforms/InstCombine/icmp-select.ll\nindex 1aae91302dab1..a038731abbc48 100644\n--- a/llvm/test/Transforms/InstCombine/icmp-select.ll\n+++ b/llvm/test/Transforms/InstCombine/icmp-select.ll\n@@ -328,10 +328,7 @@ define i1 @select_constants_and_icmp_eq0_common_bit(i1 %x, i1 %y) {\n \n define i1 @select_constants_and_icmp_eq0_no_common_op1(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_eq0_no_common_op1(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 24, i8 3\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 0\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[X:%.*]], [[Y:%.*]]\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 16, i8 3\n@@ -345,10 +342,7 @@ define i1 @select_constants_and_icmp_eq0_no_common_op1(i1 %x, i1 %y) {\n \n define i1 @select_constants_and_icmp_eq0_no_common_op2(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_eq0_no_common_op2(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 16, i8 7\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 0\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[X:%.*]], [[Y:%.*]]\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 16, i8 3\n@@ -387,14 +381,9 @@ define i1 @select_constants_and_icmp_eq0_zero_fval(i1 %x, i1 %y) {\n   ret i1 %cmp\n }\n \n-; TODO: x & y\n-\n define i1 @select_constants_and_icmp_eq_tval(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_eq_tval(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 6, i8 1\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 6, i8 1\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 6\n+; CHECK-NEXT:    [[CMP:%.*]] = and i1 [[X:%.*]], [[Y:%.*]]\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 6, i8 1\n@@ -404,14 +393,10 @@ define i1 @select_constants_and_icmp_eq_tval(i1 %x, i1 %y) {\n   ret i1 %cmp\n }\n \n-; TODO: ~(x | y)\n-\n define i1 @select_constants_and_icmp_eq_fval(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_eq_fval(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 12, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 12, i8 3\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 3\n+; CHECK-NEXT:    [[TMP1:%.*]] = or i1 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[TMP1]], true\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 12, i8 3\n@@ -512,10 +497,8 @@ define i1 @select_constants_and_icmp_ne0_common_bit(i1 %x, i1 %y) {\n \n define i1 @select_constants_and_icmp_ne0_no_common_op1(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_ne0_no_common_op1(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 24, i8 3\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 0\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i1 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[TMP1]], true\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 16, i8 3\n@@ -529,10 +512,8 @@ define i1 @select_constants_and_icmp_ne0_no_common_op1(i1 %x, i1 %y) {\n \n define i1 @select_constants_and_icmp_ne0_no_common_op2(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_ne0_no_common_op2(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 16, i8 7\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 0\n+; CHECK-NEXT:    [[TMP1:%.*]] = xor i1 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[TMP1]], true\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 16, i8 3\n@@ -571,14 +552,10 @@ define i1 @select_constants_and_icmp_ne0_zero_fval(i1 %x, i1 %y) {\n   ret i1 %cmp\n }\n \n-; TODO: ~(x & y)\n-\n define i1 @select_constants_and_icmp_ne_tval(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_ne_tval(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 6, i8 1\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 6, i8 1\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 6\n+; CHECK-NEXT:    [[TMP1:%.*]] = and i1 [[X:%.*]], [[Y:%.*]]\n+; CHECK-NEXT:    [[CMP:%.*]] = xor i1 [[TMP1]], true\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 6, i8 1\n@@ -588,14 +565,9 @@ define i1 @select_constants_and_icmp_ne_tval(i1 %x, i1 %y) {\n   ret i1 %cmp\n }\n \n-; TODO: (x | y)\n-\n define i1 @select_constants_and_icmp_ne_fval(i1 %x, i1 %y) {\n ; CHECK-LABEL: @select_constants_and_icmp_ne_fval(\n-; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 12, i8 3\n-; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 12, i8 3\n-; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 3\n+; CHECK-NEXT:    [[CMP:%.*]] = or i1 [[X:%.*]], [[Y:%.*]]\n ; CHECK-NEXT:    ret i1 [[CMP]]\n ;\n   %s1 = select i1 %x, i8 12, i8 3\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/icmp-binop.ll",
+    "llvm/test/Transforms/InstCombine/icmp-select.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-binop.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant",
+          "test_body": "define i1 @icmp_eq_or_of_selects_with_constant(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 65536, i64 0\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 256, i64 0\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint i64 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i64 65536, i64 0\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @icmp_eq_or_of_selects_with_constant(i1 %a, i1 %b) {\n  %s1 = select i1 %a, i64 65536, i64 0\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_and_arg",
+          "test_body": "define i1 @icmp_eq_or_of_selects_with_constant_and_arg(i1 %a, i1 %b, i64 %arg) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_and_arg(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 65536, i64 [[ARG:%.*]]\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 256, i64 0\n; CHECK-NEXT:    [[OR:%.*]] = or i64 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i64 65536, i64 %arg\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @icmp_eq_or_of_selects_with_constant_and_arg(i1 %a, i1 %b, i64 %arg) {\n  %s1 = select i1 %a, i64 65536, i64 %arg\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_multiuse",
+          "test_body": "declare void @use64(i64)\n\ndefine i1 @icmp_eq_or_of_selects_with_constant_multiuse(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_multiuse(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 0, i64 65536\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 0, i64 256\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint i64 [[S1]], [[S2]]\n; CHECK-NEXT:    call void @use64(i64 [[OR]])\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i64 0, i64 65536\n  %s2 = select i1 %b, i64 0, i64 256\n  %or = or i64 %s1, %s2\n  call void @use64(i64 %or)\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}",
+          "source_program": "declare void @use64(i64)\n\ndefine i1 @icmp_eq_or_of_selects_with_constant_multiuse(i1 %a, i1 %b) {\n  %s1 = select i1 %a, i64 0, i64 65536\n  %s2 = select i1 %b, i64 0, i64 256\n  %or = or i64 %s1, %s2\n  call void @use64(i64 %or)\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_multiuse_foldable",
+          "test_body": "declare void @use64(i64)\n\ndefine i1 @icmp_eq_or_of_selects_with_constant_multiuse_foldable(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_multiuse_foldable(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i64 65536, i64 0\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i64 256, i64 0\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint i64 [[S1]], [[S2]]\n; CHECK-NEXT:    call void @use64(i64 [[OR]])\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[OR]], 65792\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i64 65536, i64 0\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  call void @use64(i64 %or)\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}",
+          "source_program": "declare void @use64(i64)\n\ndefine i1 @icmp_eq_or_of_selects_with_constant_multiuse_foldable(i1 %a, i1 %b) {\n  %s1 = select i1 %a, i64 65536, i64 0\n  %s2 = select i1 %b, i64 256, i64 0\n  %or = or i64 %s1, %s2\n  call void @use64(i64 %or)\n  %cmp = icmp eq i64 %or, 65792\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_vectorized",
+          "test_body": "define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized(<2 x i1> %a, <2 x i1> %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_vectorized(\n; CHECK-NEXT:    [[S1:%.*]] = select <2 x i1> [[A:%.*]], <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[S2:%.*]] = select <2 x i1> [[B:%.*]], <2 x i64> splat (i64 256), <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint <2 x i64> [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i64> [[OR]], splat (i64 65792)\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized(<2 x i1> %a, <2 x i1> %b) {\n  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_vectorized_nonsplat",
+          "test_body": "define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(<2 x i1> %a, <2 x i1> %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(\n; CHECK-NEXT:    [[S1:%.*]] = select <2 x i1> [[A:%.*]], <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[S2:%.*]] = select <2 x i1> [[B:%.*]], <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint <2 x i64> [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i64> [[OR]], <i64 65792, i64 65664>\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65664>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(<2 x i1> %a, <2 x i1> %b) {\n  %s1 = select <2 x i1> %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65664>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized",
+          "test_body": "define <2 x i1> @icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], <2 x i64> splat (i64 256), <2 x i64> zeroinitializer\n; CHECK-NEXT:    [[OR:%.*]] = or disjoint <2 x i64> [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq <2 x i64> [[OR]], splat (i64 65792)\n; CHECK-NEXT:    ret <2 x i1> [[CMP]]\n  %s1 = select i1 %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select i1 %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n  ret <2 x i1> %cmp\n}",
+          "source_program": "define <2 x i1> @icmp_eq_or_of_selects_with_scalar_cond_constant_vectorized(i1 %a, i1 %b) {\n  %s1 = select i1 %a, <2 x i64> <i64 65536, i64 65536>, <2 x i64> zeroinitializer\n  %s2 = select i1 %b, <2 x i64> <i64 256, i64 256>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65792>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_sge_add_of_selects_with_constant",
+          "test_body": "define i1 @icmp_sge_add_of_selects_with_constant(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_sge_add_of_selects_with_constant(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i8 -8, i8 7\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i8 16, i8 0\n; CHECK-NEXT:    [[ADD:%.*]] = add nsw i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[ADD]], -10\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i8 -8, i8 7\n  %s2 = select i1 %b, i8 16, i8 0\n  %add = add i8 %s1, %s2\n  %cmp = icmp sge i8 %add, -9\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @icmp_sge_add_of_selects_with_constant(i1 %a, i1 %b) {\n  %s1 = select i1 %a, i8 -8, i8 7\n  %s2 = select i1 %b, i8 16, i8 0\n  %add = add i8 %s1, %s2\n  %cmp = icmp sge i8 %add, -9\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_and_of_selects_with_constant",
+          "test_body": "define i1 @icmp_slt_and_of_selects_with_constant(i1 %a, i1 %b) {\n; CHECK-LABEL: @icmp_slt_and_of_selects_with_constant(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[A:%.*]], i8 1, i8 -4\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[B:%.*]], i8 1, i8 -3\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[AND]], -2\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %a, i8 1, i8 -2\n  %s2 = select i1 %b, i8 1, i8 -3\n  %and = and i8 %s1, %s2\n  %cmp = icmp slt i8 %and, -2\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @icmp_slt_and_of_selects_with_constant(i1 %a, i1 %b) {\n  %s1 = select i1 %a, i8 1, i8 -2\n  %s2 = select i1 %b, i8 1, i8 -3\n  %and = and i8 %s1, %s2\n  %cmp = icmp slt i8 %and, -2\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_icmp_sgt_and_negpow2_invalid_c",
+          "test_body": "define i1 @test_icmp_sgt_and_negpow2_invalid_c(i32 %add) {\n; CHECK-LABEL: @test_icmp_sgt_and_negpow2_invalid_c(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[ADD:%.*]], -32\n; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[AND]], 48\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %and = and i32 %add, -32\n  %cmp = icmp sgt i32 %and, 48\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @test_icmp_sgt_and_negpow2_invalid_c(i32 %add) {\n  %and = and i32 %add, -32\n  %cmp = icmp sgt i32 %and, 48\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-select.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "select_constants_and_icmp_eq0_common_bit",
+          "test_body": "define i1 @select_constants_and_icmp_eq0_common_bit(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq0_common_bit(\n; CHECK-NEXT:    ret i1 false\n  %s1 = select i1 %x, i8 2, i8 3\n  %s2 = select i1 %y, i8 2, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq0_common_bit(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 2, i8 3\n  %s2 = select i1 %y, i8 2, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_eq0_no_common_op1",
+          "test_body": "define i1 @select_constants_and_icmp_eq0_no_common_op1(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq0_no_common_op1(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 24, i8 3\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 24, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq0_no_common_op1(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 24, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_eq0_no_common_op2",
+          "test_body": "define i1 @select_constants_and_icmp_eq0_no_common_op2(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq0_no_common_op2(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 16, i8 7\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 16, i8 7\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq0_no_common_op2(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 16, i8 7\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_eq0_zero_fval",
+          "test_body": "define i1 @select_constants_and_icmp_eq0_zero_fval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq0_zero_fval(\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[X:%.*]], i1 [[Y:%.*]], i1 false\n; CHECK-NEXT:    [[NOT_:%.*]] = xor i1 [[TMP1]], true\n; CHECK-NEXT:    ret i1 [[NOT_]]\n  %s1 = select i1 %x, i8 12, i8 0\n  %s2 = select i1 %y, i8 12, i8 0\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq0_zero_fval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 12, i8 0\n  %s2 = select i1 %y, i8 12, i8 0\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_eq_fval",
+          "test_body": "define i1 @select_constants_and_icmp_eq_fval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq_fval(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 12, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 12, i8 3\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 3\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 12, i8 3\n  %s2 = select i1 %y, i8 12, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 3\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq_fval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 12, i8 3\n  %s2 = select i1 %y, i8 12, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 3\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_eq_tval",
+          "test_body": "define i1 @select_constants_and_icmp_eq_tval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_eq_tval(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 6, i8 1\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 6, i8 1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i8 [[AND]], 6\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 6, i8 1\n  %s2 = select i1 %y, i8 6, i8 1\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 6\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_eq_tval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 6, i8 1\n  %s2 = select i1 %y, i8 6, i8 1\n  %and = and i8 %s1, %s2\n  %cmp = icmp eq i8 %and, 6\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne0_common_bit",
+          "test_body": "define i1 @select_constants_and_icmp_ne0_common_bit(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne0_common_bit(\n; CHECK-NEXT:    ret i1 true\n  %s1 = select i1 %x, i8 2, i8 3\n  %s2 = select i1 %y, i8 2, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne0_common_bit(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 2, i8 3\n  %s2 = select i1 %y, i8 2, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne0_no_common_op1",
+          "test_body": "define i1 @select_constants_and_icmp_ne0_no_common_op1(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne0_no_common_op1(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 24, i8 3\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 24, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne0_no_common_op1(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 24, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne0_no_common_op2",
+          "test_body": "define i1 @select_constants_and_icmp_ne0_no_common_op2(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne0_no_common_op2(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 16, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 16, i8 7\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 0\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 16, i8 7\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne0_no_common_op2(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 16, i8 3\n  %s2 = select i1 %y, i8 16, i8 7\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne0_zero_fval",
+          "test_body": "define i1 @select_constants_and_icmp_ne0_zero_fval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne0_zero_fval(\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[X:%.*]], i1 [[Y:%.*]], i1 false\n; CHECK-NEXT:    ret i1 [[TMP1]]\n  %s1 = select i1 %x, i8 12, i8 0\n  %s2 = select i1 %y, i8 12, i8 0\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne0_zero_fval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 12, i8 0\n  %s2 = select i1 %y, i8 12, i8 0\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 0\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne_fval",
+          "test_body": "define i1 @select_constants_and_icmp_ne_fval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne_fval(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 12, i8 3\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 12, i8 3\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 3\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 12, i8 3\n  %s2 = select i1 %y, i8 12, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 3\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne_fval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 12, i8 3\n  %s2 = select i1 %y, i8 12, i8 3\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 3\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "select_constants_and_icmp_ne_tval",
+          "test_body": "define i1 @select_constants_and_icmp_ne_tval(i1 %x, i1 %y) {\n; CHECK-LABEL: @select_constants_and_icmp_ne_tval(\n; CHECK-NEXT:    [[S1:%.*]] = select i1 [[X:%.*]], i8 6, i8 1\n; CHECK-NEXT:    [[S2:%.*]] = select i1 [[Y:%.*]], i8 6, i8 1\n; CHECK-NEXT:    [[AND:%.*]] = and i8 [[S1]], [[S2]]\n; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i8 [[AND]], 6\n; CHECK-NEXT:    ret i1 [[CMP]]\n  %s1 = select i1 %x, i8 6, i8 1\n  %s2 = select i1 %y, i8 6, i8 1\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 6\n  ret i1 %cmp\n}",
+          "source_program": "define i1 @select_constants_and_icmp_ne_tval(i1 %x, i1 %y) {\n  %s1 = select i1 %x, i8 6, i8 1\n  %s2 = select i1 %y, i8 6, i8 1\n  %and = and i8 %s1, %s2\n  %cmp = icmp ne i8 %and, 6\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

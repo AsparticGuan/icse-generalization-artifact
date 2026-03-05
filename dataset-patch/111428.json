@@ -1,0 +1,229 @@
+{
+  "pr_number": 111428,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/111428",
+  "title": "[InstCombine] Convert @log to @llvm.log if the input is known positive.",
+  "commit_sha": "1268da307d2d0fb147898997a03f6fb349143fd1",
+  "components": [
+    "SimplifyLibCalls"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "SimplifyLibCalls"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        [
+          2510,
+          2529
+        ],
+        [
+          2589,
+          2598
+        ],
+        [
+          2604,
+          2612
+        ],
+        [
+          2655,
+          2661
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        "LibCallSimplifier::optimizeLog"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\nindex 347e4d62244c8..5f902eec2899d 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n@@ -2510,20 +2510,15 @@ Value *LibCallSimplifier::optimizeLog(CallInst *Log, IRBuilderBase &B) {\n   Intrinsic::ID LogID = LogFn->getIntrinsicID();\n   Module *Mod = Log->getModule();\n   Type *Ty = Log->getType();\n-  Value *Ret = nullptr;\n \n   if (UnsafeFPShrink && hasFloatVersion(Mod, LogNm))\n-    Ret = optimizeUnaryDoubleFP(Log, B, TLI, true);\n-\n-  // The earlier call must also be 'fast' in order to do these transforms.\n-  CallInst *Arg = dyn_cast<CallInst>(Log->getArgOperand(0));\n-  if (!Log->isFast() || !Arg || !Arg->isFast() || !Arg->hasOneUse())\n-    return Ret;\n+    if (Value *Ret = optimizeUnaryDoubleFP(Log, B, TLI, true))\n+      return Ret;\n \n   LibFunc LogLb, ExpLb, Exp2Lb, Exp10Lb, PowLb;\n \n   // This is only applicable to log(), log2(), log10().\n-  if (TLI->getLibFunc(LogNm, LogLb))\n+  if (TLI->getLibFunc(LogNm, LogLb)) {\n     switch (LogLb) {\n     case LibFunc_logf:\n       LogID = Intrinsic::log;\n@@ -2589,10 +2584,28 @@ Value *LibCallSimplifier::optimizeLog(CallInst *Log, IRBuilderBase &B) {\n       PowLb = LibFunc_powl;\n       break;\n     default:\n-      return Ret;\n+      return nullptr;\n+    }\n+\n+    // Convert libcall to intrinsic if the value is known > 0.\n+    bool IsKnownNoErrno = Log->hasNoNaNs() && Log->hasNoInfs();\n+    if (!IsKnownNoErrno) {\n+      SimplifyQuery SQ(DL, TLI, DT, AC, Log, true, true, DC);\n+      KnownFPClass Known = computeKnownFPClass(\n+          Log->getOperand(0),\n+          KnownFPClass::OrderedLessThanZeroMask | fcSubnormal,\n+          /*Depth=*/0, SQ);\n+      Function *F = Log->getParent()->getParent();\n+      IsKnownNoErrno = Known.cannotBeOrderedLessThanZero() &&\n+                       Known.isKnownNeverLogicalZero(*F, Ty);\n+    }\n+    if (IsKnownNoErrno) {\n+      auto *NewLog = B.CreateUnaryIntrinsic(LogID, Log->getArgOperand(0), Log);\n+      NewLog->copyMetadata(*Log);\n+      return copyFlags(*Log, NewLog);\n     }\n-  else if (LogID == Intrinsic::log || LogID == Intrinsic::log2 ||\n-           LogID == Intrinsic::log10) {\n+  } else if (LogID == Intrinsic::log || LogID == Intrinsic::log2 ||\n+             LogID == Intrinsic::log10) {\n     if (Ty->getScalarType()->isFloatTy()) {\n       ExpLb = LibFunc_expf;\n       Exp2Lb = LibFunc_exp2f;\n@@ -2604,9 +2617,14 @@ Value *LibCallSimplifier::optimizeLog(CallInst *Log, IRBuilderBase &B) {\n       Exp10Lb = LibFunc_exp10;\n       PowLb = LibFunc_pow;\n     } else\n-      return Ret;\n+      return nullptr;\n   } else\n-    return Ret;\n+    return nullptr;\n+\n+  // The earlier call must also be 'fast' in order to do these transforms.\n+  CallInst *Arg = dyn_cast<CallInst>(Log->getArgOperand(0));\n+  if (!Log->isFast() || !Arg || !Arg->isFast() || !Arg->hasOneUse())\n+    return nullptr;\n \n   IRBuilderBase::FastMathFlagGuard Guard(B);\n   B.setFastMathFlags(FastMathFlags::getFast());\n@@ -2655,7 +2673,7 @@ Value *LibCallSimplifier::optimizeLog(CallInst *Log, IRBuilderBase &B) {\n     return MulY;\n   }\n \n-  return Ret;\n+  return nullptr;\n }\n \n // sqrt(exp(X)) -> exp(X * 0.5)\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/double-float-shrink-1.ll b/llvm/test/Transforms/InstCombine/double-float-shrink-1.ll\nindex 85c9a01e5faba..c13a01bb9d489 100644\n--- a/llvm/test/Transforms/InstCombine/double-float-shrink-1.ll\n+++ b/llvm/test/Transforms/InstCombine/double-float-shrink-1.ll\n@@ -249,10 +249,10 @@ define double @exp10_test2(float %f)   {\n \n define float @log_test1(float %f)   {\n ; CHECK-LABEL: @log_test1(\n-; LINUX-NEXT:    [[LOGF:%.*]] = call fast float @logf(float [[F:%.*]])\n+; LINUX-NEXT:    [[LOGF:%.*]] = call fast float @llvm.log.f32(float [[F:%.*]])\n ; LINUX-NEXT:    ret float [[LOGF]]\n-; MS32:          [[LOGF:%.*]] = call fast double @log(double [[F:%.*]])\n-; MS64-NEXT:     [[LOGF:%.*]] = call fast float @logf(float [[F:%.*]])\n+; MS32:          [[LOGF:%.*]] = call fast double @llvm.log.f64(double [[F:%.*]])\n+; MS64-NEXT:     [[LOGF:%.*]] = call fast float @llvm.log.f32(float [[F:%.*]])\n ;\n   %conv = fpext float %f to double\n   %call = call fast double @log(double %conv)\n@@ -263,7 +263,7 @@ define float @log_test1(float %f)   {\n define double @log_test2(float %f)   {\n ; CHECK-LABEL: @log_test2(\n ; CHECK-NEXT:    [[CONV:%.*]] = fpext float [[F:%.*]] to double\n-; CHECK-NEXT:    [[CALL:%.*]] = call fast double @log(double [[CONV]])\n+; CHECK-NEXT:    [[CALL:%.*]] = call fast double @llvm.log.f64(double [[CONV]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ;\n   %conv = fpext float %f to double\n@@ -273,10 +273,10 @@ define double @log_test2(float %f)   {\n \n define float @log10_test1(float %f)   {\n ; CHECK-LABEL: @log10_test1(\n-; LINUX-NEXT:    [[LOG10F:%.*]] = call fast float @log10f(float [[F:%.*]])\n+; LINUX-NEXT:    [[LOG10F:%.*]] = call fast float @llvm.log10.f32(float [[F:%.*]])\n ; LINUX-NEXT:    ret float [[LOG10F]]\n-; MS32:          [[LOG10F:%.*]] = call fast double @log10(double [[F:%.*]])\n-; MS64-NEXT:     [[LOG10F:%.*]] = call fast float @log10f(float [[F:%.*]])\n+; MS32:          [[LOG10F:%.*]] = call fast double @llvm.log10.f64(double [[F:%.*]])\n+; MS64-NEXT:     [[LOG10F:%.*]] = call fast float @llvm.log10.f32(float [[F:%.*]])\n ;\n   %conv = fpext float %f to double\n   %call = call fast double @log10(double %conv)\n@@ -287,7 +287,7 @@ define float @log10_test1(float %f)   {\n define double @log10_test2(float %f) {\n ; CHECK-LABEL: @log10_test2(\n ; CHECK-NEXT:    [[CONV:%.*]] = fpext float [[F:%.*]] to double\n-; CHECK-NEXT:    [[CALL:%.*]] = call fast double @log10(double [[CONV]])\n+; CHECK-NEXT:    [[CALL:%.*]] = call fast double @llvm.log10.f64(double [[CONV]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ;\n   %conv = fpext float %f to double\n@@ -320,7 +320,7 @@ define double @log1p_test2(float %f)   {\n \n define float @log2_test1(float %f)   {\n ; CHECK-LABEL: @log2_test1(\n-; ISC99-NEXT:    [[LOG2F:%.*]] = call fast float @log2f(float [[F:%.*]])\n+; ISC99-NEXT:    [[LOG2F:%.*]] = call fast float @llvm.log2.f32(float [[F:%.*]])\n ; ISC99-NEXT:    ret float [[LOG2F]]\n ; ISC89:         [[LOG2F:%.*]] = call fast double @log2(double [[F:%.*]])\n ;\n@@ -333,7 +333,8 @@ define float @log2_test1(float %f)   {\n define double @log2_test2(float %f)   {\n ; CHECK-LABEL: @log2_test2(\n ; CHECK-NEXT:    [[CONV:%.*]] = fpext float [[F:%.*]] to double\n-; CHECK-NEXT:    [[CALL:%.*]] = call fast double @log2(double [[CONV]])\n+; ISC99-NEXT:    [[CALL:%.*]] = call fast double @llvm.log2.f64(double [[CONV]])\n+; ISC89-NEXT:    [[LOG2F:%.*]] = call fast double @log2(double [[F:%.*]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ;\n   %conv = fpext float %f to double\ndiff --git a/llvm/test/Transforms/InstCombine/log-pow.ll b/llvm/test/Transforms/InstCombine/log-pow.ll\nindex b628e7cc57f15..bfa636e470bb4 100644\n--- a/llvm/test/Transforms/InstCombine/log-pow.ll\n+++ b/llvm/test/Transforms/InstCombine/log-pow.ll\n@@ -73,7 +73,7 @@ define float @logf_powfi_nonconst(float %x, i32 %y) {\n define double @log_powi_not_fast(double %x, i32 %y) {\n ; CHECK-LABEL: @log_powi_not_fast(\n ; CHECK-NEXT:    [[POW:%.*]] = call double @llvm.powi.f64.i32(double [[X:%.*]], i32 [[Y:%.*]])\n-; CHECK-NEXT:    [[LOG:%.*]] = call fast double @log(double [[POW]])\n+; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[POW]])\n ; CHECK-NEXT:    ret double [[LOG]]\n ;\n   %pow = call double @llvm.powi.f64.i32(double %x, i32 %y)\n@@ -106,7 +106,7 @@ define <2 x double> @log2v_powv(<2 x double> %x, <2 x double> %y) {\n define double @log_pow_not_fast(double %x, double %y) {\n ; CHECK-LABEL: @log_pow_not_fast(\n ; CHECK-NEXT:    [[POW:%.*]] = call double @pow(double [[X:%.*]], double [[Y:%.*]])\n-; CHECK-NEXT:    [[LOG:%.*]] = call fast double @log(double [[POW]])\n+; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[POW]])\n ; CHECK-NEXT:    ret double [[LOG]]\n ;\n   %pow = call double @pow(double %x, double %y)\n@@ -158,7 +158,7 @@ define float @log2f_exp10f(float %x) {\n define double @log_exp2_not_fast(double %x) {\n ; CHECK-LABEL: @log_exp2_not_fast(\n ; CHECK-NEXT:    [[EXP:%.*]] = call double @exp2(double [[X:%.*]])\n-; CHECK-NEXT:    [[LOG:%.*]] = call fast double @log(double [[EXP]])\n+; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[EXP]])\n ; CHECK-NEXT:    ret double [[LOG]]\n ;\n   %exp = call double @exp2(double %x)\ndiff --git a/llvm/test/Transforms/InstCombine/log-to-intrinsic.ll b/llvm/test/Transforms/InstCombine/log-to-intrinsic.ll\nindex 6b397423b7959..273d44c091919 100644\n--- a/llvm/test/Transforms/InstCombine/log-to-intrinsic.ll\n+++ b/llvm/test/Transforms/InstCombine/log-to-intrinsic.ll\n@@ -8,7 +8,7 @@ define float @test_logf_pos(float %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call float @logf(float [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log.f32(float [[F]])\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret float 0.000000e+00\n@@ -32,7 +32,7 @@ define double @test_log_pos(double %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call double @log(double [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log.f64(double [[F]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret double 0.000000e+00\n@@ -56,7 +56,7 @@ define fp128 @test_logl_pos(fp128 %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @logl(fp128 [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log.f128(fp128 [[F]])\n ; CHECK-NEXT:    ret fp128 [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\n@@ -80,7 +80,7 @@ define float @test_log10f_pos(float %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call float @log10f(float [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log10.f32(float [[F]])\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret float 0.000000e+00\n@@ -104,7 +104,7 @@ define double @test_log10_pos(double %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call double @log10(double [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log10.f64(double [[F]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret double 0.000000e+00\n@@ -128,7 +128,7 @@ define fp128 @test_log10l_pos(fp128 %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @log10l(fp128 [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log10.f128(fp128 [[F]])\n ; CHECK-NEXT:    ret fp128 [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\n@@ -152,7 +152,7 @@ define float @test_log2f_pos(float %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call float @log2f(float [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log2.f32(float [[F]])\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret float 0.000000e+00\n@@ -176,7 +176,7 @@ define double @test_log2_pos(double %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call double @log2(double [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log2.f64(double [[F]])\n ; CHECK-NEXT:    ret double [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret double 0.000000e+00\n@@ -200,7 +200,7 @@ define fp128 @test_log2l_pos(fp128 %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @log2l(fp128 [[F]])\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log2.f128(fp128 [[F]])\n ; CHECK-NEXT:    ret fp128 [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\n@@ -273,7 +273,7 @@ define float @metadata(float %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n ; CHECK:       [[IF_END]]:\n-; CHECK-NEXT:    [[CALL:%.*]] = tail call float @logf(float [[F]]), !fpmath [[META0:![0-9]+]]\n+; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log.f32(float [[F]]), !fpmath [[META0:![0-9]+]]\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       [[RETURN]]:\n ; CHECK-NEXT:    ret float 0.000000e+00\n",
+  "source_files": [
+    "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/double-float-shrink-1.ll",
+    "llvm/test/Transforms/InstCombine/log-pow.ll",
+    "llvm/test/Transforms/InstCombine/log-to-intrinsic.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/double-float-shrink-1.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S -mtriple x86_64-unknown-linux-gnu",
+          "FileCheck %s --check-prefixes=CHECK,LINUX,ISC99,MS64,ISC89,MS32"
+        ],
+        [
+          "opt < %s -passes=instcombine -S -mtriple x86_64-pc-win32",
+          "FileCheck %s --check-prefixes=CHECK,LINUX,ISC99,MS64,ISC89,MS32"
+        ],
+        [
+          "opt < %s -passes=instcombine -S -mtriple x86_64-pc-windows-msvc16",
+          "FileCheck %s --check-prefixes=CHECK,LINUX,ISC99,MS64,ISC89,MS32"
+        ],
+        [
+          "opt < %s -passes=instcombine -S -mtriple i386-pc-windows-msvc",
+          "FileCheck %s --check-prefixes=CHECK,LINUX,ISC99,MS64,ISC89,MS32"
+        ],
+        [
+          "opt < %s -passes=instcombine -S -mtriple i686-pc-windows-msvc17",
+          "FileCheck %s --check-prefixes=CHECK,LINUX,ISC99,MS64,ISC89,MS32"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "exp10_test2",
+          "test_body": "define double @exp10_test2(float %f) {",
+          "source_program": "define double @exp10_test2(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @exp10(double %conv)\n  ret double %call\n}\n"
+        },
+        {
+          "test_name": "log10_test1",
+          "test_body": "define float @log10_test1(float %f) {",
+          "source_program": "define float @log10_test1(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log10(double %conv)\n  %conv1 = fptrunc double %call to float\n  ret float %conv1\n}\n"
+        },
+        {
+          "test_name": "log10_test2",
+          "test_body": "define double @log10_test2(float %f) {\n; CHECK-LABEL: @log10_test2(\n; CHECK-NEXT:    [[CONV:%.*]] = fpext float [[F:%.*]] to double\n; CHECK-NEXT:    [[CALL:%.*]] = call fast double @llvm.log10.f64(double [[CONV]])\n; CHECK-NEXT:    ret double [[CALL]]\n  %conv = fpext float %f to double\n  %call = call fast double @log10(double %conv)\n  ret double %call\n}",
+          "source_program": "define double @log10_test2(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log10(double %conv)\n  ret double %call\n}\n"
+        },
+        {
+          "test_name": "log1p_test2",
+          "test_body": "define double @log1p_test2(float %f) {",
+          "source_program": "define double @log1p_test2(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log1p(double %conv)\n  ret double %call\n}\n"
+        },
+        {
+          "test_name": "log2_test1",
+          "test_body": "define float @log2_test1(float %f) {",
+          "source_program": "define float @log2_test1(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log2(double %conv)\n  %conv1 = fptrunc double %call to float\n  ret float %conv1\n}\n"
+        },
+        {
+          "test_name": "log2_test2",
+          "test_body": "define double @log2_test2(float %f) {",
+          "source_program": "define double @log2_test2(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log2(double %conv)\n  ret double %call\n}\n"
+        },
+        {
+          "test_name": "log_test1",
+          "test_body": "define float @log_test1(float %f) {",
+          "source_program": "define float @log_test1(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log(double %conv)\n  %conv1 = fptrunc double %call to float\n  ret float %conv1\n}\n"
+        },
+        {
+          "test_name": "log_test2",
+          "test_body": "define double @log_test2(float %f) {",
+          "source_program": "define double @log_test2(float %f) {\n  %conv = fpext float %f to double\n  %call = call fast double @log(double %conv)\n  ret double %call\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/log-pow.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "log2f_exp10f",
+          "test_body": "define float @log2f_exp10f(float %x) {\n; CHECK-LABEL: @log2f_exp10f(\n; CHECK-NEXT:    [[MUL:%.*]] = fmul fast float [[X:%.*]], 0x400A934F00000000\n; CHECK-NEXT:    ret float [[MUL]]\n  %exp = call fast float @exp10f(float %x)\n  %log = call fast float @log2f(float %exp)\n  ret float %log\n}",
+          "source_program": "define float @log2f_exp10f(float %x) {\n  %exp = call fast float @exp10f(float %x)\n  %log = call fast float @log2f(float %exp)\n  ret float %log\n}\n"
+        },
+        {
+          "test_name": "log2v_powv",
+          "test_body": "define <2 x double> @log2v_powv(<2 x double> %x, <2 x double> %y) {\n; CHECK-LABEL: @log2v_powv(\n; CHECK-NEXT:    [[LOG1:%.*]] = call fast <2 x double> @llvm.log2.v2f64(<2 x double> [[X:%.*]])\n; CHECK-NEXT:    [[MUL:%.*]] = fmul fast <2 x double> [[Y:%.*]], [[LOG1]]\n; CHECK-NEXT:    ret <2 x double> [[MUL]]\n  %pow = call fast <2 x double> @llvm.pow.v2f64(<2 x double> %x, <2 x double> %y)\n  %log = call fast <2 x double> @llvm.log2.v2f64(<2 x double> %pow)\n  ret <2 x double> %log\n}",
+          "source_program": "define <2 x double> @log2v_powv(<2 x double> %x, <2 x double> %y) {\n  %pow = call fast <2 x double> @llvm.pow.v2f64(<2 x double> %x, <2 x double> %y)\n  %log = call fast <2 x double> @llvm.log2.v2f64(<2 x double> %pow)\n  ret <2 x double> %log\n}\n"
+        },
+        {
+          "test_name": "log_exp2_not_fast",
+          "test_body": "define double @log_exp2_not_fast(double %x) {\n; CHECK-LABEL: @log_exp2_not_fast(\n; CHECK-NEXT:    [[EXP:%.*]] = call double @exp2(double [[X:%.*]])\n; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[EXP]])\n; CHECK-NEXT:    ret double [[LOG]]\n  %exp = call double @exp2(double %x)\n  %log = call fast double @log(double %exp)\n  ret double %log\n}",
+          "source_program": "define double @log_exp2_not_fast(double %x) {\n  %exp = call double @exp2(double %x)\n  %log = call fast double @log(double %exp)\n  ret double %log\n}\n"
+        },
+        {
+          "test_name": "log_pow_not_fast",
+          "test_body": "define double @log_pow_not_fast(double %x, double %y) {\n; CHECK-LABEL: @log_pow_not_fast(\n; CHECK-NEXT:    [[POW:%.*]] = call double @pow(double [[X:%.*]], double [[Y:%.*]])\n; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[POW]])\n; CHECK-NEXT:    ret double [[LOG]]\n  %pow = call double @pow(double %x, double %y)\n  %log = call fast double @log(double %pow)\n  ret double %log\n}",
+          "source_program": "define double @log_pow_not_fast(double %x, double %y) {\n  %pow = call double @pow(double %x, double %y)\n  %log = call fast double @log(double %pow)\n  ret double %log\n}\n"
+        },
+        {
+          "test_name": "log_powi_not_fast",
+          "test_body": "define double @log_powi_not_fast(double %x, i32 %y) {\n; CHECK-LABEL: @log_powi_not_fast(\n; CHECK-NEXT:    [[POW:%.*]] = call double @llvm.powi.f64.i32(double [[X:%.*]], i32 [[Y:%.*]])\n; CHECK-NEXT:    [[LOG:%.*]] = call fast double @llvm.log.f64(double [[POW]])\n; CHECK-NEXT:    ret double [[LOG]]\n  %pow = call double @llvm.powi.f64.i32(double %x, i32 %y)\n  %log = call fast double @log(double %pow)\n  ret double %log\n}",
+          "source_program": "define double @log_powi_not_fast(double %x, i32 %y) {\n  %pow = call double @llvm.powi.f64.i32(double %x, i32 %y)\n  %log = call fast double @log(double %pow)\n  ret double %log\n}\n"
+        },
+        {
+          "test_name": "logf_powfi_nonconst",
+          "test_body": "define float @logf_powfi_nonconst(float %x, i32 %y) {\n; CHECK-LABEL: @logf_powfi_nonconst(\n; CHECK-NEXT:    [[LOG1:%.*]] = call fast float @llvm.log.f32(float [[X:%.*]])\n; CHECK-NEXT:    [[CAST:%.*]] = sitofp i32 [[Y:%.*]] to float\n; CHECK-NEXT:    [[MUL:%.*]] = fmul fast float [[LOG1]], [[CAST]]\n; CHECK-NEXT:    ret float [[MUL]]\n  %pow = call fast float @llvm.powi.f32.i32(float %x, i32 %y)\n  %log = call fast float @logf(float %pow)\n  ret float %log\n}",
+          "source_program": "define float @logf_powfi_nonconst(float %x, i32 %y) {\n  %pow = call fast float @llvm.powi.f32.i32(float %x, i32 %y)\n  %log = call fast float @logf(float %pow)\n  ret float %log\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/log-to-intrinsic.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "metadata",
+          "test_body": "define float @metadata(float %f) {\n; CHECK-LABEL: define float @metadata(\n; CHECK-SAME: float [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log.f32(float [[F]]), !fpmath [[META0:![0-9]+]]\n; CHECK-NEXT:    ret float [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret float 0.000000e+00\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @logf(float %f), !fpmath !0\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}",
+          "source_program": "define float @metadata(float %f) {\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @logf(float %f), !fpmath !0\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_log10_pos",
+          "test_body": "define double @test_log10_pos(double %f) {\n; CHECK-LABEL: define double @test_log10_pos(\n; CHECK-SAME: double [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log10.f64(double [[F]])\n; CHECK-NEXT:    ret double [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret double 0.000000e+00\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log10(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}",
+          "source_program": "define double @test_log10_pos(double %f) {\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log10(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_log10f_pos",
+          "test_body": "define float @test_log10f_pos(float %f) {\n; CHECK-LABEL: define float @test_log10f_pos(\n; CHECK-SAME: float [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log10.f32(float [[F]])\n; CHECK-NEXT:    ret float [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret float 0.000000e+00\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @log10f(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}",
+          "source_program": "define float @test_log10f_pos(float %f) {\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @log10f(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_log10l_pos",
+          "test_body": "define fp128 @test_log10l_pos(fp128 %f) {\n; CHECK-LABEL: define fp128 @test_log10l_pos(\n; CHECK-SAME: fp128 [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log10.f128(fp128 [[F]])\n; CHECK-NEXT:    ret fp128 [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @log10l(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}",
+          "source_program": "define fp128 @test_log10l_pos(fp128 %f) {\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @log10l(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}\n"
+        },
+        {
+          "test_name": "test_log2_pos",
+          "test_body": "define double @test_log2_pos(double %f) {\n; CHECK-LABEL: define double @test_log2_pos(\n; CHECK-SAME: double [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log2.f64(double [[F]])\n; CHECK-NEXT:    ret double [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret double 0.000000e+00\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log2(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}",
+          "source_program": "define double @test_log2_pos(double %f) {\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log2(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_log2f_pos",
+          "test_body": "define float @test_log2f_pos(float %f) {\n; CHECK-LABEL: define float @test_log2f_pos(\n; CHECK-SAME: float [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log2.f32(float [[F]])\n; CHECK-NEXT:    ret float [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret float 0.000000e+00\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @log2f(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}",
+          "source_program": "define float @test_log2f_pos(float %f) {\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @log2f(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_log2l_pos",
+          "test_body": "define fp128 @test_log2l_pos(fp128 %f) {\n; CHECK-LABEL: define fp128 @test_log2l_pos(\n; CHECK-SAME: fp128 [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log2.f128(fp128 [[F]])\n; CHECK-NEXT:    ret fp128 [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @log2l(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}",
+          "source_program": "define fp128 @test_log2l_pos(fp128 %f) {\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @log2l(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}\n"
+        },
+        {
+          "test_name": "test_log_pos",
+          "test_body": "define double @test_log_pos(double %f) {\n; CHECK-LABEL: define double @test_log_pos(\n; CHECK-SAME: double [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt double [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call double @llvm.log.f64(double [[F]])\n; CHECK-NEXT:    ret double [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret double 0.000000e+00\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}",
+          "source_program": "define double @test_log_pos(double %f) {\nentry:\n  %isinf = fcmp ole double %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call double @log(double %f)\n  ret double %call\n\nreturn:                                           ; preds = %entry\n  ret double 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_logf_pos",
+          "test_body": "define float @test_logf_pos(float %f) {\n; CHECK-LABEL: define float @test_logf_pos(\n; CHECK-SAME: float [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt float [[F]], 0.000000e+00\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call float @llvm.log.f32(float [[F]])\n; CHECK-NEXT:    ret float [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret float 0.000000e+00\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @logf(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}",
+          "source_program": "define float @test_logf_pos(float %f) {\nentry:\n  %isinf = fcmp ole float %f, 0.000000e+00\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @logf(float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n"
+        },
+        {
+          "test_name": "test_logl_pos",
+          "test_body": "define fp128 @test_logl_pos(fp128 %f) {\n; CHECK-LABEL: define fp128 @test_logl_pos(\n; CHECK-SAME: fp128 [[F:%.*]]) {\n; CHECK-NEXT:  [[ENTRY:.*:]]\n; CHECK-NEXT:    [[ISINF:%.*]] = fcmp ugt fp128 [[F]], 0xL00000000000000000000000000000000\n; CHECK-NEXT:    br i1 [[ISINF]], label %[[IF_END:.*]], label %[[RETURN:.*]]\n; CHECK:       [[IF_END]]:\n; CHECK-NEXT:    [[CALL:%.*]] = tail call fp128 @llvm.log.f128(fp128 [[F]])\n; CHECK-NEXT:    ret fp128 [[CALL]]\n; CHECK:       [[RETURN]]:\n; CHECK-NEXT:    ret fp128 0xL00000000000000000000000000000000\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @logl(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}",
+          "source_program": "define fp128 @test_logl_pos(fp128 %f) {\nentry:\n  %isinf = fcmp ole fp128 %f, 0xL00000000000000000000000000000000\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call fp128 @logl(fp128 %f)\n  ret fp128 %call\n\nreturn:                                           ; preds = %entry\n  ret fp128 0xL00000000000000000000000000000000\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

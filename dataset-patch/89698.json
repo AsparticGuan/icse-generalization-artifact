@@ -1,0 +1,89 @@
+{
+  "pr_number": 89698,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/89698",
+  "title": "[InstCombine] Fix miscompile in negation of select",
+  "commit_sha": "51967fe7e8e9668f3076b7db812193c1b2487c51",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          131,
+          137
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          8042,
+          8058
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        [
+          320,
+          326
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        "isKnownNonZero"
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "matchMinMax"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        "Negator::getSortedOperandsOfBinOp"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex a2fa8f6064e11..571e44cdac265 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -131,7 +131,8 @@ bool isKnownNonZero(const Value *V, const SimplifyQuery &Q, unsigned Depth = 0);\n /// Currently can recoginze Value pair:\n /// 1: <X, Y> if X = sub (0, Y) or Y = sub (0, X)\n /// 2: <X, Y> if X = sub (A, B) and Y = sub (B, A)\n-bool isKnownNegation(const Value *X, const Value *Y, bool NeedNSW = false);\n+bool isKnownNegation(const Value *X, const Value *Y, bool NeedNSW = false,\n+                     bool AllowPoison = true);\n \n /// Returns true if the give value is known to be non-negative.\n bool isKnownNonNegative(const Value *V, const SimplifyQuery &SQ,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 21e3f8a4cc52c..7501f78ca23b7 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -8042,17 +8042,27 @@ static SelectPatternResult matchMinMax(CmpInst::Predicate Pred,\n   return {SPF_UNKNOWN, SPNB_NA, false};\n }\n \n-bool llvm::isKnownNegation(const Value *X, const Value *Y, bool NeedNSW) {\n+bool llvm::isKnownNegation(const Value *X, const Value *Y, bool NeedNSW,\n+                           bool AllowPoison) {\n   assert(X && Y && \"Invalid operand\");\n \n-  // X = sub (0, Y) || X = sub nsw (0, Y)\n-  if ((!NeedNSW && match(X, m_Sub(m_ZeroInt(), m_Specific(Y)))) ||\n-      (NeedNSW && match(X, m_NSWNeg(m_Specific(Y)))))\n+  auto IsNegationOf = [&](const Value *X, const Value *Y) {\n+    if (!match(X, m_Neg(m_Specific(Y))))\n+      return false;\n+\n+    auto *BO = cast<BinaryOperator>(X);\n+    if (NeedNSW && !BO->hasNoSignedWrap())\n+      return false;\n+\n+    auto *Zero = cast<Constant>(BO->getOperand(0));\n+    if (!AllowPoison && !Zero->isNullValue())\n+      return false;\n+\n     return true;\n+  };\n \n-  // Y = sub (0, X) || Y = sub nsw (0, X)\n-  if ((!NeedNSW && match(Y, m_Sub(m_ZeroInt(), m_Specific(X)))) ||\n-      (NeedNSW && match(Y, m_NSWNeg(m_Specific(X)))))\n+  // X = -Y or Y = -X\n+  if (IsNegationOf(X, Y) || IsNegationOf(Y, X))\n     return true;\n \n   // X = sub (A, B), Y = sub (B, A) || X = sub nsw (A, B), Y = sub nsw (B, A)\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\nindex d697f361dec02..ed2a98ba4ae40 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n@@ -320,7 +320,8 @@ std::array<Value *, 2> Negator::getSortedOperandsOfBinOp(Instruction *I) {\n     return NegatedPHI;\n   }\n   case Instruction::Select: {\n-    if (isKnownNegation(I->getOperand(1), I->getOperand(2))) {\n+    if (isKnownNegation(I->getOperand(1), I->getOperand(2), /*NeedNSW=*/false,\n+                        /*AllowPoison=*/false)) {\n       // Of one hand of select is known to be negation of another hand,\n       // just swap the hands around.\n       auto *NewSelect = cast<SelectInst>(I->clone());\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/sub-of-negatible.ll b/llvm/test/Transforms/InstCombine/sub-of-negatible.ll\nindex 72fd7f7be2b04..b2e14ceaca1b0 100644\n--- a/llvm/test/Transforms/InstCombine/sub-of-negatible.ll\n+++ b/llvm/test/Transforms/InstCombine/sub-of-negatible.ll\n@@ -1385,12 +1385,12 @@ define i8 @dont_negate_ordinary_select(i8 %x, i8 %y, i8 %z, i1 %c) {\n   ret i8 %t1\n }\n \n-; FIXME: This is a miscompile.\n define <2 x i32> @negate_select_of_negation_poison(<2 x i1> %c, <2 x i32> %x) {\n ; CHECK-LABEL: @negate_select_of_negation_poison(\n ; CHECK-NEXT:    [[NEG:%.*]] = sub <2 x i32> <i32 0, i32 poison>, [[X:%.*]]\n-; CHECK-NEXT:    [[TMP1:%.*]] = select <2 x i1> [[C:%.*]], <2 x i32> [[X]], <2 x i32> [[NEG]]\n-; CHECK-NEXT:    ret <2 x i32> [[TMP1]]\n+; CHECK-NEXT:    [[SEL:%.*]] = select <2 x i1> [[C:%.*]], <2 x i32> [[NEG]], <2 x i32> [[X]]\n+; CHECK-NEXT:    [[NEG2:%.*]] = sub <2 x i32> zeroinitializer, [[SEL]]\n+; CHECK-NEXT:    ret <2 x i32> [[NEG2]]\n ;\n   %neg = sub <2 x i32> <i32 0, i32 poison>, %x\n   %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/ValueTracking.h",
+    "llvm/lib/Analysis/ValueTracking.cpp",
+    "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/sub-of-negatible.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/sub-of-negatible.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "dont_negate_ordinary_select",
+          "test_body": "define i8 @dont_negate_ordinary_select(i8 %x, i8 %y, i8 %z, i1 %c) {\n; CHECK-LABEL: @dont_negate_ordinary_select(\n; CHECK-NEXT:    [[T0:%.*]] = select i1 [[C:%.*]], i8 [[X:%.*]], i8 [[Y:%.*]]\n; CHECK-NEXT:    [[T1:%.*]] = sub i8 [[Z:%.*]], [[T0]]\n; CHECK-NEXT:    ret i8 [[T1]]\n  %t0 = select i1 %c, i8 %x, i8 %y\n  %t1 = sub i8 %z, %t0\n  ret i8 %t1\n}",
+          "source_program": "define i8 @dont_negate_ordinary_select(i8 %x, i8 %y, i8 %z, i1 %c) {\n  %t0 = select i1 %c, i8 %x, i8 %y\n  %t1 = sub i8 %z, %t0\n  ret i8 %t1\n}\n"
+        },
+        {
+          "test_name": "negate_select_of_negation_poison",
+          "test_body": "define <2 x i32> @negate_select_of_negation_poison(<2 x i1> %c, <2 x i32> %x) {\n; CHECK-LABEL: @negate_select_of_negation_poison(\n; CHECK-NEXT:    [[NEG:%.*]] = sub <2 x i32> <i32 0, i32 poison>, [[X:%.*]]\n; CHECK-NEXT:    [[SEL:%.*]] = select <2 x i1> [[C:%.*]], <2 x i32> [[NEG]], <2 x i32> [[X]]\n; CHECK-NEXT:    [[NEG2:%.*]] = sub <2 x i32> zeroinitializer, [[SEL]]\n; CHECK-NEXT:    ret <2 x i32> [[NEG2]]\n  %neg = sub <2 x i32> <i32 0, i32 poison>, %x\n  %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\n  %neg2 = sub <2 x i32> zeroinitializer, %sel\n  ret <2 x i32> %neg2\n}",
+          "source_program": "define <2 x i32> @negate_select_of_negation_poison(<2 x i1> %c, <2 x i32> %x) {\n  %neg = sub <2 x i32> <i32 0, i32 poison>, %x\n  %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\n  %neg2 = sub <2 x i32> zeroinitializer, %sel\n  ret <2 x i32> %neg2\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

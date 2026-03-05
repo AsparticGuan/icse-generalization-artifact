@@ -1,0 +1,183 @@
+{
+  "pr_number": 153623,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/153623",
+  "title": "[InstCombine] Make strlen optimization more resilient to different gep types.",
+  "commit_sha": "c5004b6d3547140235d17f40a26c8e8f3580e251",
+  "components": [
+    "SimplifyLibCalls",
+    "ValueTracking"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "SimplifyLibCalls",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          359,
+          369
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          6356,
+          6382
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        [
+          20,
+          25
+        ],
+        [
+          977,
+          984
+        ],
+        [
+          1000,
+          1009
+        ],
+        [
+          1011,
+          1017
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        "GetPointerBaseWithConstantOffset"
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "llvm::FindInsertedValue"
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        "LibCallSimplifier::optimizeStringLength"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex 02990a3cb44f7..15ff129deda13 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -359,11 +359,6 @@ GetPointerBaseWithConstantOffset(const Value *Ptr, int64_t &Offset,\n                                           AllowNonInbounds);\n }\n \n-/// Returns true if the GEP is based on a pointer to a string (array of\n-// \\p CharSize integers) and is indexing into this string.\n-LLVM_ABI bool isGEPBasedOnPointerToString(const GEPOperator *GEP,\n-                                          unsigned CharSize = 8);\n-\n /// Represents offset+length into a ConstantDataArray.\n struct ConstantDataArraySlice {\n   /// ConstantDataArray pointer. nullptr indicates a zeroinitializer (a valid\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex b0e4b009f3501..a816aef810822 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -6356,27 +6356,6 @@ llvm::FindInsertedValue(Value *V, ArrayRef<unsigned> idx_range,\n   return nullptr;\n }\n \n-bool llvm::isGEPBasedOnPointerToString(const GEPOperator *GEP,\n-                                       unsigned CharSize) {\n-  // Make sure the GEP has exactly three arguments.\n-  if (GEP->getNumOperands() != 3)\n-    return false;\n-\n-  // Make sure the index-ee is a pointer to array of \\p CharSize integers.\n-  // CharSize.\n-  ArrayType *AT = dyn_cast<ArrayType>(GEP->getSourceElementType());\n-  if (!AT || !AT->getElementType()->isIntegerTy(CharSize))\n-    return false;\n-\n-  // Check to make sure that the first operand of the GEP is an integer and\n-  // has value 0 so that we are sure we're indexing into the initializer.\n-  const ConstantInt *FirstIdx = dyn_cast<ConstantInt>(GEP->getOperand(1));\n-  if (!FirstIdx || !FirstIdx->isZero())\n-    return false;\n-\n-  return true;\n-}\n-\n // If V refers to an initialized global constant, set Slice either to\n // its initializer if the size of its elements equals ElementSize, or,\n // for ElementSize == 8, to its representation as an array of unsiged\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\nindex 737321daa9109..f3567dbf740ed 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n@@ -20,6 +20,7 @@\n #include \"llvm/Analysis/Loads.h\"\n #include \"llvm/Analysis/OptimizationRemarkEmitter.h\"\n #include \"llvm/Analysis/TargetLibraryInfo.h\"\n+#include \"llvm/Analysis/Utils/Local.h\"\n #include \"llvm/Analysis/ValueTracking.h\"\n #include \"llvm/IR/AttributeMask.h\"\n #include \"llvm/IR/DataLayout.h\"\n@@ -977,8 +978,14 @@ Value *LibCallSimplifier::optimizeStringLength(CallInst *CI, IRBuilderBase &B,\n   // it's not very useful because calling strlen for a pointer of other types is\n   // very uncommon.\n   if (GEPOperator *GEP = dyn_cast<GEPOperator>(Src)) {\n-    // TODO: Handle subobjects.\n-    if (!isGEPBasedOnPointerToString(GEP, CharSize))\n+    unsigned BW = DL.getIndexTypeSizeInBits(GEP->getType());\n+    SmallMapVector<Value *, APInt, 4> VarOffsets;\n+    APInt ConstOffset(BW, 0);\n+    assert(CharSize % 8 == 0 && \"Expected a multiple of 8 sized CharSize\");\n+    // Check the gep is a single variable offset.\n+    if (!GEP->collectOffset(DL, BW, VarOffsets, ConstOffset) ||\n+        VarOffsets.size() != 1 || ConstOffset != 0 ||\n+        VarOffsets.begin()->second != CharSize / 8)\n       return nullptr;\n \n     ConstantDataArraySlice Slice;\n@@ -1000,10 +1007,8 @@ Value *LibCallSimplifier::optimizeStringLength(CallInst *CI, IRBuilderBase &B,\n           return nullptr;\n       }\n \n-      Value *Offset = GEP->getOperand(2);\n+      Value *Offset = VarOffsets.begin()->first;\n       KnownBits Known = computeKnownBits(Offset, DL, nullptr, CI, nullptr);\n-      uint64_t ArrSize =\n-             cast<ArrayType>(GEP->getSourceElementType())->getNumElements();\n \n       // If Offset is not provably in the range [0, NullTermIdx], we can still\n       // optimize if we can prove that the program has undefined behavior when\n@@ -1011,7 +1016,7 @@ Value *LibCallSimplifier::optimizeStringLength(CallInst *CI, IRBuilderBase &B,\n       // is a pointer to an object whose memory extent is NullTermIdx+1.\n       if ((Known.isNonNegative() && Known.getMaxValue().ule(NullTermIdx)) ||\n           (isa<GlobalVariable>(GEP->getOperand(0)) &&\n-           NullTermIdx == ArrSize - 1)) {\n+           NullTermIdx == Slice.Length - 1)) {\n         Offset = B.CreateSExtOrTrunc(Offset, CI->getType());\n         return B.CreateSub(ConstantInt::get(CI->getType(), NullTermIdx),\n                            Offset);\n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/strlen-1.ll b/llvm/test/Transforms/InstCombine/strlen-1.ll\nindex 4616767997512..27f9e4ace3a7b 100644\n--- a/llvm/test/Transforms/InstCombine/strlen-1.ll\n+++ b/llvm/test/Transforms/InstCombine/strlen-1.ll\n@@ -116,6 +116,25 @@ define i32 @test_simplify10_inbounds(i32 %x) {\n   ret i32 %hello_l\n }\n \n+define i32 @test_simplify10_inbounds_i8gep(i32 %x) {\n+; CHECK-LABEL: @test_simplify10_inbounds_i8gep(\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n+; CHECK-NEXT:    ret i32 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr inbounds i8, ptr @hello, i32 %x\n+  %hello_l = call i32 @strlen(ptr %hello_p)\n+  ret i32 %hello_l\n+}\n+\n+define i32 @test_simplify10_inbounds_i8gep_const() {\n+; CHECK-LABEL: @test_simplify10_inbounds_i8gep_const(\n+; CHECK-NEXT:    ret i32 3\n+;\n+  %hello_p = getelementptr inbounds i8, ptr @hello, i32 2\n+  %hello_l = call i32 @strlen(ptr %hello_p)\n+  ret i32 %hello_l\n+}\n+\n define i32 @test_simplify10_no_inbounds(i32 %x) {\n ; CHECK-LABEL: @test_simplify10_no_inbounds(\n ; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n@@ -126,6 +145,16 @@ define i32 @test_simplify10_no_inbounds(i32 %x) {\n   ret i32 %hello_l\n }\n \n+define i32 @test_simplify10_no_inbounds_i8gep(i32 %x) {\n+; CHECK-LABEL: @test_simplify10_no_inbounds_i8gep(\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n+; CHECK-NEXT:    ret i32 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr i8, ptr @hello, i32 %x\n+  %hello_l = call i32 @strlen(ptr %hello_p)\n+  ret i32 %hello_l\n+}\n+\n ; strlen(@null_hello_mid + (x & 7)) --> 9 - (x & 7)\n \n define i32 @test_simplify11(i32 %x) {\ndiff --git a/llvm/test/Transforms/InstCombine/wcslen-1.ll b/llvm/test/Transforms/InstCombine/wcslen-1.ll\nindex 8a2b66d7bd8d3..ffd62564f1dde 100644\n--- a/llvm/test/Transforms/InstCombine/wcslen-1.ll\n+++ b/llvm/test/Transforms/InstCombine/wcslen-1.ll\n@@ -118,6 +118,63 @@ define i64 @test_simplify10(i32 %x) {\n   ret i64 %hello_l\n }\n \n+define i64 @test_simplify10_gepi32(i64 %x) {\n+; CHECK-LABEL: @test_simplify10_gepi32(\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i64 5, [[X:%.*]]\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr inbounds i32, ptr @hello, i64 %x\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n+define i64 @test_simplify10_gepi64(i32 %x) {\n+; CHECK-LABEL: @test_simplify10_gepi64(\n+; CHECK-NEXT:    [[TMP1:%.*]] = sext i32 [[X:%.*]] to i64\n+; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i64, ptr @hello, i64 [[TMP1]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr inbounds i64, ptr @hello, i32 %x\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n+define i64 @test_simplify10_gepi16(i64 %x) {\n+; CHECK-LABEL: @test_simplify10_gepi16(\n+; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i16, ptr @hello, i64 [[X:%.*]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr inbounds i16, ptr @hello, i64 %x\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n+define i64 @test_simplify10_gepi8(i64 %x) {\n+; CHECK-LABEL: @test_simplify10_gepi8(\n+; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i8, ptr @hello, i64 [[TMP1:%.*]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %x\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n+define i64 @test_simplify10_gepi8mul4(i64 %x) {\n+; CHECK-LABEL: @test_simplify10_gepi8mul4(\n+; CHECK-NEXT:    [[Y:%.*]] = shl i64 [[X:%.*]], 2\n+; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i8, ptr @hello, i64 [[Y]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %y = mul i64 %x, 4\n+  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %y\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n ; wcslen(@null_hello_mid + (x & 7)) --> 9 - (x & 7)\n \n define i64 @test_simplify11(i32 %x) {\n@@ -133,6 +190,33 @@ define i64 @test_simplify11(i32 %x) {\n   ret i64 %hello_l\n }\n \n+define i64 @test_simplify11_gepi32(i32 %x) {\n+; CHECK-LABEL: @test_simplify11_gepi32(\n+; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n+; CHECK-NEXT:    [[NARROW:%.*]] = sub nuw nsw i32 9, [[AND]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = zext nneg i32 [[NARROW]] to i64\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %and = and i32 %x, 7\n+  %hello_p = getelementptr inbounds i32, ptr @null_hello_mid, i32 %and\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n+define i64 @test_simplify11_gepi8(i32 %x) {\n+; CHECK-LABEL: @test_simplify11_gepi8(\n+; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n+; CHECK-NEXT:    [[TMP1:%.*]] = zext nneg i32 [[AND]] to i64\n+; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds nuw i8, ptr @null_hello_mid, i64 [[TMP1]]\n+; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n+; CHECK-NEXT:    ret i64 [[HELLO_L]]\n+;\n+  %and = and i32 %x, 7\n+  %hello_p = getelementptr inbounds i8, ptr @null_hello_mid, i32 %and\n+  %hello_l = call i64 @wcslen(ptr %hello_p)\n+  ret i64 %hello_l\n+}\n+\n ; Check cases that shouldn't be simplified.\n \n define i64 @test_no_simplify1() {\n",
+  "source_files": [
+    "llvm/include/llvm/Analysis/ValueTracking.h",
+    "llvm/lib/Analysis/ValueTracking.cpp",
+    "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/strlen-1.ll",
+    "llvm/test/Transforms/InstCombine/wcslen-1.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/strlen-1.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_simplify10_inbounds",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds(i32 %x) {\n; CHECK-LABEL: @test_simplify10_inbounds(\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[HELLO_L]]\n  %hello_p = getelementptr inbounds [6 x i8], ptr @hello, i32 0, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds(i32 %x) {\n  %hello_p = getelementptr inbounds [6 x i8], ptr @hello, i32 0, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_inbounds_i8gep",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds_i8gep(i32 %x) {\n; CHECK-LABEL: @test_simplify10_inbounds_i8gep(\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[HELLO_L]]\n  %hello_p = getelementptr inbounds i8, ptr @hello, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds_i8gep(i32 %x) {\n  %hello_p = getelementptr inbounds i8, ptr @hello, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_inbounds_i8gep_const",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds_i8gep_const() {\n; CHECK-LABEL: @test_simplify10_inbounds_i8gep_const(\n; CHECK-NEXT:    ret i32 3\n  %hello_p = getelementptr inbounds i8, ptr @hello, i32 2\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_inbounds_i8gep_const() {\n  %hello_p = getelementptr inbounds i8, ptr @hello, i32 2\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_no_inbounds",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_no_inbounds(i32 %x) {\n; CHECK-LABEL: @test_simplify10_no_inbounds(\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[HELLO_L]]\n  %hello_p = getelementptr [6 x i8], ptr @hello, i32 0, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_no_inbounds(i32 %x) {\n  %hello_p = getelementptr [6 x i8], ptr @hello, i32 0, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_no_inbounds_i8gep",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_no_inbounds_i8gep(i32 %x) {\n; CHECK-LABEL: @test_simplify10_no_inbounds_i8gep(\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i32 5, [[X:%.*]]\n; CHECK-NEXT:    ret i32 [[HELLO_L]]\n  %hello_p = getelementptr i8, ptr @hello, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@hello = external constant [6 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify10_no_inbounds_i8gep(i32 %x) {\n  %hello_p = getelementptr i8, ptr @hello, i32 %x\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify11",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@null_hello_mid = external constant [13 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify11(i32 %x) {\n; CHECK-LABEL: @test_simplify11(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub nuw nsw i32 9, [[AND]]\n; CHECK-NEXT:    ret i32 [[HELLO_L]]\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds [13 x i8], ptr @null_hello_mid, i32 0, i32 %and\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}",
+          "source_program": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n@null_hello_mid = external constant [13 x i8]\n\ndeclare i32 @strlen(ptr)\n\ndefine i32 @test_simplify11(i32 %x) {\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds [13 x i8], ptr @null_hello_mid, i32 0, i32 %and\n  %hello_l = call i32 @strlen(ptr %hello_p)\n  ret i32 %hello_l\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/wcslen-1.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_no_simplify1",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@a = external global [32 x i32], align 1\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_no_simplify1() {\n; CHECK-LABEL: @test_no_simplify1(\n; CHECK-NEXT:    [[A_L:%.*]] = call i64 @wcslen(ptr nonnull @a)\n; CHECK-NEXT:    ret i64 [[A_L]]\n  %a_l = call i64 @wcslen(ptr @a)\n  ret i64 %a_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@a = external global [32 x i32], align 1\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_no_simplify1() {\n  %a_l = call i64 @wcslen(ptr @a)\n  ret i64 %a_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10(i32 %x) {\n; CHECK-LABEL: @test_simplify10(\n; CHECK-NEXT:    [[TMP1:%.*]] = sext i32 [[X:%.*]] to i64\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub nsw i64 5, [[TMP1]]\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %hello_p = getelementptr inbounds [6 x i32], ptr @hello, i32 0, i32 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10(i32 %x) {\n  %hello_p = getelementptr inbounds [6 x i32], ptr @hello, i32 0, i32 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_gepi16",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi16(i64 %x) {\n; CHECK-LABEL: @test_simplify10_gepi16(\n; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i16, ptr @hello, i64 [[X:%.*]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %hello_p = getelementptr inbounds i16, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi16(i64 %x) {\n  %hello_p = getelementptr inbounds i16, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_gepi32",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi32(i64 %x) {\n; CHECK-LABEL: @test_simplify10_gepi32(\n; CHECK-NEXT:    [[HELLO_L:%.*]] = sub i64 5, [[X:%.*]]\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %hello_p = getelementptr inbounds i32, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi32(i64 %x) {\n  %hello_p = getelementptr inbounds i32, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_gepi64",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi64(i32 %x) {\n; CHECK-LABEL: @test_simplify10_gepi64(\n; CHECK-NEXT:    [[TMP1:%.*]] = sext i32 [[X:%.*]] to i64\n; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i64, ptr @hello, i64 [[TMP1]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %hello_p = getelementptr inbounds i64, ptr @hello, i32 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi64(i32 %x) {\n  %hello_p = getelementptr inbounds i64, ptr @hello, i32 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_gepi8",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi8(i64 %x) {\n; CHECK-LABEL: @test_simplify10_gepi8(\n; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i8, ptr @hello, i64 [[TMP1:%.*]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi8(i64 %x) {\n  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %x\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify10_gepi8mul4",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi8mul4(i64 %x) {\n; CHECK-LABEL: @test_simplify10_gepi8mul4(\n; CHECK-NEXT:    [[Y:%.*]] = shl i64 [[X:%.*]], 2\n; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds i8, ptr @hello, i64 [[Y]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %y = mul i64 %x, 4\n  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %y\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@hello = external constant [6 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify10_gepi8mul4(i64 %x) {\n  %y = mul i64 %x, 4\n  %hello_p = getelementptr inbounds i8, ptr @hello, i64 %y\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify11",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11(i32 %x) {\n; CHECK-LABEL: @test_simplify11(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n; CHECK-NEXT:    [[NARROW:%.*]] = sub nuw nsw i32 9, [[AND]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = zext nneg i32 [[NARROW]] to i64\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds [13 x i32], ptr @null_hello_mid, i32 0, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11(i32 %x) {\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds [13 x i32], ptr @null_hello_mid, i32 0, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify11_gepi32",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11_gepi32(i32 %x) {\n; CHECK-LABEL: @test_simplify11_gepi32(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n; CHECK-NEXT:    [[NARROW:%.*]] = sub nuw nsw i32 9, [[AND]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = zext nneg i32 [[NARROW]] to i64\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds i32, ptr @null_hello_mid, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11_gepi32(i32 %x) {\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds i32, ptr @null_hello_mid, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        },
+        {
+          "test_name": "test_simplify11_gepi8",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11_gepi8(i32 %x) {\n; CHECK-LABEL: @test_simplify11_gepi8(\n; CHECK-NEXT:    [[AND:%.*]] = and i32 [[X:%.*]], 7\n; CHECK-NEXT:    [[TMP1:%.*]] = zext nneg i32 [[AND]] to i64\n; CHECK-NEXT:    [[HELLO_P:%.*]] = getelementptr inbounds nuw i8, ptr @null_hello_mid, i64 [[TMP1]]\n; CHECK-NEXT:    [[HELLO_L:%.*]] = call i64 @wcslen(ptr nonnull [[HELLO_P]])\n; CHECK-NEXT:    ret i64 [[HELLO_L]]\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds i8, ptr @null_hello_mid, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}",
+          "source_program": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\n@null_hello_mid = external constant [13 x i32]\n\ndeclare i64 @wcslen(ptr)\n\ndefine i64 @test_simplify11_gepi8(i32 %x) {\n  %and = and i32 %x, 7\n  %hello_p = getelementptr inbounds i8, ptr @null_hello_mid, i32 %and\n  %hello_l = call i64 @wcslen(ptr %hello_p)\n  ret i64 %hello_l\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

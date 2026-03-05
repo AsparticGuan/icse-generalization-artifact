@@ -1,0 +1,86 @@
+{
+  "pr_number": 136998,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/136998",
+  "title": "[InstCombine] Fold bitcast (extelt (bitcast X), Idx) into bitcast+shufflevector.",
+  "commit_sha": "13aae7521586f0050def818ce414d2c0bf79d960",
+  "components": [
+    "InstCombine"
+  ],
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+        [
+          2380,
+          2385
+        ],
+        [
+          2866,
+          2871
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+        "InstCombinerImpl::visitBitCast",
+        "optimizeIntegerToVectorInsertions"
+      ]
+    }
+  },
+  "source_patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\nindex 1a95636f37ed7..d656dcc21ae1e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n@@ -2380,6 +2380,51 @@ static Value *optimizeIntegerToVectorInsertions(BitCastInst &CI,\n   return Result;\n }\n \n+/// If the input is (extractelement (bitcast X), Idx) and the source and\n+/// destination types are vectors, we are performing a vector extract from X. We\n+/// can replace the extractelement+bitcast with a shufflevector, avoiding the\n+/// final scalar->vector bitcast. This pattern is usually handled better by the\n+/// backend.\n+///\n+/// Example:\n+///   %bc = bitcast <8 x i32> %X to <2 x i128>\n+///   %ext = extractelement <2 x i128> %bc1, i64 1\n+///   bitcast i128 %ext to <2 x i64>\n+///   --->\n+///   %bc = bitcast <8 x i32> %X to <4 x i64>\n+///   shufflevector <4 x i64> %bc, <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n+static Instruction *foldBitCastExtElt(BitCastInst &BitCast,\n+                                      InstCombiner::BuilderTy &Builder) {\n+  Value *X;\n+  uint64_t Index;\n+  if (!match(\n+          BitCast.getOperand(0),\n+          m_OneUse(m_ExtractElt(m_BitCast(m_Value(X)), m_ConstantInt(Index)))))\n+    return nullptr;\n+\n+  auto *SrcTy = dyn_cast<FixedVectorType>(X->getType());\n+  auto *DstTy = dyn_cast<FixedVectorType>(BitCast.getType());\n+  if (!SrcTy || !DstTy)\n+    return nullptr;\n+\n+  // Check if the mask indices would overflow.\n+  unsigned NumElts = DstTy->getNumElements();\n+  if (Index > INT32_MAX || NumElts > INT32_MAX ||\n+      (Index + 1) * NumElts - 1 > INT32_MAX)\n+    return nullptr;\n+\n+  unsigned DstEltWidth = DstTy->getScalarSizeInBits();\n+  unsigned SrcVecWidth = SrcTy->getPrimitiveSizeInBits();\n+  assert((SrcVecWidth % DstEltWidth == 0) && \"Invalid types.\");\n+  auto *NewVecTy =\n+      FixedVectorType::get(DstTy->getElementType(), SrcVecWidth / DstEltWidth);\n+  auto *NewBC = Builder.CreateBitCast(X, NewVecTy, \"bc\");\n+\n+  unsigned StartIdx = Index * NumElts;\n+  auto Mask = llvm::to_vector<16>(llvm::seq<int>(StartIdx, StartIdx + NumElts));\n+  return new ShuffleVectorInst(NewBC, Mask);\n+}\n+\n /// Canonicalize scalar bitcasts of extracted elements into a bitcast of the\n /// vector followed by extract element. The backend tends to handle bitcasts of\n /// vectors better than bitcasts of scalars because vector registers are\n@@ -2866,6 +2911,9 @@ Instruction *InstCombinerImpl::visitBitCast(BitCastInst &CI) {\n   if (Instruction *I = canonicalizeBitCastExtElt(CI, *this))\n     return I;\n \n+  if (Instruction *I = foldBitCastExtElt(CI, Builder))\n+    return I;\n+\n   if (Instruction *I = foldBitCastBitwiseLogic(CI, Builder))\n     return I;\n \n",
+  "test_patch": "diff --git a/llvm/test/Transforms/InstCombine/bitcast.ll b/llvm/test/Transforms/InstCombine/bitcast.ll\nindex 37d41de3e9991..cade44412341d 100644\n--- a/llvm/test/Transforms/InstCombine/bitcast.ll\n+++ b/llvm/test/Transforms/InstCombine/bitcast.ll\n@@ -480,6 +480,34 @@ define double @bitcast_extelt8(<1 x i64> %A) {\n   ret double %bc\n }\n \n+; Extract a subvector from a vector, extracted element wider than source.\n+\n+define <2 x i64> @bitcast_extelt9(<8 x i32> %A) {\n+; CHECK-LABEL: @bitcast_extelt9(\n+; CHECK-NEXT:    [[BC:%.*]] = bitcast <8 x i32> [[A:%.*]] to <4 x i64>\n+; CHECK-NEXT:    [[BC2:%.*]] = shufflevector <4 x i64> [[BC]], <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n+; CHECK-NEXT:    ret <2 x i64> [[BC2]]\n+;\n+  %bc1 = bitcast <8 x i32> %A to <2 x i128>\n+  %ext = extractelement <2 x i128> %bc1, i64 1\n+  %bc2 = bitcast i128 %ext to <2 x i64>\n+  ret <2 x i64> %bc2\n+}\n+\n+; Extract a subvector from a vector, extracted element narrower than source.\n+\n+define <2 x i8> @bitcast_extelt10(<8 x i32> %A) {\n+; CHECK-LABEL: @bitcast_extelt10(\n+; CHECK-NEXT:    [[BC:%.*]] = bitcast <8 x i32> [[A:%.*]] to <32 x i8>\n+; CHECK-NEXT:    [[BC2:%.*]] = shufflevector <32 x i8> [[BC]], <32 x i8> poison, <2 x i32> <i32 6, i32 7>\n+; CHECK-NEXT:    ret <2 x i8> [[BC2]]\n+;\n+  %bc1 = bitcast <8 x i32> %A to <16 x i16>\n+  %ext = extractelement <16 x i16> %bc1, i64 3\n+  %bc2 = bitcast i16 %ext to <2 x i8>\n+  ret <2 x i8> %bc2\n+}\n+\n define <2 x i32> @test4(i32 %A, i32 %B){\n ; CHECK-LABEL: @test4(\n ; CHECK-NEXT:    [[TMP1:%.*]] = insertelement <2 x i32> poison, i32 [[A:%.*]], i64 0\n",
+  "source_files": [
+    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp"
+  ],
+  "test_files": [
+    "llvm/test/Transforms/InstCombine/bitcast.ll"
+  ],
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/bitcast.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ],
+        [
+          "opt < %s -passes=instcombine -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_extelt10",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i8> @bitcast_extelt10(<8 x i32> %A) {\n; CHECK-LABEL: @bitcast_extelt10(\n; CHECK-NEXT:    [[BC1:%.*]] = bitcast <8 x i32> [[A:%.*]] to <16 x i16>\n; CHECK-NEXT:    [[EXT:%.*]] = extractelement <16 x i16> [[BC1]], i64 3\n; CHECK-NEXT:    [[BC2:%.*]] = bitcast i16 [[EXT]] to <2 x i8>\n; CHECK-NEXT:    ret <2 x i8> [[BC2]]\n  %bc1 = bitcast <8 x i32> %A to <16 x i16>\n  %ext = extractelement <16 x i16> %bc1, i64 3\n  %bc2 = bitcast i16 %ext to <2 x i8>\n  ret <2 x i8> %bc2\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i8> @bitcast_extelt10(<8 x i32> %A) {\n  %bc1 = bitcast <8 x i32> %A to <16 x i16>\n  %ext = extractelement <16 x i16> %bc1, i64 3\n  %bc2 = bitcast i16 %ext to <2 x i8>\n  ret <2 x i8> %bc2\n}\n"
+        },
+        {
+          "test_name": "bitcast_extelt8",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine double @bitcast_extelt8(<1 x i64> %A) {\n; CHECK-LABEL: @bitcast_extelt8(\n; CHECK-NEXT:    [[BC1:%.*]] = bitcast <1 x i64> [[A:%.*]] to <1 x double>\n; CHECK-NEXT:    [[BC:%.*]] = extractelement <1 x double> [[BC1]], i64 0\n; CHECK-NEXT:    ret double [[BC]]\n  %bc = bitcast <1 x i64> %A to double\n  ret double %bc\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine double @bitcast_extelt8(<1 x i64> %A) {\n  %bc = bitcast <1 x i64> %A to double\n  ret double %bc\n}\n"
+        },
+        {
+          "test_name": "bitcast_extelt9",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i64> @bitcast_extelt9(<8 x i32> %A) {\n; CHECK-LABEL: @bitcast_extelt9(\n; CHECK-NEXT:    [[BC1:%.*]] = bitcast <8 x i32> [[A:%.*]] to <2 x i128>\n; CHECK-NEXT:    [[EXT:%.*]] = extractelement <2 x i128> [[BC1]], i64 1\n; CHECK-NEXT:    [[BC2:%.*]] = bitcast i128 [[EXT]] to <2 x i64>\n; CHECK-NEXT:    ret <2 x i64> [[BC2]]\n  %bc1 = bitcast <8 x i32> %A to <2 x i128>\n  %ext = extractelement <2 x i128> %bc1, i64 1\n  %bc2 = bitcast i128 %ext to <2 x i64>\n  ret <2 x i64> %bc2\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i64> @bitcast_extelt9(<8 x i32> %A) {\n  %bc1 = bitcast <8 x i32> %A to <2 x i128>\n  %ext = extractelement <2 x i128> %bc1, i64 1\n  %bc2 = bitcast i128 %ext to <2 x i64>\n  ret <2 x i64> %bc2\n}\n"
+        },
+        {
+          "test_name": "test4",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i32> @test4(i32 %A, i32 %B) {",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\ntarget triple = \"x86_64-apple-darwin10.0.0\"\n\ndefine <2 x i32> @test4(i32 %A, i32 %B) {\n  %t38 = zext i32 %A to i64\n  %t32 = zext i32 %B to i64\n  %t33 = shl i64 %t32, 32\n  %ins35 = or i64 %t33, %t38\n  %t43 = bitcast i64 %ins35 to <2 x i32>\n  ret <2 x i32> %t43\n}\n"
+        }
+      ]
+    }
+  ],
+  "has_test_changes": true,
+  "has_source_changes": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}
