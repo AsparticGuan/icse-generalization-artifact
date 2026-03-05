@@ -232,6 +232,9 @@ def alive2_check(src: str, tgt: str, additional_args: str):
                 return (success, {"src": src, "tgt": tgt, "log": out})
     except subprocess.CalledProcessError as e:
         return (False, str(e) + "\n" + decode_output(e.output))
+    except Exception as e:
+        # 例如 alive-tv 未安装或路径不存在时，返回失败日志而不是抛异常中断主流程。
+        return (False, str(e))
 
 
 def lli_check(tgt: bytes, expected_out: str):
@@ -251,7 +254,10 @@ def lli_check(tgt: bytes, expected_out: str):
     except subprocess.TimeoutExpired as e:
         return (False, str(e) + "\n" + decode_output(e.output))
 
-def cost_check(source_program: str, expect_optimized_program: str, current_optimized_program: str):
+
+def cost_check(
+    source_program: str, expect_optimized_program: str, current_optimized_program: str
+):
     """
     比较三份 IR 的代价估计：
     - source_program: 原始程序
@@ -264,46 +270,53 @@ def cost_check(source_program: str, expect_optimized_program: str, current_optim
     programs = {
         "source_program": source_program,
         "expect_optimized_program": expect_optimized_program,
-        "current_optimized_program": current_optimized_program
+        "current_optimized_program": current_optimized_program,
     }
     costs = {
         "source_program": -1,
         "expect_optimized_program": -1,
-        "current_optimized_program": -1
+        "current_optimized_program": -1,
     }
     for prog_name in programs:
         with tempfile.NamedTemporaryFile(suffix=".ll") as code_file:
             code_file.write(programs[prog_name].encode())
             code_file.flush()
             try:
-                out = subprocess.check_output([llvm_cost_tool, code_file.name], stderr=subprocess.STDOUT).decode()
+                out = subprocess.check_output(
+                    [llvm_cost_tool, code_file.name], stderr=subprocess.STDOUT
+                ).decode()
                 cost = int(out.strip().split("Cost: ")[1])
                 costs[prog_name] = cost
-            except subprocess.CalledProcessError as e:
+            except Exception as e:
                 print(e)
                 pass
     success = False
-    # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or 
+    # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or
     # \ test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
     # if costs["current_optimized_program"] < costs["source_program"] and \
     #     costs["current_optimized_program"] <= costs["expect_optimized_program"]:
-    if costs["current_optimized_program"] < costs["source_program"] and \
-        costs["current_optimized_program"] <= costs["expect_optimized_program"]:
+    if (
+        costs["current_optimized_program"] < costs["source_program"]
+        and costs["current_optimized_program"] <= costs["expect_optimized_program"]
+    ):
         success = True
 
     print(f"costs: {costs}")
     print(f"success: {success}")
     return (success, costs)
 
+
 def filecheck_check(src: str, tgt: str, args_list: list[str]):
     """调用 FileCheck 验证优化结果是否满足测试断言。"""
     filecheck_command = []
     for arg in args_list:
-        if '--check-prefix' not in arg:
+        if "--check-prefix" not in arg:
             filecheck_command.append(arg)
         else:
             # 仅保留在 src 中真实出现的 check-prefix，避免误用无关前缀。
-            check_prefixes_raw = re.findall(r"check-prefixes=(.*)", arg) + re.findall(r"check-prefix=(.*)", arg)
+            check_prefixes_raw = re.findall(r"check-prefixes=(.*)", arg) + re.findall(
+                r"check-prefix=(.*)", arg
+            )
             check_prefixes_used = []
             if check_prefixes_raw:
                 check_prefixes = check_prefixes_raw[0].strip().split(",")
@@ -311,7 +324,9 @@ def filecheck_check(src: str, tgt: str, args_list: list[str]):
                     if f"; {check_prefix}" in src:
                         check_prefixes_used.append(check_prefix)
             if len(check_prefixes_used) != 0:
-                filecheck_command.append(f"--check-prefixes={','.join(check_prefixes_used)}")
+                filecheck_command.append(
+                    f"--check-prefixes={','.join(check_prefixes_used)}"
+                )
     with tempfile.NamedTemporaryFile() as src_file:
         with tempfile.NamedTemporaryFile() as tgt_file:
             src = filter_out_unsupported_feats(src)
@@ -323,12 +338,22 @@ def filecheck_check(src: str, tgt: str, args_list: list[str]):
             filecheck_command.append(src_file.name)
             try:
                 # Create a pipe to feed tgt_file content as input
-                with open(tgt_file.name, 'rb') as tgt_input:
-                    out = subprocess.check_output(filecheck_command, stdin=tgt_input, stderr=subprocess.STDOUT).decode()
+                with open(tgt_file.name, "rb") as tgt_input:
+                    out = subprocess.check_output(
+                        filecheck_command, stdin=tgt_input, stderr=subprocess.STDOUT
+                    ).decode()
                 success = len(out.strip()) == 0
                 return (success, {"src": src, "tgt": tgt, "log": out})
             except subprocess.CalledProcessError as e:
-                return (False, {"src": src, "tgt": tgt, "log": str(e) + "\n" + decode_output(e.output)})
+                return (
+                    False,
+                    {
+                        "src": src,
+                        "tgt": tgt,
+                        "log": str(e) + "\n" + decode_output(e.output),
+                    },
+                )
+
 
 def copy_triple(input: str, out: bytes):
     """若 input 缺失 target triple，则从 out 中复制补齐。"""
@@ -377,7 +402,8 @@ def verify_dispatch(
     run_args_list = list(
         filter(
             lambda x: x != "",
-            commands[0].replace("< ", " ")
+            commands[0]
+            .replace("< ", " ")
             .replace("%s", "-")
             .replace("2>&1", "")
             .replace("'", "")
@@ -391,7 +417,8 @@ def verify_dispatch(
     filecheck_args_list = list(
         filter(
             lambda x: x != "",
-            commands[1].replace("< ", " ")
+            commands[1]
+            .replace("< ", " ")
             .replace("%s", "")
             .replace("2>&1", "")
             .replace("'", "")
@@ -414,16 +441,26 @@ def verify_dispatch(
             new_input = copy_triple(input, output)
             new_input = copy_datalayout(new_input, output)
             # we don't care about the alive2 result here because filecheck gives a stricter check
-            res_alive2, log_alive2 = alive2_check(new_input, output.decode(), additional_args)
+            res_alive2, log_alive2 = alive2_check(
+                new_input, output.decode(), additional_args
+            )
             if source_program is not None and expect_optimized_program is not None:
-                current_optimized_program = output.decode().removeprefix(
-                    "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n"
-                    ).removeprefix("\n")
-                res_cost, log_cost = cost_check(source_program, expect_optimized_program, current_optimized_program)
+                current_optimized_program = (
+                    output.decode()
+                    .removeprefix(
+                        "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n"
+                    )
+                    .removeprefix("\n")
+                )
+                res_cost, log_cost = cost_check(
+                    source_program, expect_optimized_program, current_optimized_program
+                )
             else:
                 res_cost = False
                 log_cost = ""
-            res_filecheck, log_filecheck = filecheck_check(new_input, output.decode(), filecheck_args_list)
+            res_filecheck, log_filecheck = filecheck_check(
+                new_input, output.decode(), filecheck_args_list
+            )
             log = {"alive2": log_alive2, "cost": log_cost, "filecheck": log_filecheck}
             if source_program is not None and expect_optimized_program is not None:
                 log["source_program"] = source_program
@@ -441,10 +478,13 @@ def verify_dispatch(
             return (res, log)
         return (not repro, "success\n" + decode_output(out.stderr))
     except Exception as e:
+        output = decode_output(getattr(e, "output", None))
+        stderr = decode_output(getattr(e, "stderr", None))
         return (
             False,
-            str(e) + "\n" + decode_output(e.output) + "\n" + decode_output(e.stderr),
+            str(e) + "\n" + output + "\n" + stderr,
         )
+
 
 def verify_test_group(repro: bool, input, type: str):
     """批量执行测试组（带 commands + test_body 的标准样本格式）。"""
@@ -558,7 +598,9 @@ def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_li
                         "name": name,
                         "body": "",
                         "result": False,
-                        "log": {"error": "missing source_program or expect_optimized_program"},
+                        "log": {
+                            "error": "missing source_program or expect_optimized_program"
+                        },
                     }
                 )
                 overall_test_res = False

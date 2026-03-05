@@ -19,7 +19,12 @@ cd ./utils/cost
 <!-- #### Step 3: Install alive2 utility
 Please  -->
 
-#### Step 3: Init the environment
+#### Step 3: Install dependencies
+```
+uv sync
+```
+
+#### Step 4: Init the environment
 For example, setup the Qwen-3 model environment
 ```
 source init_env.sh qwen3
