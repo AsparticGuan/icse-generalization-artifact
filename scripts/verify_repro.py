@@ -83,12 +83,7 @@ def verify_issue(issue):
                     data["tests"][test_file_index]["tests"][test_index]["current_optimized_program"] = optimized_program
                     break
                 break
-<<<<<<< HEAD
             assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != [], f"optimized_program: {optimized_program}"
-=======
-            # 防御性断言：确保日志与 test_name 对应函数一致。
-            assert re.findall(f'@{log[log_index]["name"]}\(', optimized_program) != []
->>>>>>> origin/mini-swe-agent
             
     # 应用修复 patch，进入“修复后”验证阶段。
     llvm_helper.apply(data["patch"])
