@@ -13,6 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""批量扫描 LLVM issue 并触发数据抽取。
+
+该脚本是数据集构建入口之一，职责为：
+1. 在给定 issue id 区间内遍历 GitHub issue；
+2. 依据标签/状态做快速过滤，仅保留候选优化问题；
+3. 调用 postfix_extract.py 做深度解析与落盘；
+4. 结合缓存与速率限制处理，支持长时间稳定运行。
+"""
+
 import os
 import requests
 import subprocess
@@ -21,9 +30,13 @@ import time
 import tqdm
 import llvm_helper
 
+# 访问 GitHub API 所需 Token 与本地缓存目录。
 github_token = os.environ["LAB_GITHUB_TOKEN"]
 cache_dir = os.environ["LAB_ISSUE_CACHE"]
+# 复用后处理抽取脚本。
 postfix_extract = os.path.join(os.path.dirname(__file__), "postfix_extract.py")
+
+# 全局会话统一附带鉴权与 API 版本头。
 session = requests.Session()
 session.headers.update(
     {
@@ -33,11 +46,13 @@ session.headers.update(
     }
 )
 
+# issue 扫描区间（含两端）。
 issue_id_begin = 76663  # 76663 Since 2024-01-01
 issue_id_end = 177448
 
 
 def wait(progress):
+    """在限流或网络异常时等待下一轮可用窗口。"""
     try:
         rate_limit = session.get("https://api.github.com/rate_limit", timeout=10).json()
         if rate_limit["rate"]["remaining"] == 0:
@@ -51,20 +66,30 @@ def wait(progress):
 
 
 def fetch(issue_id):
+    """拉取并筛选单个 issue，必要时调用 postfix_extract 做数据生成。"""
     data_json_path = os.path.join(llvm_helper.dataset_dir, f"{issue_id}.json")
+    # 若数据已存在，则视为已处理。
     if os.path.exists(data_json_path):
         return False
 
     issue_url = f"https://api.github.com/repos/llvm/llvm-project/issues/{issue_id}"
     issue = session.get(issue_url).json()
+
+    # 过滤不存在/被删除 issue。
     if "message" in issue and (
         issue["message"] == "Not Found" or issue["message"] == "This issue was deleted"
     ):
         return False
+
+    # 仅关注“已关闭且完成”的 issue。
     if issue["state"] != "closed" or issue["state_reason"] != "completed":
         return False
+
+    # 明确排除 PR（只处理 issue）。
     if "issue" not in issue["html_url"]:
         return False
+
+    # 标签规则：需要包含目标类型标签，并排除明显无关子系统。
     has_valid_label = False
     is_llvm_middleend = False
     for label in issue["labels"]:
@@ -118,6 +143,7 @@ def fetch(issue_id):
     # if not is_llvm_middleend:
     #     return False
 
+    # 通过基础筛选后，调用 postfix_extract.py 做 fix commit/patch/test 提取。
     try:
         out = subprocess.check_output(
             ["python3", postfix_extract, str(issue_id)], stderr=subprocess.DEVNULL
@@ -131,6 +157,7 @@ def fetch(issue_id):
         return True
 
 
+# 初始化缓存目录；缓存文件存在表示该 issue 已经判定过（成功或失败）。
 os.makedirs(cache_dir, exist_ok=True)
 success = 0
 progress = tqdm.tqdm(range(issue_id_begin, issue_id_end + 1))
@@ -145,8 +172,10 @@ for issue_id in progress:
             if fetch(issue_id):
                 success += 1
             else:
+                # 未抽取成功时也写缓存哨兵，避免下次重复请求。
                 Path(cache_file).touch()
             break
+        # 以下异常统一走 wait，尽量保证长任务可恢复。
         except KeyError as e:
             wait(progress)
         except requests.exceptions.RequestException:
