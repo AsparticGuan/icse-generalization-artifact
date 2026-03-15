@@ -111,11 +111,13 @@ python agent/run.py 85250
 | `MSWEA_GLOBAL_CALL_LIMIT` | | `200` | mini-swe-agent 全局调用上限 |
 | `LAB_LLVM_DIR` | | `utils/llvm/llvm-project` | 基础 LLVM 源码（per-issue 克隆的种子仓库） |
 | `LAB_LLVM_BUILD_DIR` | | `build/` | 构建根目录 |
-| `LAB_DATASET_DIR` | | `dataset/` | 数据集目录 |
 | `LAB_LLVM_ALIVE_TV` | | `utils/alive2/build/alive-tv` | Alive2 工具路径 |
 | `LAB_LLVM_COST_TOOL` | | `utils/cost/cost` | 代价分析工具路径 |
 | `LAB_FIX_DIR_AGENT` | | 根据模型名自动生成 | 结果 JSON 输出目录 |
 | `LAB_TRAJ_DIR_AGENT` | | 根据模型名自动生成 | 轨迹 JSON 输出目录 |
+
+> Agent 运行时会固定使用 `<project_root>/dataset`（与
+> `pipeline/generate.py` 保持一致）。外部传入的 `LAB_DATASET_DIR` 不再覆盖。
 
 > **历史方式**: `source agent/init_agent_env.sh <model>` 仍可使用，但不再必需。
 
@@ -188,10 +190,16 @@ uv run python agent/run_batch.py \
 
 ## 7) 输出说明
 
-- **结果 JSON**：
-  `results/agent/fixes-<model>-agent/<issue_id>.json`
-- **轨迹 JSON**：
-  `results/agent/traj-<model>-agent/<issue_id>.traj.json`
+主输出（按 issue 分目录、带时间戳）：
+
+- `results/agent/<model>-<issue_id>/<timestamp>/fix.json`
+- `results/agent/<model>-<issue_id>/<timestamp>/traj.json`
+- `results/agent/<model>-<issue_id>/<timestamp>/preds.json`
+
+Pipeline 兼容扁平输出（可直接被 `pipeline/retest_patches.py` 消费）：
+
+- `results/agent/fixes-<model>-agent-<timestamp>/<issue_id>.json`
+- `results/agent/traj-<model>-agent-<timestamp>/<issue_id>.traj.json`
 
 结果文件与 pipeline 消费方（尤其 `pipeline/retest_patches.py`）兼容。
 
@@ -204,6 +212,19 @@ uv run python agent/run_batch.py \
 - `patch`
 - `log.model`, `log.messages`, `log.trajectory`
 - `check_fast_log`, `check_full_log`
+
+### 历史补丁复测（直接沿用 pipeline）
+
+补丁可复现性复测统一使用 **pipeline 脚本**（不在 agent 侧重复实现 retest 逻辑）：
+
+```bash
+LAB_PATCH_DIR=<results/agent/fixes-...-<timestamp>> \
+python pipeline/retest_patches.py [issue_id_or_csv] [-f]
+```
+
+`pipeline/retest_patches.py` 会读取 `dataset/<issue_id>.json` 的 **`dev_tests`**
+（developer golden test cases）进行验证。该集合与常规修复环节使用的 `tests`
+不同，二者不要混用。
 
 ---
 

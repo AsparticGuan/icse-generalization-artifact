@@ -171,6 +171,21 @@ class Environment:
             "check_full_log": self.check_full_log,
         }
 
+    def _verify_fast_group(self, *, repro: bool):
+        """执行与 pipeline 一致的 fast-check 测试组验证。
+
+        统一走 llvm_helper.verify_test_group_orig：
+        - commands 非空时回退到 verify_dispatch（兼容旧数据格式）；
+        - commands 为空时按 source/expect IR 做 alive2 + cost 校验。
+        """
+        hints = self.data.get("hints") or {}
+        return llvm_helper.verify_test_group_orig(
+            repro=repro,
+            input_tests=self.data["tests"],
+            type_str=self.bug_type,
+            component_list=hints.get("components"),
+        )
+
     def check_fast(self, skip_build=False):
         """快速检查：build + verify_test_group，不跑 llvm-lit。"""
         with TimeCompensationGuard(self):
@@ -181,9 +196,7 @@ class Environment:
                     return (False, reason)
             else:
                 self.build_count += 1
-            res, log = llvm_helper.verify_test_group(
-                repro=False, input=self.data["tests"], type=self.bug_type
-            )
+            res, log = self._verify_fast_group(repro=False)
             if not res:
                 return (False, log)
             self.fast_check_pass = True
@@ -196,9 +209,7 @@ class Environment:
             res, reason = self.build()
             if not res:
                 return (False, reason)
-            res, log = llvm_helper.verify_test_group(
-                repro=False, input=self.data["tests"], type=self.bug_type
-            )
+            res, log = self._verify_fast_group(repro=False)
             self.check_fast_log.append(log)
             if not res:
                 return (False, log)

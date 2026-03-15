@@ -107,7 +107,7 @@ class AgentConfig:
         default_factory=lambda: _env_float("MSWEA_GLOBAL_COST_LIMIT", 10.0)
     )
     mswea_global_call_limit: int = field(
-        default_factory=lambda: _env_int("MSWEA_GLOBAL_CALL_LIMIT", 200)
+        default_factory=lambda: _env_int("MSWEA_GLOBAL_CALL_LIMIT", 0)
     )
 
     # ── 核心路径 ──
@@ -125,9 +125,7 @@ class AgentConfig:
     llvm_build_dir: str = field(
         default_factory=lambda: _env("LAB_LLVM_BUILD_DIR", str(_PROJECT_ROOT / "build"))
     )
-    dataset_dir: str = field(
-        default_factory=lambda: _env("LAB_DATASET_DIR", str(_PROJECT_ROOT / "dataset"))
-    )
+    dataset_dir: str = field(default_factory=lambda: str(_PROJECT_ROOT / "dataset"))
     localize_output: str = field(default_factory=lambda: _env("LAB_LOCALIZE_OUTPUT"))
 
     # ── 外部工具路径 ──
@@ -179,6 +177,9 @@ class AgentConfig:
         _setdefault("MSWEA_GLOBAL_COST_LIMIT", str(self.mswea_global_cost_limit))
         _setdefault("MSWEA_GLOBAL_CALL_LIMIT", str(self.mswea_global_call_limit))
         _setdefault("LAB_RUN_TIMESTAMP", self.run_timestamp)
+
+        # 与 pipeline/generate.py 对齐：固定使用仓库 dataset/。
+        os.environ["LAB_DATASET_DIR"] = self.dataset_dir
 
 
 # ── 模块级单例：import 即可用 ──

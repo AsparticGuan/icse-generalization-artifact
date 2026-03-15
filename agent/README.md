@@ -112,11 +112,13 @@ All variables, their meanings, and defaults are documented in `.env.example`.
 | `MSWEA_GLOBAL_CALL_LIMIT` | | `200` | mini-swe-agent global call cap |
 | `LAB_LLVM_DIR` | | `utils/llvm/llvm-project` | Base LLVM source (seed for per-issue clones) |
 | `LAB_LLVM_BUILD_DIR` | | `build/` | Build root |
-| `LAB_DATASET_DIR` | | `dataset/` | Dataset directory |
 | `LAB_LLVM_ALIVE_TV` | | `utils/alive2/build/alive-tv` | Alive2 tool path |
 | `LAB_LLVM_COST_TOOL` | | `utils/cost/cost` | Cost tool path |
 | `LAB_FIX_DIR_AGENT` | | auto-generated from model name | Result JSON output dir |
 | `LAB_TRAJ_DIR_AGENT` | | auto-generated from model name | Trajectory output dir |
+
+> Dataset path is fixed to `<project_root>/dataset` in agent runtime (aligned with
+> `pipeline/generate.py` style). External `LAB_DATASET_DIR` overrides are ignored.
 
 > **Legacy**: `source agent/init_agent_env.sh <model>` still works but is no
 > longer required.
@@ -193,10 +195,16 @@ Notes:
 
 ## 7) Outputs
 
-- **Result JSON**:
-  `results/agent/fixes-<model>-agent/<issue_id>.json`
-- **Trajectory JSON**:
-  `results/agent/traj-<model>-agent/<issue_id>.traj.json`
+Primary run artifacts (per issue, timestamped):
+
+- `results/agent/<model>-<issue_id>/<timestamp>/fix.json`
+- `results/agent/<model>-<issue_id>/<timestamp>/traj.json`
+- `results/agent/<model>-<issue_id>/<timestamp>/preds.json`
+
+Pipeline-compatible flat artifacts (for direct reuse by `pipeline/retest_patches.py`):
+
+- `results/agent/fixes-<model>-agent-<timestamp>/<issue_id>.json`
+- `results/agent/traj-<model>-agent-<timestamp>/<issue_id>.traj.json`
 
 Result JSON is intentionally compatible with pipeline consumers
 (notably `pipeline/retest_patches.py`).
@@ -210,6 +218,20 @@ Important result fields include:
 - `patch`
 - `log.model`, `log.messages`, `log.trajectory`
 - `check_fast_log`, `check_full_log`
+
+### Retest historical patches (use pipeline directly)
+
+For patch reproducibility retest, **reuse pipeline script directly** (do not add a
+separate agent retest implementation):
+
+```bash
+LAB_PATCH_DIR=<results/agent/fixes-...-<timestamp>> \
+python pipeline/retest_patches.py [issue_id_or_csv] [-f]
+```
+
+`pipeline/retest_patches.py` verifies with `dataset/<issue_id>.json` **`dev_tests`**
+(developer golden test cases). This is intentionally different from normal
+`tests` used in generate/fix loops — do not mix them.
 
 ---
 
