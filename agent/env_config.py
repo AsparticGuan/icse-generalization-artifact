@@ -58,6 +58,24 @@ def _setdefault(key: str, value: str) -> None:
         os.environ[key] = value
 
 
+def _is_executable_file(path: str) -> bool:
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _resolve_alive_tv_path(path: str) -> str:
+    candidates = [path, "/usr/local/bin/alive-tv", "/usr/bin/alive-tv"]
+    fallback = str(_PROJECT_ROOT / "utils" / "alive2" / "build" / "alive-tv")
+    if fallback not in candidates:
+        candidates.append(fallback)
+    for cand in candidates:
+        if not _is_executable_file(cand):
+            continue
+        if os.path.basename(os.path.realpath(cand)) == "alive":
+            continue
+        return cand
+    return path if path else fallback
+
+
 def _append_timestamp_suffix(path: str, ts: str) -> str:
     """为路径最后一段追加时间戳后缀（若已包含则保持不变）。"""
     p = Path(path)
@@ -126,12 +144,20 @@ class AgentConfig:
         default_factory=lambda: _env("LAB_LLVM_BUILD_DIR", str(_PROJECT_ROOT / "build"))
     )
     dataset_dir: str = field(default_factory=lambda: str(_PROJECT_ROOT / "dataset"))
+    tmp_dir: str = field(
+        default_factory=lambda: (
+            _env("LAB_TMP_DIR", str(_PROJECT_ROOT / ".tmp"))
+            or str(_PROJECT_ROOT / ".tmp")
+        )
+    )
 
     # ── 外部工具路径 ──
     alive_tv: str = field(
-        default_factory=lambda: _env(
-            "LAB_LLVM_ALIVE_TV",
-            str(_PROJECT_ROOT / "utils" / "alive2" / "build" / "alive-tv"),
+        default_factory=lambda: _resolve_alive_tv_path(
+            _env(
+                "LAB_LLVM_ALIVE_TV",
+                str(_PROJECT_ROOT / "utils" / "alive2" / "build" / "alive-tv"),
+            )
         )
     )
     cost_tool: str = field(
@@ -179,6 +205,13 @@ class AgentConfig:
 
         # 与 pipeline/generate.py 对齐：固定使用仓库 dataset/。
         os.environ["LAB_DATASET_DIR"] = self.dataset_dir
+        os.environ["LAB_LLVM_ALIVE_TV"] = self.alive_tv
+        _setdefault("LAB_TMP_DIR", self.tmp_dir)
+        os.environ["TMPDIR"] = os.environ["LAB_TMP_DIR"]
+        try:
+            Path(os.environ["LAB_TMP_DIR"]).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
 
 # ── 模块级单例：import 即可用 ──

@@ -28,12 +28,44 @@ from lab_env import Environment as Env
 MAX_LOG_SIZE = 8000
 
 
+def collect_infra_failures(log) -> list[dict]:
+    """提取 fast-check 中的基础设施失败条目。"""
+    failures = []
+    if not isinstance(log, list):
+        return failures
+    for test_log in log:
+        data = test_log.get("log", {})
+        if not isinstance(data, dict):
+            continue
+        if data.get("infra_error"):
+            failures.append(
+                {
+                    "name": test_log.get("name", "unknown"),
+                    "reason": data.get("infra_reason", "infra_error"),
+                    "detail": data.get("alive2", {}).get("log", data.get("log", "")),
+                }
+            )
+            continue
+        alive2 = data.get("alive2", {})
+        if isinstance(alive2, dict) and alive2.get("infra_error"):
+            failures.append(
+                {
+                    "name": test_log.get("name", "unknown"),
+                    "reason": alive2.get("infra_reason", "alive2_infra_error"),
+                    "detail": alive2.get("log", ""),
+                }
+            )
+    return failures
+
+
 def normalize_build_errors(log) -> str:
     """从构建日志中提取关键错误行。"""
     if isinstance(log, list):
         return json.dumps(log, indent=2)[:MAX_LOG_SIZE]
     text = str(log)
-    pattern = re.compile(r"(llvm-project/llvm/[^\n]+error:[^\n]+(?:\n[ ]*\d+\s*\|[^\n]*)?)")
+    pattern = re.compile(
+        r"(llvm-project/llvm/[^\n]+error:[^\n]+(?:\n[ ]*\d+\s*\|[^\n]*)?)"
+    )
     matches = pattern.findall(text)
     if matches:
         result = "\n".join(matches)
@@ -63,6 +95,9 @@ def format_test_results(log) -> str:
         if not result:
             log_data = test_log.get("log", {})
             if isinstance(log_data, dict):
+                if log_data.get("infra_error"):
+                    reason = log_data.get("infra_reason", "infra_error")
+                    output.append(f"  Infra error: {reason}")
                 # 输出 source / expected / current IR 对比
                 src = log_data.get("source_program", "")
                 exp = log_data.get("expect_optimized_program", "")
@@ -77,6 +112,10 @@ def format_test_results(log) -> str:
                 # Alive2 结果
                 alive2 = log_data.get("alive2", {})
                 if isinstance(alive2, dict):
+                    if alive2.get("infra_error"):
+                        output.append(
+                            f"  Alive2 infra error: {alive2.get('infra_reason', 'unknown')}"
+                        )
                     a2log = alive2.get("log", "")
                     if a2log and "0 incorrect" not in str(a2log):
                         a2_text = str(a2log)
@@ -120,6 +159,12 @@ def main():
             print("✓ BUILD SUCCESS")
             print("✗ FAST CHECK FAILED")
             print()
+            infra_failures = collect_infra_failures(log)
+            if infra_failures:
+                print("! INFRA FAILURE DETECTED (toolchain/runtime)")
+                for item in infra_failures[:3]:
+                    print(f"  - {item['name']}: {item['reason']}")
+                print()
             print(format_test_results(log))
 
 

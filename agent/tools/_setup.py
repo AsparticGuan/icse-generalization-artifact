@@ -26,6 +26,14 @@ _agent_dir = os.path.join(PROJECT_ROOT, "agent")
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
+_default_tmp_dir = os.path.join(PROJECT_ROOT, ".tmp")
+os.environ.setdefault("LAB_TMP_DIR", _default_tmp_dir)
+os.environ.setdefault("TMPDIR", os.environ["LAB_TMP_DIR"])
+try:
+    os.makedirs(os.environ["LAB_TMP_DIR"], exist_ok=True)
+except Exception:
+    pass
+
 
 def get_env_or_die(key: str) -> str:
     """获取环境变量，缺失时直接报错退出。"""

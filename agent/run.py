@@ -54,11 +54,26 @@ from env_config import cfg
 # 双保险：即便外部 shell/.env 注入了其它值，也仅使用 dataset/。
 cfg.dataset_dir = _PROJECT_DATASET_DIR
 
+
+def _ensure_writable_tmp_dir(path: str) -> str:
+    """确保临时目录存在且可写；失败时抛异常以便上层快速失败。"""
+    os.makedirs(path, exist_ok=True)
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise PermissionError(f"LAB_TMP_DIR is not writable: {path}")
+    return path
+
+
 os.environ.setdefault("LAB_LLVM_DIR", cfg.llvm_dir)
 os.environ.setdefault("LAB_LLVM_BUILD_DIR", cfg.llvm_build_dir)
 os.environ["LAB_DATASET_DIR"] = cfg.dataset_dir
 os.environ.setdefault("LAB_LLVM_ALIVE_TV", cfg.alive_tv)
 os.environ.setdefault("LAB_LLVM_COST_TOOL", cfg.cost_tool)
+_tmp_dir = os.environ.get("LAB_TMP_DIR", cfg.tmp_dir)
+if not _tmp_dir:
+    _tmp_dir = cfg.tmp_dir
+_tmp_dir = _ensure_writable_tmp_dir(_tmp_dir)
+os.environ["LAB_TMP_DIR"] = _tmp_dir
+os.environ["TMPDIR"] = _tmp_dir
 
 import llvm_helper  # pyright: ignore[reportMissingImports]
 from lab_env import Environment as Env  # pyright: ignore[reportMissingImports]
@@ -1101,8 +1116,13 @@ def _get_opt_debug_output_pipeline(
         if not isinstance(opt_cmd, str) or not opt_cmd.strip():
             return None
 
+        tmp_dir = os.environ.get("LAB_TMP_DIR") or None
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".ll", delete=False, encoding="utf-8"
+            mode="w",
+            suffix=".ll",
+            delete=False,
+            encoding="utf-8",
+            dir=tmp_dir,
         ) as f:
             f.write(source_program)
             temp_file = f.name
@@ -1793,6 +1813,13 @@ def fix_issue(
     thinking_overrides: dict[str, object] | None = None,
 ):
     """用 mini-swe-agent 修复单个 issue。"""
+    tmp_dir = os.environ.get("LAB_TMP_DIR", cfg.tmp_dir)
+    if not tmp_dir:
+        tmp_dir = cfg.tmp_dir
+    tmp_dir = _ensure_writable_tmp_dir(tmp_dir)
+    os.environ["LAB_TMP_DIR"] = tmp_dir
+    os.environ["TMPDIR"] = tmp_dir
+
     run_output_dir, fix_log_path, traj_path, preds_path = _build_output_paths(issue_id)
 
     if not override and os.path.exists(fix_log_path):

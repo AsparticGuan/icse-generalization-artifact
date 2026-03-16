@@ -28,6 +28,7 @@ import os
 import subprocess
 import re
 import tempfile
+from pathlib import Path
 
 # NOTE: llvm-lit requires psutil
 import psutil  # noqa: F401
@@ -38,6 +39,17 @@ llvm_build_dir = os.environ["LAB_LLVM_BUILD_DIR"]
 llvm_alive_tv = os.environ["LAB_LLVM_ALIVE_TV"]
 llvm_cost_tool = os.environ["LAB_LLVM_COST_TOOL"]
 dataset_dir = os.environ["LAB_DATASET_DIR"]
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ALIVE2_HEALTHCHECK_SAMPLE = (
+    _PROJECT_ROOT
+    / "utils"
+    / "alive2"
+    / "tests"
+    / "alive-tv"
+    / "noundef_metadata.srctgt.ll"
+)
+_ALIVE2_HEALTHCHECK_RESULT = None
+_DEFAULT_TMP_DIR = str(_PROJECT_ROOT / ".tmp")
 
 # 兼容不同 Ninja 版本：若支持 --quiet，则构建时默认静默输出。
 NINJA_QUIET = ["--", "--quiet"]
@@ -45,6 +57,151 @@ if "--quiet" not in subprocess.run(
     ["ninja", "--help"], capture_output=True
 ).stderr.decode("utf-8"):
     NINJA_QUIET = []
+
+
+def _tmp_dir_from_env():
+    """返回并校验临时目录；未配置时回退到项目内 .tmp。"""
+    tmp_dir = (
+        os.environ.get("LAB_TMP_DIR") or os.environ.get("TMPDIR") or _DEFAULT_TMP_DIR
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    if not os.access(tmp_dir, os.W_OK | os.X_OK):
+        raise PermissionError(f"Temporary directory is not writable: {tmp_dir}")
+    os.environ["LAB_TMP_DIR"] = tmp_dir
+    os.environ["TMPDIR"] = tmp_dir
+    return tmp_dir
+
+
+def _named_temp_file(**kwargs):
+    """统一临时文件创建入口，优先使用 LAB_TMP_DIR/TMPDIR。"""
+    tmp_dir = _tmp_dir_from_env()
+    if tmp_dir:
+        kwargs.setdefault("dir", tmp_dir)
+    return tempfile.NamedTemporaryFile(**kwargs)
+
+
+def _alive2_summary_success(output: str) -> bool:
+    """Alive2 成功判定（兼容 summary 与简化输出）。"""
+    if "Transformation seems to be correct" in output:
+        return True
+    return (
+        "0 incorrect transformations" in output
+        and "0 failed-to-prove transformations" in output
+        and "0 Alive2 errors" in output
+    )
+
+
+def _detect_alive2_infra_reason(output: str):
+    """识别 Alive2 工具链/运行时故障，返回 infra reason 或 None。"""
+    text = str(output or "")
+    lower = text.lower()
+    if "permission denied" in lower and "/tmp" in lower:
+        return "tmp_permission_denied"
+    if "error while loading shared libraries" in lower:
+        return "alive2_missing_runtime"
+    if "no such file or directory" in lower and "alive" in lower:
+        return "alive2_binary_missing"
+    if "not executable" in lower and "alive" in lower:
+        return "alive2_not_executable"
+    if "block cannot be empty" in lower:
+        return "alive2_parse_error"
+    if "usage: alive2" in lower:
+        return "alive2_wrong_binary"
+    return None
+
+
+def _build_alive2_infra_log(reason: str, detail: str):
+    """构造统一 infra 错误日志结构。"""
+    return {
+        "infra_error": True,
+        "infra_reason": reason,
+        "log": detail,
+    }
+
+
+def _alive2_log_is_infra(log):
+    return isinstance(log, dict) and bool(log.get("infra_error"))
+
+
+def _test_log_has_infra_error(log):
+    if not isinstance(log, dict):
+        return False
+    if log.get("infra_error"):
+        return True
+    return _alive2_log_is_infra(log.get("alive2"))
+
+
+def _alive2_healthcheck():
+    """对 alive-tv 做一次性健康检查，避免后续反复失败。"""
+    global llvm_alive_tv
+    global _ALIVE2_HEALTHCHECK_RESULT
+    if _ALIVE2_HEALTHCHECK_RESULT is not None:
+        return _ALIVE2_HEALTHCHECK_RESULT
+
+    project_alive_tv = str(_PROJECT_ROOT / "utils" / "alive2" / "build" / "alive-tv")
+    candidates = []
+    for cand in [
+        llvm_alive_tv,
+        "/usr/local/bin/alive-tv",
+        "/usr/bin/alive-tv",
+        project_alive_tv,
+    ]:
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    last_error = ""
+    for cand in candidates:
+        if not os.path.isfile(cand):
+            last_error = f"alive-tv not found: {cand}"
+            continue
+        if not os.access(cand, os.X_OK):
+            last_error = f"alive-tv is not executable: {cand}"
+            continue
+        if os.path.basename(os.path.realpath(cand)) == "alive":
+            last_error = (
+                f"alive-tv points to alive binary: {cand} -> {os.path.realpath(cand)}"
+            )
+            continue
+
+        if _ALIVE2_HEALTHCHECK_SAMPLE.is_file():
+            try:
+                out = subprocess.run(
+                    [cand, str(_ALIVE2_HEALTHCHECK_SAMPLE)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30.0,
+                    check=False,
+                )
+                merged = (out.stdout or "") + (f"\n{out.stderr}" if out.stderr else "")
+                if _alive2_summary_success(merged):
+                    llvm_alive_tv = cand
+                    os.environ["LAB_LLVM_ALIVE_TV"] = cand
+                    _ALIVE2_HEALTHCHECK_RESULT = (True, f"ok:{cand}")
+                    return _ALIVE2_HEALTHCHECK_RESULT
+                reason = _detect_alive2_infra_reason(merged)
+                if reason is not None:
+                    last_error = (
+                        f"alive-tv healthcheck failed for {cand} ({reason}):\n{merged}"
+                    )
+                    continue
+                if out.returncode != 0:
+                    last_error = f"alive-tv healthcheck failed for {cand} with code {out.returncode}:\n{merged}"
+                    continue
+                llvm_alive_tv = cand
+                os.environ["LAB_LLVM_ALIVE_TV"] = cand
+                _ALIVE2_HEALTHCHECK_RESULT = (True, f"ok:{cand}")
+                return _ALIVE2_HEALTHCHECK_RESULT
+            except Exception as e:
+                last_error = f"alive-tv healthcheck exception for {cand}: {e}"
+                continue
+        else:
+            llvm_alive_tv = cand
+            os.environ["LAB_LLVM_ALIVE_TV"] = cand
+            _ALIVE2_HEALTHCHECK_RESULT = (True, f"ok:{cand}")
+            return _ALIVE2_HEALTHCHECK_RESULT
+
+    _ALIVE2_HEALTHCHECK_RESULT = (False, last_error or "alive-tv healthcheck failed")
+    return _ALIVE2_HEALTHCHECK_RESULT
 
 
 def git_execute(args):
@@ -203,11 +360,23 @@ def filter_out_unsupported_feats(src: str):
 
 def alive2_check(src: str, tgt: str, additional_args: str):
     """调用 Alive2 对源码 IR 与优化后 IR 做语义等价检查。"""
+    src = filter_out_unsupported_feats(src)
+    tgt = filter_out_unsupported_feats(tgt)
+
+    health_ok, health_log = _alive2_healthcheck()
+    if not health_ok:
+        return (
+            False,
+            {
+                "src": src,
+                "tgt": tgt,
+                **_build_alive2_infra_log("alive2_healthcheck_failed", health_log),
+            },
+        )
+
     try:
-        with tempfile.NamedTemporaryFile() as src_file:
-            with tempfile.NamedTemporaryFile() as tgt_file:
-                src = filter_out_unsupported_feats(src)
-                tgt = filter_out_unsupported_feats(tgt)
+        with _named_temp_file() as src_file:
+            with _named_temp_file() as tgt_file:
                 src_file.write(src.encode())
                 tgt_file.write(tgt.encode())
                 src_file.flush()
@@ -220,21 +389,46 @@ def alive2_check(src: str, tgt: str, additional_args: str):
                     tgt_file.name,
                 ]
                 if additional_args is not None:
-                    args += additional_args.strip().split(" ")
+                    args += [arg for arg in additional_args.strip().split(" ") if arg]
 
                 out = subprocess.check_output(args, stderr=subprocess.STDOUT).decode()
-                # Alive2 三个关键指标都为 0 时视为语义验证成功。
-                success = (
-                    "0 incorrect transformations" in out
-                    and "0 failed-to-prove transformations" in out
-                    and "0 Alive2 errors" in out
-                )
+                success = _alive2_summary_success(out)
+                infra_reason = _detect_alive2_infra_reason(out)
+                if infra_reason is not None:
+                    return (
+                        False,
+                        {
+                            "src": src,
+                            "tgt": tgt,
+                            **_build_alive2_infra_log(infra_reason, out),
+                        },
+                    )
                 return (success, {"src": src, "tgt": tgt, "log": out})
     except subprocess.CalledProcessError as e:
-        return (False, str(e) + "\n" + decode_output(e.output))
+        err_log = str(e) + "\n" + decode_output(e.output)
+        infra_reason = _detect_alive2_infra_reason(err_log)
+        if infra_reason is not None:
+            return (
+                False,
+                {
+                    "src": src,
+                    "tgt": tgt,
+                    **_build_alive2_infra_log(infra_reason, err_log),
+                },
+            )
+        return (False, {"src": src, "tgt": tgt, "log": err_log})
     except Exception as e:
         # 例如 alive-tv 未安装或路径不存在时，返回失败日志而不是抛异常中断主流程。
-        return (False, str(e))
+        err_log = str(e)
+        infra_reason = _detect_alive2_infra_reason(err_log) or "alive2_exception"
+        return (
+            False,
+            {
+                "src": src,
+                "tgt": tgt,
+                **_build_alive2_infra_log(infra_reason, err_log),
+            },
+        )
 
 
 def lli_check(tgt: bytes, expected_out: str):
@@ -278,7 +472,7 @@ def cost_check(
         "current_optimized_program": -1,
     }
     for prog_name in programs:
-        with tempfile.NamedTemporaryFile(suffix=".ll") as code_file:
+        with _named_temp_file(suffix=".ll") as code_file:
             code_file.write(programs[prog_name].encode())
             code_file.flush()
             try:
@@ -327,8 +521,8 @@ def filecheck_check(src: str, tgt: str, args_list: list[str]):
                 filecheck_command.append(
                     f"--check-prefixes={','.join(check_prefixes_used)}"
                 )
-    with tempfile.NamedTemporaryFile() as src_file:
-        with tempfile.NamedTemporaryFile() as tgt_file:
+    with _named_temp_file() as src_file:
+        with _named_temp_file() as tgt_file:
             src = filter_out_unsupported_feats(src)
             tgt = filter_out_unsupported_feats(tgt)
             src_file.write(src.encode())
@@ -462,6 +656,9 @@ def verify_dispatch(
                 new_input, output.decode(), filecheck_args_list
             )
             log = {"alive2": log_alive2, "cost": log_cost, "filecheck": log_filecheck}
+            if _alive2_log_is_infra(log_alive2):
+                log["infra_error"] = True
+                log["infra_reason"] = log_alive2.get("infra_reason")
             if source_program is not None and expect_optimized_program is not None:
                 log["source_program"] = source_program
                 log["expect_optimized_program"] = expect_optimized_program
@@ -473,6 +670,9 @@ def verify_dispatch(
                 res = res_filecheck
                 if not res:
                     # if filecheck fails, we use alive2_check and cost_check to check if the optimized program is correct and cost is low
+                    if _alive2_log_is_infra(log_alive2):
+                        log["opt_stderr"] = decode_output(out.stderr)
+                        return (False, log)
                     res = res_alive2 and res_cost
             log["opt_stderr"] = decode_output(out.stderr)
             return (res, log)
@@ -519,6 +719,8 @@ def verify_test_group(repro: bool, input, type: str):
                         "log": log,
                     }
                 )
+                if _test_log_has_infra_error(log):
+                    return (False, test_res)
                 if repro:
                     overall_test_res = overall_test_res or res
                 else:
@@ -596,6 +798,8 @@ def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_li
                             "log": log,
                         }
                     )
+                    if _test_log_has_infra_error(log):
+                        return (False, test_res)
                     if repro:
                         overall_test_res = overall_test_res or res
                     else:
@@ -651,6 +855,21 @@ def verify_test_group_orig(repro: bool, input_tests, type_str: str, component_li
                     "expect_optimized_program": expect_optimized_program,
                     "current_optimized_program": current_optimized_program,
                 }
+                if _alive2_log_is_infra(log_alive2):
+                    log["infra_error"] = True
+                    log["infra_reason"] = log_alive2.get("infra_reason")
+                    res = False
+                    test_res.append(
+                        {
+                            "file": file,
+                            "args": "(no FileCheck)",
+                            "name": name,
+                            "body": "",
+                            "result": False,
+                            "log": log,
+                        }
+                    )
+                    return (False, test_res)
                 if repro:
                     res = res_alive2 and not res_cost
                 else:

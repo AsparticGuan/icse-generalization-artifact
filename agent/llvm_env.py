@@ -30,6 +30,8 @@ class LLVMEnvironment(LocalEnvironment):
         timeout: int = 600,
         extra_env: dict[str, str] | None = None,
     ):
+        os.makedirs(cfg.tmp_dir, exist_ok=True)
+
         # 构建传给工具脚本的环境变量映射（从 cfg 集中读取，不再散落 os.environ.get）
         env_vars: dict[str, str] = {
             # 核心路径
@@ -38,6 +40,8 @@ class LLVMEnvironment(LocalEnvironment):
             "LAB_LLVM_BUILD_DIR": llvm_build_dir,
             # 从集中配置继承
             "LAB_DATASET_DIR": cfg.dataset_dir,
+            "LAB_TMP_DIR": cfg.tmp_dir,
+            "TMPDIR": cfg.tmp_dir,
             "LAB_LLVM_ALIVE_TV": cfg.alive_tv,
             "LAB_LLVM_COST_TOOL": cfg.cost_tool,
             "LAB_LLM_BASEMODEL_CUTOFF": cfg.llm_basemodel_cutoff,
