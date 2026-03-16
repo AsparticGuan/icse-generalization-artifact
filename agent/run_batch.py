@@ -297,6 +297,7 @@ def _build_cmd(
     issue_arg: str | None,
     force: bool,
     *,
+    fresh_run: bool,
     localize_mode: str | None,
     ordered_effort: str | None,
     profile_args: list[str],
@@ -315,6 +316,8 @@ def _build_cmd(
     cmd.extend(profile_args)
     if force:
         cmd.append("-f")
+    if fresh_run:
+        cmd.append("--fresh-run")
     if retest:
         cmd.append("--retest")
     if retest_force:
@@ -441,6 +444,14 @@ def main() -> int:
         help="透传 -f 给 agent/run.py，覆盖已有结果。",
     )
     parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help=(
+            "透传 --fresh-run 给 run.py。每个 issue 运行前清理并重建工作区，"
+            "避免继承已有 clone/build/build_cache。"
+        ),
+    )
+    parser.add_argument(
         "--stop-on-error",
         action="store_true",
         help="任一模型执行失败时立即停止（默认继续执行后续模型）。",
@@ -534,6 +545,7 @@ def main() -> int:
         + (args.localize_mode if args.localize_mode is not None else "(run.py default)")
     )
     print(f"Force overwrite: {args.force}")
+    print(f"Fresh run: {args.fresh_run}")
     print(
         "Per-model timeout (seconds): "
         + (
@@ -593,6 +605,7 @@ def main() -> int:
             model,
             issue_arg,
             args.force,
+            fresh_run=args.fresh_run,
             localize_mode=args.localize_mode,
             ordered_effort=None,
             profile_args=per_model_profile_args,

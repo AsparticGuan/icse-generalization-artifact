@@ -215,7 +215,7 @@ def alive2_check(src: str, tgt: str, additional_args: str):
 
                 args = [
                     llvm_alive_tv,
-                    "--disable-undef-input",
+                    "-disable-undef-input",
                     src_file.name,
                     tgt_file.name,
                 ]

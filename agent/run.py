@@ -5,6 +5,7 @@
     python agent/run.py                     # 处理 dataset/ 下全部 issue
     python agent/run.py 85250               # 处理指定 issue
     python agent/run.py 85250 -f            # 覆盖已有结果
+    python agent/run.py 85250 --fresh-run   # 每次从全新工作区和全新 build 开始
     python agent/run.py 85250,76128         # 处理多个 issue（逗号分隔）
     python agent/run.py 85250 --retest      # 结束后直接调用 agent/retest_patches.py 复测同批 patch
     python agent/run.py 85250 --retest --retest-force
@@ -566,6 +567,14 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
         help="覆盖已有修复结果。",
     )
     parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help=(
+            "每个 issue 运行前清理并重建工作区：删除 utils/llvm-<issue>、"
+            "build/<issue> 与 build/<issue>_cache。"
+        ),
+    )
+    parser.add_argument(
         "--retest",
         "--retest-patches",
         dest="retest_patches",
@@ -769,6 +778,23 @@ def ensure_llvm_clone_for_issue(issue_id: str, base_llvm_dir: str = "") -> str:
             ["git", "clone", "https://github.com/llvm/llvm-project.git", issue_dir]
         )
     return issue_dir
+
+
+def _clean_issue_workspace(issue_id: str) -> None:
+    """清理 issue 相关工作区，确保从全新 clone / build 开始。"""
+    issue_dir = os.path.join(UTILS_DIR, f"llvm-{issue_id}")
+    build_dir = os.path.join(cfg.llvm_build_dir, issue_id)
+    build_cache_dir = os.path.join(cfg.llvm_build_dir, issue_id + "_cache")
+    targets = [issue_dir, build_dir, build_cache_dir]
+
+    for path in targets:
+        if not os.path.exists(path):
+            continue
+        print(f"[FreshRun] Remove: {path}")
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -1763,6 +1789,7 @@ def fix_issue(
     *,
     model_name: str,
     localize_mode: str,
+    fresh_run: bool = False,
     thinking_overrides: dict[str, object] | None = None,
 ):
     """用 mini-swe-agent 修复单个 issue。"""
@@ -1777,6 +1804,9 @@ def fix_issue(
     print(f"{'='*60}")
 
     start_time = time.time()
+
+    if fresh_run:
+        _clean_issue_workspace(issue_id)
 
     # 1. 准备 per-issue LLVM 克隆
     issue_llvm_dir = ensure_llvm_clone_for_issue(issue_id, cfg.llvm_dir)
@@ -2197,11 +2227,12 @@ if __name__ == "__main__":
     print(f"Agent workflow — {len(task_list)} issue(s) to process")
     print(f"Model: {cfg.llm_model}")
     print(f"Localization mode: {localize_mode} (source={localize_mode_source})")
+    print("Thinking overrides:")
     if thinking_overrides:
-        print("Thinking overrides:")
         print(json.dumps(thinking_overrides, indent=2, ensure_ascii=False))
     print(f"Results root: {RESULTS_AGENT_DIR}")
     print(f"Run timestamp: {cfg.run_timestamp}")
+    print(f"Fresh run: {args.fresh_run}")
     if args.retest_patches:
         target_retest_root = args.retest_dir.strip() or _default_retest_root()
         print("Retest with agent/retest_patches.py: enabled")
@@ -2209,6 +2240,7 @@ if __name__ == "__main__":
         print("Retest file pattern: <retest_root>/<safe_issue>/<timestamp>/retest.json")
     print()
 
+    retest_issue_ids = []
     for task_id in task_list:
         try:
             fix_issue(
@@ -2216,8 +2248,10 @@ if __name__ == "__main__":
                 override=override,
                 model_name=cfg.llm_model,
                 localize_mode=localize_mode,
+                fresh_run=args.fresh_run,
                 thinking_overrides=thinking_overrides,
             )
+            retest_issue_ids.append(task_id)
         except Exception as e:
             print(f"ERROR processing {task_id}: {e}")
             import traceback
