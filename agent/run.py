@@ -30,6 +30,7 @@ import time
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -84,13 +85,49 @@ def _safe_env_int(key: str, default: int) -> int:
         return default
 
 
+def _safe_env_bool(key: str, default: bool) -> bool:
+    """Read boolean env var with safe fallback."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+LOCALIZE_MODE_PIPELINE = "pipeline"
+LOCALIZE_MODE_LITE = "lite"
+LOCALIZE_MODE_CHOICES = (LOCALIZE_MODE_PIPELINE, LOCALIZE_MODE_LITE)
+LOCALIZE_MODE_ENV_KEY = "LAB_AGENT_LOCALIZE_MODE"
+LOCALIZE_DEFAULT_MODE = LOCALIZE_MODE_PIPELINE
+
 LOCALIZE_RUNTIME_ENABLED = os.environ.get("LAB_AGENT_RUNTIME_LOCALIZE", "ON") == "ON"
 LOCALIZE_TOP_K_FILES = max(1, _safe_env_int("LAB_AGENT_LOCALIZE_TOP_K_FILES", 3))
 LOCALIZE_TOP_K_FUNCS = max(1, _safe_env_int("LAB_AGENT_LOCALIZE_TOP_K_FUNCS", 3))
 LOCALIZE_MAX_FILE_CHARS = max(
     2000, _safe_env_int("LAB_AGENT_LOCALIZE_MAX_FILE_CHARS", 120000)
 )
+LOCALIZE_MAX_ISSUE_DESC_CHARS = max(
+    2000, _safe_env_int("LAB_AGENT_LOCALIZE_MAX_ISSUE_DESC_CHARS", 20000)
+)
+LOCALIZE_MAX_DEBUG_CHARS = max(
+    1000, _safe_env_int("LAB_AGENT_LOCALIZE_MAX_DEBUG_CHARS", 5000)
+)
+LOCALIZE_ENABLE_OPT_DEBUG = _safe_env_bool("LAB_AGENT_LOCALIZE_ENABLE_OPT_DEBUG", True)
+LOCALIZE_BUILD_BEFORE_OPT_DEBUG = _safe_env_bool(
+    "LAB_AGENT_LOCALIZE_BUILD_BEFORE_OPT_DEBUG", True
+)
+LOCALIZE_OPT_DEBUG_TIMEOUT = max(
+    5, _safe_env_int("LAB_AGENT_LOCALIZE_OPT_DEBUG_TIMEOUT", 30)
+)
 LOCALIZE_TIMEOUT_SECONDS = max(15, _safe_env_int("LAB_AGENT_LOCALIZE_TIMEOUT", 120))
+LIMITS_RETRY_ENABLED = os.environ.get("LAB_AGENT_LIMITS_RETRY", "ON") == "ON"
+LIMITS_RETRY_EXTRA_STEPS = max(
+    5, _safe_env_int("LAB_AGENT_LIMITS_RETRY_EXTRA_STEPS", 25)
+)
 
 LOCALIZE_CANDIDATE_FILES = [
     "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp",
@@ -119,6 +156,19 @@ LOCALIZE_SYS_PROMPT_FUNC = (
     "Identify which function in the given file is most likely responsible."
 )
 LOCALIZE_TEXT_BLOCK_PATTERN = re.compile(r"```text(.*?)```", re.DOTALL)
+LOCALIZE_FORMAT_ISSUE_DESC_FROM_PROGRAMS = """
+The following program reveals the missed optimization.
+The source program is
+```llvm
+{source_program}
+```
+
+However, current LLVM cannot optimize the source program. The expected optimized program is
+```llvm
+{expect_optimized_program}
+```
+"""
+LOCALIZE_CACHE_FILENAME = "localization.json"
 
 
 def _safe_path_part(value: str) -> str:
@@ -134,6 +184,14 @@ def _model_results_root() -> str:
     return model_root
 
 
+def _issue_results_dir(issue_id: str) -> str:
+    """当前模型下单 issue 的稳定输出目录。"""
+    issue_part = _safe_path_part(issue_id)
+    issue_dir = os.path.join(_model_results_root(), issue_part)
+    os.makedirs(issue_dir, exist_ok=True)
+    return issue_dir
+
+
 def _build_output_paths(issue_id: str) -> tuple[str, str, str, str]:
     """构造单 issue 的输出路径。
 
@@ -143,9 +201,7 @@ def _build_output_paths(issue_id: str) -> tuple[str, str, str, str]:
         - traj.json
         - preds.json
     """
-    issue_part = _safe_path_part(issue_id)
-    issue_dir = os.path.join(_model_results_root(), issue_part)
-    os.makedirs(issue_dir, exist_ok=True)
+    issue_dir = _issue_results_dir(issue_id)
 
     run_dir = os.path.join(issue_dir, cfg.run_timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -535,6 +591,15 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
         default="",
         help="覆盖 LAB_LLM_MODEL（例如 openai/gpt-5.4、qwen/qwen3.5-plus）。",
     )
+    parser.add_argument(
+        "--localize-mode",
+        choices=list(LOCALIZE_MODE_CHOICES),
+        default=None,
+        help=(
+            "运行时 localization 模式（pipeline|lite）。"
+            "优先级：CLI > LAB_AGENT_LOCALIZE_MODE > pipeline（默认）。"
+        ),
+    )
 
     # 通用强度档位（会根据模型自动映射到 reasoning/thinking 参数）
     parser.add_argument(
@@ -614,6 +679,28 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_localize_mode(cli_mode: str | None) -> tuple[str, str]:
+    """Resolve localization mode with priority: CLI > env > default."""
+    if cli_mode:
+        mode = cli_mode.strip().lower()
+        source = "cli"
+    else:
+        raw_env = os.environ.get(LOCALIZE_MODE_ENV_KEY, "").strip().lower()
+        if raw_env:
+            mode = raw_env
+            source = "env"
+        else:
+            mode = LOCALIZE_DEFAULT_MODE
+            source = "default"
+
+    if mode not in LOCALIZE_MODE_CHOICES:
+        allowed = ", ".join(LOCALIZE_MODE_CHOICES)
+        raise ValueError(
+            f"{LOCALIZE_MODE_ENV_KEY}={mode!r} 无效（允许值：{allowed}）。"
+        )
+    return mode, source
+
+
 def _default_retest_root() -> str:
     """构造 agent 默认复测输出根目录。"""
     return _model_results_root()
@@ -684,19 +771,55 @@ def ensure_llvm_clone_for_issue(issue_id: str, base_llvm_dir: str = "") -> str:
     return issue_dir
 
 
-def _first_missed_optimization_desc(env: Env) -> str:
-    """提取首个未优化测试样例并构造 issue 描述。"""
+def _truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n<Truncated>..."
+
+
+def _get_first_missed_optimization_test_case(
+    env: Env,
+) -> tuple[str, str, str, dict] | None:
+    """Return first mismatched test case: source/current/expected/test_file."""
     for test_file in env.get_tests():
-        for test in test_file["tests"]:
-            cur = test.get("current_optimized_program", "").strip()
-            exp = test.get("expect_optimized_program", "").strip()
+        tests = test_file.get("tests", [])
+        if not isinstance(tests, list):
+            continue
+        for test in tests:
+            if not isinstance(test, dict):
+                continue
+            source_program = str(test.get("source_program", ""))
+            cur = str(test.get("current_optimized_program", "")).strip()
+            exp = str(test.get("expect_optimized_program", "")).strip()
             if cur != exp:
-                return (
-                    "The following program reveals the missed optimization.\n"
-                    f"The source program is:\n```llvm\n{test['source_program']}\n```\n\n"
-                    f"The expected optimized program is:\n```llvm\n{test['expect_optimized_program']}\n```\n"
-                )
-    return ""
+                return source_program, cur, exp, test_file
+    return None
+
+
+def _build_pipeline_issue_desc(
+    source_program: str,
+    current_optimized_program: str,
+    expect_optimized_program: str,
+) -> str:
+    del current_optimized_program
+    desc = LOCALIZE_FORMAT_ISSUE_DESC_FROM_PROGRAMS.format(
+        source_program=source_program,
+        expect_optimized_program=expect_optimized_program,
+    )
+    return _truncate_text(desc, LOCALIZE_MAX_ISSUE_DESC_CHARS)
+
+
+def _first_missed_optimization_desc(env: Env) -> str:
+    """提取首个未优化测试样例并构造轻量 issue 描述。"""
+    case = _get_first_missed_optimization_test_case(env)
+    if not case:
+        return ""
+    source_program, _cur, expect_optimized_program, _test_file = case
+    return (
+        "The following program reveals the missed optimization.\n"
+        f"The source program is:\n```llvm\n{source_program}\n```\n\n"
+        f"The expected optimized program is:\n```llvm\n{expect_optimized_program}\n```\n"
+    )
 
 
 def _normalize_str_list(raw: object, *, limit: int) -> list[str]:
@@ -767,8 +890,8 @@ def _extract_topk_lines_from_model_output(model_output: str, top_k: int) -> list
     return cleaned
 
 
-def _build_file_localize_prompt(issue_desc: str) -> str:
-    """Build pipeline-style file localization prompt."""
+def _build_file_localize_prompt_lite(issue_desc: str) -> str:
+    """Build lightweight file localization prompt."""
     candidate_lines = "\n".join(os.path.basename(x) for x in LOCALIZE_CANDIDATE_FILES)
     return f"""
 LLVM has a missed optimization bug. Locate where to edit in InstCombine.
@@ -790,8 +913,11 @@ InstructionCombining.cpp
 """.strip()
 
 
-def _build_func_localize_prompt(pred_file: str, issue_desc: str, file_text: str) -> str:
-    """Build pipeline-style function localization prompt."""
+def _build_func_localize_prompt_lite(
+    pred_file: str, issue_desc: str, file_text: str
+) -> str:
+    """Build lightweight function localization prompt."""
+    file_text = _truncate_text(file_text, LOCALIZE_MAX_FILE_CHARS)
     return f"""
 LLVM has a missed optimization bug.
 The likely file is `{pred_file}`.
@@ -813,6 +939,224 @@ InstCombinerImpl::visitAdd
 InstCombinerImpl::visitMul
 ```
 """.strip()
+
+
+def _build_file_localize_prompt_pipeline(
+    issue_desc: str, debug_output: str | None
+) -> str:
+    """Build pipeline/localize.py-style file localization prompt."""
+    candidate_lines = "\n".join(os.path.basename(x) for x in LOCALIZE_CANDIDATE_FILES)
+    debug_context = ""
+    if debug_output:
+        debug_context = f"""
+
+**Debug Output Context**: When running the `opt` command on the source program, the following debug output was generated. This output may reveal which optimization passes, analyses, or code paths are involved in processing this program. Use this information to help identify which files are most likely responsible for the missed optimization:
+
+```
+{_truncate_text(debug_output, LOCALIZE_MAX_DEBUG_CHARS)}
+```
+"""
+
+    analyze_section = (
+        "### 1. Analyze\n"
+        "**Content**: Provide a deep analysis of the missed optimization. Explain:"
+    )
+    if debug_output:
+        analyze_section += (
+            "\n- **Context**: Consider the debug output provided above, which "
+            "shows the actual execution trace of LLVM optimization passes when "
+            "processing this program."
+        )
+    analyze_section += """
+- **What** the issue is (what optimization is missing or failing).
+- **Why** it happens in the current LLVM implementation (e.g., which patterns, analyses, or passes are insufficient or incorrect).
+- **Impact** on performance or correctness.
+"""
+
+    verify_section = (
+        "### 3. Verify\n"
+        f"**Content**: Justify why these {LOCALIZE_TOP_K_FILES} specific files are the most appropriate locations for the change:"
+    )
+    if debug_output:
+        verify_section += (
+            "\n- **Evidence from Debug Output**: If the debug output above "
+            "mentions specific passes or components, explain how this supports "
+            "your file selection."
+        )
+    verify_section += """
+- Describe the responsibilities and typical transformations implemented in each file.
+- Explain the ranking order (why the first file is more likely than the second, etc.).
+"""
+
+    prompt = f"""
+LLVM is currently unable to perform this optimization successfully. Your task is to identify which files below are most likely to be modified to implement the missing optimization. Use the exact Markdown section headings and structure provided.
+
+{issue_desc}{debug_context}
+
+You must choose exactly {LOCALIZE_TOP_K_FILES} files from this list (ranked by likelihood):
+
+{candidate_lines}
+
+--
+
+{analyze_section}
+
+### 2. Propose positions
+**Content**: You must output exactly {LOCALIZE_TOP_K_FILES} file names from the list above, ranked by likelihood (most likely first). Do not explain here; only output the chosen file names exactly as written in the list, one per line.
+
+{verify_section}
+
+### 4. Submit
+**Content**: Provide the final answer by outputting file names (one per line), enclosed in a Markdown code block with language tag `text`, like:
+
+```text
+InstCombineXXX.cpp
+InstCombineYYY.cpp
+InstCombineZZZ.cpp
+```
+""".strip()
+    return prompt
+
+
+def _build_func_localize_prompt_pipeline(
+    pred_file: str,
+    full_path_rel: str,
+    issue_desc: str,
+    file_text: str,
+) -> str:
+    """Build pipeline/localize.py-style function localization prompt."""
+    file_text = _truncate_text(file_text, LOCALIZE_MAX_FILE_CHARS)
+    return f"""
+LLVM is currently unable to perform this optimization successfully. We have identified that the file `{pred_file}` (full path: `{full_path_rel}`) is likely to contain the code that needs modification.
+
+{issue_desc}
+
+Below is the complete content of this file:
+```cpp
+{file_text}
+```
+
+### 1. Analyze
+**Content**: Carefully read the file content and map functions to their likely responsibilities. Relate IR patterns in the source vs. expected optimized programs to the functions that typically handle those transformations.
+
+### 2. Propose
+**Content**: Identify the top {LOCALIZE_TOP_K_FUNCS} functions most likely responsible for the missed optimization. Give the function names exactly as they appear in the file. Do not include explanations in the final answer.
+
+### 3. Submit
+**Content**: Output function names (one per line), ranked by likelihood, wrapped in a Markdown code block with language tag `text`, like:
+
+```text
+InstCombinerImpl::visitMul
+InstCombinerImpl::visitAdd
+InstCombinerImpl::visitSub
+```
+""".strip()
+
+
+def _get_opt_debug_output_pipeline(
+    source_program: str,
+    test_file: dict,
+    build_dir: str,
+) -> str | None:
+    """Generate opt -debug stderr using pipeline/localize.py-compatible flow."""
+    try:
+        commands = test_file.get("commands", [])
+        if not commands:
+            return None
+
+        first_cmd = commands[0]
+        if isinstance(first_cmd, list):
+            if not first_cmd:
+                return None
+            opt_cmd = first_cmd[0]
+        else:
+            opt_cmd = first_cmd
+
+        if not isinstance(opt_cmd, str) or not opt_cmd.strip():
+            return None
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ll", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(source_program)
+            temp_file = f.name
+
+        try:
+            opt_path = os.path.join(build_dir, "bin", "opt")
+            opt_cmd_parts = opt_cmd.replace("< ", " ").replace("%s", temp_file).split()
+            if not opt_cmd_parts:
+                return None
+
+            replaced_opt = False
+            for i, arg in enumerate(opt_cmd_parts):
+                if arg == "opt" or arg.endswith("/opt"):
+                    opt_cmd_parts[i] = opt_path
+                    replaced_opt = True
+                    break
+            if not replaced_opt:
+                opt_cmd_parts.insert(0, opt_path)
+
+            if "-S" in opt_cmd_parts:
+                s_idx = opt_cmd_parts.index("-S")
+                opt_cmd_parts.insert(s_idx, "-debug")
+            else:
+                opt_cmd_parts.append("-debug")
+
+            result = subprocess.run(
+                opt_cmd_parts,
+                capture_output=True,
+                text=True,
+                timeout=LOCALIZE_OPT_DEBUG_TIMEOUT,
+                check=False,
+            )
+            return result.stderr if result.stderr else None
+        finally:
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _collect_pipeline_debug_output(
+    env: Env,
+    issue_id: str,
+    source_program: str,
+    test_file: dict,
+    build_dir: str,
+) -> str | None:
+    """Collect optional opt -debug context for pipeline localization mode."""
+    if not LOCALIZE_ENABLE_OPT_DEBUG:
+        print(
+            "[Localize][pipeline] opt -debug disabled by LAB_AGENT_LOCALIZE_ENABLE_OPT_DEBUG."
+        )
+        return None
+
+    if LOCALIZE_BUILD_BEFORE_OPT_DEBUG:
+        print(f"[Localize][pipeline] Building LLVM for {issue_id} before opt -debug...")
+        try:
+            build_res, _build_log = env.build()
+        except Exception as exc:
+            print(f"[Localize][pipeline] Build/debug failed for {issue_id}: {exc}")
+            return None
+        if not build_res:
+            print(
+                f"[Localize][pipeline] Build failed for {issue_id}; "
+                "debug output disabled for this issue."
+            )
+            return None
+
+    debug_output = _get_opt_debug_output_pipeline(
+        source_program=source_program,
+        test_file=test_file,
+        build_dir=build_dir,
+    )
+    if debug_output:
+        print(f"[Localize][pipeline] Debug output obtained (len={len(debug_output)})")
+    else:
+        print("[Localize][pipeline] No debug output")
+    return debug_output
 
 
 def _normalize_localize_model_name(raw_name: str, api_url: str) -> str:
@@ -897,21 +1241,28 @@ def _read_localize_file_text(issue_llvm_dir: str, rel_path: str) -> str:
 
 def _load_precomputed_localization(
     issue_id: str,
-) -> tuple[list[str], dict[str, list[str]]]:
-    """Load localization predictions from LAB_LOCALIZE_OUTPUT if available."""
-    if not cfg.localize_output or not os.path.isfile(cfg.localize_output):
-        return [], {}
+) -> tuple[list[str], dict[str, list[str]], str]:
+    """Load issue-scoped localization cache from results/agent/<model>/<issue>/."""
+    localize_output = os.path.join(
+        _issue_results_dir(issue_id), LOCALIZE_CACHE_FILENAME
+    )
+    if not os.path.isfile(localize_output):
+        return [], {}, localize_output
 
     try:
-        with open(cfg.localize_output, "r", encoding="utf-8") as f:
+        with open(localize_output, "r", encoding="utf-8") as f:
             localize_data = json.load(f)
     except Exception as exc:
-        print(f"[Localize] Failed to read {cfg.localize_output}: {exc}")
-        return [], {}
+        print(f"[Localize] Failed to read {localize_output}: {exc}")
+        return [], {}, localize_output
 
-    issue_data = localize_data.get(issue_id)
+    issue_data = localize_data
+    if isinstance(localize_data, dict) and (
+        "pred_files" not in localize_data and "pred_funcs" not in localize_data
+    ):
+        issue_data = localize_data.get(issue_id)
     if not isinstance(issue_data, dict):
-        return [], {}
+        return [], {}, localize_output
 
     pred_files: list[str] = []
     for raw_file in _normalize_str_list(
@@ -926,23 +1277,59 @@ def _load_precomputed_localization(
         resolved = _resolve_localize_file_path(raw_file) or raw_file
         pred_funcs[resolved] = funcs[:LOCALIZE_TOP_K_FUNCS]
 
-    return pred_files, pred_funcs
+    return pred_files, pred_funcs, localize_output
 
 
-def _run_runtime_localization(
+def _persist_issue_localization(
+    issue_id: str,
+    pred_files: list[str],
+    pred_funcs: dict[str, list[str]],
+    *,
+    localize_mode: str,
+    source: str,
+) -> str:
+    """Persist runtime localization result to issue-scoped cache file."""
+    localize_output = os.path.join(
+        _issue_results_dir(issue_id), LOCALIZE_CACHE_FILENAME
+    )
+    payload = {
+        "issue_id": issue_id,
+        "pred_files": _normalize_str_list(pred_files, limit=LOCALIZE_TOP_K_FILES),
+        "pred_funcs": {},
+        "localize_mode": localize_mode,
+        "source": source,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+
+    normalized_funcs = _normalize_pred_funcs(pred_funcs)
+    for raw_file, funcs in normalized_funcs.items():
+        resolved = _resolve_localize_file_path(raw_file) or raw_file
+        payload["pred_funcs"][resolved] = funcs[:LOCALIZE_TOP_K_FUNCS]
+
+    try:
+        with open(localize_output, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print(f"[Localize] Persisted issue localization: {localize_output}")
+    except Exception as exc:
+        print(f"[Localize] Failed to persist {localize_output}: {exc}")
+
+    return localize_output
+
+
+def _run_runtime_localization_lite(
     issue_id: str,
     issue_desc: str,
     issue_llvm_dir: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
-    """Run pipeline-style (file -> function) localization on demand."""
+    """Run lightweight (file -> function) runtime localization."""
     if not LOCALIZE_RUNTIME_ENABLED:
         return [], {}
     if not issue_desc.strip():
         return [], {}
 
-    print(f"[Localize] Running runtime localization for issue {issue_id}...")
+    print(f"[Localize][lite] Running runtime localization for issue {issue_id}...")
 
-    file_prompt = _build_file_localize_prompt(issue_desc)
+    file_prompt = _build_file_localize_prompt_lite(issue_desc)
     file_output = _call_localize_model(file_prompt, sys_prompt=LOCALIZE_SYS_PROMPT_FILE)
     raw_files = _extract_topk_lines_from_model_output(file_output, LOCALIZE_TOP_K_FILES)
 
@@ -959,7 +1346,7 @@ def _run_runtime_localization(
         if not file_text:
             continue
 
-        func_prompt = _build_func_localize_prompt(
+        func_prompt = _build_func_localize_prompt_lite(
             pred_file=os.path.basename(resolved),
             issue_desc=issue_desc,
             file_text=file_text,
@@ -972,14 +1359,122 @@ def _run_runtime_localization(
             pred_funcs[resolved] = funcs
 
     if pred_files:
-        print(f"[Localize] Runtime candidate files: {pred_files}")
+        print(f"[Localize][lite] Runtime candidate files: {pred_files}")
     if pred_funcs:
-        print(f"[Localize] Runtime candidate funcs: {pred_funcs}")
+        print(f"[Localize][lite] Runtime candidate funcs: {pred_funcs}")
 
     return pred_files, pred_funcs
 
 
-def build_task_description(env: Env, issue_id: str, issue_llvm_dir: str) -> str:
+def _run_runtime_localization_pipeline(
+    issue_id: str,
+    env: Env,
+    issue_llvm_dir: str,
+    build_dir: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Run pipeline/localize.py-aligned runtime localization."""
+    if not LOCALIZE_RUNTIME_ENABLED:
+        return [], {}
+
+    case = _get_first_missed_optimization_test_case(env)
+    if not case:
+        return [], {}
+
+    source_program, current_optimized_program, expect_optimized_program, test_file = (
+        case
+    )
+    issue_desc = _build_pipeline_issue_desc(
+        source_program=source_program,
+        current_optimized_program=current_optimized_program,
+        expect_optimized_program=expect_optimized_program,
+    )
+    if not issue_desc.strip():
+        return [], {}
+
+    print(f"[Localize][pipeline] Running runtime localization for issue {issue_id}...")
+    debug_output = _collect_pipeline_debug_output(
+        env=env,
+        issue_id=issue_id,
+        source_program=source_program,
+        test_file=test_file,
+        build_dir=build_dir,
+    )
+
+    file_prompt = _build_file_localize_prompt_pipeline(issue_desc, debug_output)
+    file_output = _call_localize_model(file_prompt, sys_prompt=LOCALIZE_SYS_PROMPT_FILE)
+    raw_files = _extract_topk_lines_from_model_output(file_output, LOCALIZE_TOP_K_FILES)
+
+    pred_files: list[str] = []
+    pred_funcs: dict[str, list[str]] = {}
+    for raw_file in raw_files:
+        resolved = _resolve_localize_file_path(raw_file)
+        if not resolved:
+            continue
+        if resolved not in pred_files:
+            pred_files.append(resolved)
+
+        file_text = _read_localize_file_text(issue_llvm_dir, resolved)
+        if not file_text:
+            continue
+
+        func_prompt = _build_func_localize_prompt_pipeline(
+            pred_file=os.path.basename(resolved),
+            full_path_rel=resolved,
+            issue_desc=issue_desc,
+            file_text=file_text,
+        )
+        func_output = _call_localize_model(
+            func_prompt, sys_prompt=LOCALIZE_SYS_PROMPT_FUNC
+        )
+        funcs = _extract_topk_lines_from_model_output(func_output, LOCALIZE_TOP_K_FUNCS)
+        if funcs:
+            pred_funcs[resolved] = funcs
+
+    if pred_files:
+        print(f"[Localize][pipeline] Runtime candidate files: {pred_files}")
+    if pred_funcs:
+        print(f"[Localize][pipeline] Runtime candidate funcs: {pred_funcs}")
+
+    return pred_files, pred_funcs
+
+
+def _run_runtime_localization(
+    issue_id: str,
+    issue_desc: str,
+    issue_llvm_dir: str,
+    env: Env,
+    build_dir: str,
+    localize_mode: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Run runtime localization dispatcher by selected mode."""
+    if localize_mode == LOCALIZE_MODE_PIPELINE:
+        return _run_runtime_localization_pipeline(
+            issue_id=issue_id,
+            env=env,
+            issue_llvm_dir=issue_llvm_dir,
+            build_dir=build_dir,
+        )
+    if localize_mode == LOCALIZE_MODE_LITE:
+        return _run_runtime_localization_lite(
+            issue_id=issue_id,
+            issue_desc=issue_desc,
+            issue_llvm_dir=issue_llvm_dir,
+        )
+    print(f"[Localize] Unknown mode={localize_mode!r}, fallback to lite.")
+    return _run_runtime_localization_lite(
+        issue_id=issue_id,
+        issue_desc=issue_desc,
+        issue_llvm_dir=issue_llvm_dir,
+    )
+
+
+def build_task_description(
+    env: Env,
+    issue_id: str,
+    issue_llvm_dir: str,
+    build_dir: str,
+    localize_mode: str,
+) -> str:
     """构造传给 agent.run(task=...) 的任务描述文本。"""
     bug_type = env.get_bug_type()
     components = list(env.get_hint_components() or [])
@@ -1015,18 +1510,37 @@ def build_task_description(env: Env, issue_id: str, issue_llvm_dir: str) -> str:
 
     desc += f"\n{issue_desc}"
 
-    pred_files, pred_funcs = _load_precomputed_localization(issue_id)
+    pred_files, pred_funcs, localize_output = _load_precomputed_localization(issue_id)
     localize_source = ""
     if pred_files or pred_funcs:
-        localize_source = "pre-computed analysis"
+        localize_source = f"issue localization cache ({localize_output})"
     else:
+        print(
+            f"[Localize] No issue cache for {issue_id}: {localize_output}; "
+            f"fallback to runtime ({localize_mode})."
+        )
         pred_files, pred_funcs = _run_runtime_localization(
             issue_id=issue_id,
             issue_desc=issue_desc,
             issue_llvm_dir=issue_llvm_dir,
+            env=env,
+            build_dir=build_dir,
+            localize_mode=localize_mode,
         )
+        if LOCALIZE_RUNTIME_ENABLED:
+            _persist_issue_localization(
+                issue_id=issue_id,
+                pred_files=pred_files,
+                pred_funcs=pred_funcs,
+                localize_mode=localize_mode,
+                source=f"runtime localization ({localize_mode})",
+            )
         if pred_files or pred_funcs:
-            localize_source = "runtime pipeline-style localization"
+            localize_source = f"runtime localization ({localize_mode})"
+        else:
+            print(
+                f"[Localize] Runtime localization returned empty for issue {issue_id}."
+            )
 
     if pred_files or pred_funcs:
         desc += f"\n**Localization Predictions** ({localize_source}):\n"
@@ -1155,6 +1669,42 @@ def convert_to_pipeline_format(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 运行态辅助（重试判定 / 提交门槛）
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _extract_text_messages(messages: list[dict]) -> list[str]:
+    texts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and content:
+            texts.append(content)
+    return texts
+
+
+def _has_fast_or_full_pass_signal(messages: list[dict]) -> bool:
+    texts = _extract_text_messages(messages)
+    for text in texts:
+        if (
+            "BUILD SUCCESS + FAST CHECK PASSED" in text
+            or "FAST CHECK PASSED" in text
+            or "FULL CHECK PASSED" in text
+        ):
+            return True
+    return False
+
+
+def _should_retry_after_limits(exit_status: str, messages: list[dict]) -> bool:
+    if not LIMITS_RETRY_ENABLED:
+        return False
+    if exit_status != "LimitsExceeded":
+        return False
+    return _has_fast_or_full_pass_signal(messages)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 构造 litellm 兼容的 model_name
 # ──────────────────────────────────────────────────────────────────────
 
@@ -1212,6 +1762,7 @@ def fix_issue(
     override: bool = False,
     *,
     model_name: str,
+    localize_mode: str,
     thinking_overrides: dict[str, object] | None = None,
 ):
     """用 mini-swe-agent 修复单个 issue。"""
@@ -1259,7 +1810,13 @@ def fix_issue(
     env.reset()
 
     # 4. 构造任务描述（含强化定位信息）
-    task = build_task_description(env, issue_id, issue_llvm_dir)
+    task = build_task_description(
+        env=env,
+        issue_id=issue_id,
+        issue_llvm_dir=issue_llvm_dir,
+        build_dir=build_dir,
+        localize_mode=localize_mode,
+    )
 
     # 5. 创建 mini-swe-agent 组件
     litellm_name = make_litellm_model_name(model_name, cfg.llm_url)
@@ -1349,6 +1906,7 @@ def fix_issue(
 
     exit_status = "Error"
     submission = ""
+    agent_messages: list[dict] = []
     try:
         result = agent.run(
             task=task,
@@ -1364,6 +1922,41 @@ def fix_issue(
 
         traceback.print_exc()
         result = {}
+    if hasattr(agent, "messages"):
+        agent_messages = agent.messages
+
+    if _should_retry_after_limits(exit_status, agent_messages):
+        retry_step_limit = cfg.step_limit + LIMITS_RETRY_EXTRA_STEPS
+        print(
+            f"[Retry] exit_status=LimitsExceeded but pass signals detected; "
+            f"rerun with step_limit={retry_step_limit}"
+        )
+        retry_agent = LLVMFixAgent(
+            model,
+            llvm_env,
+            system_template=system_tpl,
+            instance_template=instance_tpl,
+            step_limit=retry_step_limit,
+            cost_limit=cfg.cost_limit,
+            output_path=Path(traj_path),
+        )
+        try:
+            retry_result = retry_agent.run(
+                task=task,
+                issue_id=issue_id,
+                cwd=issue_llvm_dir,
+                model_name=litellm_name,
+            )
+            exit_status = retry_result.get("exit_status", "Unknown")
+            submission = retry_result.get("submission", "")
+            agent = retry_agent
+            if hasattr(agent, "messages"):
+                agent_messages = agent.messages
+        except Exception as e:
+            print(f"[Retry] Agent retry error: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     # 7. 运行完成后，用 env 做最终验证（复用 lab_env 逻辑确保一致性）
     # 重新加载 env 以获取最新状态
@@ -1389,8 +1982,18 @@ def fix_issue(
         except Exception as e:
             print(f"[Final] Full check error: {e}")
 
+    # 提交硬门槛：若最终 fast/full 未通过，则不接受 submitted。
+    if exit_status == "submitted" and not (
+        final_env.fast_check_pass and final_env.full_check_pass
+    ):
+        print(
+            "[SubmitGate] Blocked invalid submission: "
+            "final fast/full checks are not both PASS."
+        )
+        exit_status = "SubmitBlocked"
+        submission = ""
+
     # 8. 转换并保存结果
-    agent_messages = []
     if hasattr(agent, "messages"):
         agent_messages = agent.messages
 
@@ -1494,6 +2097,15 @@ You can also use standard bash commands (grep, find, cat, head, tail, etc.) for 
 7. **Regression Test**: Once fast checks pass, run `cd {{cwd}} && python $AGENT_TOOLS_DIR/check_full.py`.
 8. **Submit**: When all checks pass, run `echo SUBMIT_PATCH` to finalize.
 
+## Strict Execution Rules
+
+- Start from the top-ranked localization candidate; do not browse more than 2 files before the first code edit.
+- Within the first 8 actions, you must make at least one `apply_code.py` edit and run `build_and_check.py`.
+- Never run more than 3 consecutive exploration actions (`view_source.py`, `grep`, `find`) without either `apply_code.py` or `build_and_check.py`.
+- After every `apply_code.py` edit, run `build_and_check.py` immediately before more exploration.
+- If fast check passes, run `check_full.py` immediately in the same iteration.
+- Do not run `echo SUBMIT_PATCH` unless both fast and full checks have passed after the latest code edit.
+
 ## Important Constraints
 
 - Each bash command runs in a **fresh subshell** — always prefix with `cd {{cwd}} && `.
@@ -1520,7 +2132,12 @@ Use `cd {{cwd}} && grep -rn '<pattern>' llvm/lib/Transforms/` to search for rele
 
 When ready, make your changes. After each `apply_code.py` edit, immediately run
 `cd {{cwd}} && python $AGENT_TOOLS_DIR/build_and_check.py`.
-Repeat this edit -> fast-check cycle as needed before `check_full.py`."""
+Repeat this edit -> fast-check cycle as needed before `check_full.py`.
+
+Hard constraints:
+- First edit + first `build_and_check.py` must happen within 8 actions.
+- At most 3 consecutive exploration commands (`view_source.py`, `grep`, `find`) are allowed.
+- `echo SUBMIT_PATCH` is only allowed after `build_and_check.py` and `check_full.py` both pass after the latest edit."""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1539,6 +2156,11 @@ if __name__ == "__main__":
         thinking_overrides = _build_model_thinking_overrides(args, cfg.llm_model)
     except ValueError as exc:
         print(f"[ERROR] Invalid model/thinking parameters: {exc}")
+        sys.exit(2)
+    try:
+        localize_mode, localize_mode_source = _resolve_localize_mode(args.localize_mode)
+    except ValueError as exc:
+        print(f"[ERROR] Invalid localization mode: {exc}")
         sys.exit(2)
 
     override = args.force
@@ -1574,6 +2196,7 @@ if __name__ == "__main__":
 
     print(f"Agent workflow — {len(task_list)} issue(s) to process")
     print(f"Model: {cfg.llm_model}")
+    print(f"Localization mode: {localize_mode} (source={localize_mode_source})")
     if thinking_overrides:
         print("Thinking overrides:")
         print(json.dumps(thinking_overrides, indent=2, ensure_ascii=False))
@@ -1592,6 +2215,7 @@ if __name__ == "__main__":
                 task_id,
                 override=override,
                 model_name=cfg.llm_model,
+                localize_mode=localize_mode,
                 thinking_overrides=thinking_overrides,
             )
         except Exception as e:

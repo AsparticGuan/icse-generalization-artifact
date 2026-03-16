@@ -106,6 +106,8 @@ All variables, their meanings, and defaults are documented in `.env.example`.
 | `LAB_LLM_TOKEN` | **yes** | | API key |
 | `LAB_LLM_URL` | | `https://api.openai.com/v1` | API endpoint |
 | `LAB_LLM_MODEL` | | `gpt-4o` | Model name (for custom endpoints, keep the gateway model id as-is; both prefixed and non-prefixed names are supported) |
+| `LAB_AGENT_LOCALIZE_MODE` | | `pipeline` | Runtime localization mode fallback (`pipeline` or `lite`), overridden by CLI `--localize-mode` |
+| `LAB_AGENT_RUNTIME_LOCALIZE` | | `ON` | Enable runtime localization when `results/agent/<model>/<issue>/localization.json` is missing |
 | `LAB_AGENT_STEP_LIMIT` | | `30` | Max steps per issue |
 | `LAB_AGENT_COST_LIMIT` | | `5.0` | Max cost per issue (USD) |
 | `MSWEA_GLOBAL_COST_LIMIT` | | `10.0` | mini-swe-agent global cost cap |
@@ -139,15 +141,25 @@ python agent/run.py
 
 # overwrite existing result JSON
 python agent/run.py 85250 -f
+
+# force runtime localization mode
+python agent/run.py 85250 --localize-mode pipeline
+python agent/run.py 85250 --localize-mode lite
 ```
+
+Localization mode priority:
+
+- CLI `--localize-mode` > env `LAB_AGENT_LOCALIZE_MODE` > default `pipeline`.
+- Per issue cache file path is fixed: `results/agent/<safe_model>/<safe_issue>/localization.json`.
+- If that file exists, agent uses it first; if missing, runtime localization runs and persists to the same path.
 
 ### Batch Testing Script (multiple models × shared issues)
 
 `agent/run_batch.py` can run the same issue set across one or more models,
 strictly in the input order.
 
-Model switching is implemented by editing `agent/.env` (`LAB_LLM_MODEL`) before
-each run, then launching `agent/run.py`.
+Model selection is passed directly via `run.py --model` for each run.
+`run_batch.py` does **not** rewrite `agent/.env`.
 
 ```bash
 # 1) two models (order preserved), one issue
@@ -171,6 +183,16 @@ uv run python agent/run_batch.py \
   --model openai/gpt-5.3-codex \
   --issues 104772 \
   -f
+
+# 5) force pipeline runtime localization in batch mode
+uv run python agent/run_batch.py \
+  --model qwen3.5-plus \
+  --issues all \
+  --localize-mode pipeline \
+  --thinking-profile '{"enable_thinking":true,"thinking_budget":81920}' \
+  -f \
+  --retest \
+  --retest-force
 ```
 
 Main options:
@@ -178,6 +200,7 @@ Main options:
 - `--model <name>`: repeatable, preserves input order.
 - `--models a,b,c`: comma-separated model list.
 - `--issues all|<id>|<id1,id2,...>`: one/many/all issues (applies to every model).
+- `--localize-mode pipeline|lite`: pass runtime localization mode to `run.py`.
 - `-f/--force`: pass `-f` to `run.py`.
 - `--stop-on-error`: stop immediately when one model fails.
 

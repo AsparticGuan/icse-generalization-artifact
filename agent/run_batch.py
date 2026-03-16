@@ -24,6 +24,7 @@ _ENV_PATH = _THIS_DIR / ".env"
 _RUN_PATH = _THIS_DIR / "run.py"
 
 _EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_LOCALIZE_MODE_CHOICES = ("pipeline", "lite")
 
 
 def _safe_path_part(value: str) -> str:
@@ -296,6 +297,7 @@ def _build_cmd(
     issue_arg: str | None,
     force: bool,
     *,
+    localize_mode: str | None,
     ordered_effort: str | None,
     profile_args: list[str],
     retest: bool,
@@ -306,6 +308,8 @@ def _build_cmd(
     cmd = [sys.executable, str(_RUN_PATH), "--model", model]
     if issue_arg is not None:
         cmd.append(issue_arg)
+    if localize_mode is not None:
+        cmd.extend(["--localize-mode", localize_mode])
     if ordered_effort is not None:
         cmd.extend(["--effort", ordered_effort])
     cmd.extend(profile_args)
@@ -383,6 +387,16 @@ def main() -> int:
         "--issues",
         default="all",
         help="测试用例：all（默认）/单个 issue/逗号分隔多个 issue。例：104772,85250",
+    )
+    parser.add_argument(
+        "--localize-mode",
+        choices=list(_LOCALIZE_MODE_CHOICES),
+        default=None,
+        help=(
+            "透传给 run.py 的 runtime localization 模式。"
+            "可选：pipeline/lite；不传时使用 run.py 默认解析"
+            "（CLI > LAB_AGENT_LOCALIZE_MODE > pipeline）。"
+        ),
     )
 
     # 按模型顺序传通用思考强度：1个=应用到全部模型；N个=与模型一一对应
@@ -515,6 +529,10 @@ def main() -> int:
     print(f"Issues: {'all' if issue_arg is None else issue_arg}")
     print(f"Ordered efforts: {ordered_efforts}")
     print(f"Thinking profiles count: {len(raw_profiles)}")
+    print(
+        "Localization mode: "
+        + (args.localize_mode if args.localize_mode is not None else "(run.py default)")
+    )
     print(f"Force overwrite: {args.force}")
     print(
         "Per-model timeout (seconds): "
@@ -575,6 +593,7 @@ def main() -> int:
             model,
             issue_arg,
             args.force,
+            localize_mode=args.localize_mode,
             ordered_effort=None,
             profile_args=per_model_profile_args,
             retest=args.retest_patches,

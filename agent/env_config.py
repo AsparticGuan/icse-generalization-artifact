@@ -126,7 +126,6 @@ class AgentConfig:
         default_factory=lambda: _env("LAB_LLVM_BUILD_DIR", str(_PROJECT_ROOT / "build"))
     )
     dataset_dir: str = field(default_factory=lambda: str(_PROJECT_ROOT / "dataset"))
-    localize_output: str = field(default_factory=lambda: _env("LAB_LOCALIZE_OUTPUT"))
 
     # ── 外部工具路径 ──
     alive_tv: str = field(

@@ -105,6 +105,8 @@ python agent/run.py 85250
 | `LAB_LLM_TOKEN` | **是** | | API 密钥 |
 | `LAB_LLM_URL` | | `https://api.openai.com/v1` | API 端点 |
 | `LAB_LLM_MODEL` | | `gpt-4o` | 模型名（自建端点会按原样透传，支持有前缀或无前缀；请填写网关实际注册名） |
+| `LAB_AGENT_LOCALIZE_MODE` | | `pipeline` | 运行时定位模式兜底（`pipeline` 或 `lite`），可被 CLI `--localize-mode` 覆盖 |
+| `LAB_AGENT_RUNTIME_LOCALIZE` | | `ON` | 当 `results/agent/<model>/<issue>/localization.json` 缺失时，启用运行时定位 |
 | `LAB_AGENT_STEP_LIMIT` | | `30` | 每个 issue 最大步数 |
 | `LAB_AGENT_COST_LIMIT` | | `5.0` | 每个 issue 最大成本（美元） |
 | `MSWEA_GLOBAL_COST_LIMIT` | | `10.0` | mini-swe-agent 全局成本上限 |
@@ -137,13 +139,24 @@ python agent/run.py
 
 # 覆盖已有结果
 python agent/run.py 85250 -f
+
+# 强制运行时定位模式
+python agent/run.py 85250 --localize-mode pipeline
+python agent/run.py 85250 --localize-mode lite
 ```
+
+定位模式优先级：
+
+- CLI `--localize-mode` > 环境变量 `LAB_AGENT_LOCALIZE_MODE` > 默认值 `pipeline`。
+- 每个 issue 的定位缓存路径固定为：`results/agent/<safe_model>/<safe_issue>/localization.json`。
+- 若该文件存在则优先使用；若缺失则执行 runtime localization，并持久化回同一路径。
 
 ### 批量测试脚本（多模型 × 同一组用例）
 
 `agent/run_batch.py` 支持将同一组 issue 依次在多个模型上执行，并严格保持你传入的模型顺序。
 
-模型切换方式为：每轮先修改 `agent/.env` 里的 `LAB_LLM_MODEL`，再启动 `agent/run.py`。
+模型选择会在每轮通过 `run.py --model` 直接传递。
+`run_batch.py` **不会** 改写 `agent/.env`。
 
 ```bash
 # 1) 两个模型（按顺序），单个 issue
@@ -167,6 +180,16 @@ uv run python agent/run_batch.py \
   --model openai/gpt-5.3-codex \
   --issues 104772 \
   -f
+
+# 5) 在批量模式中强制使用 pipeline 运行时定位
+uv run python agent/run_batch.py \
+  --model qwen3.5-plus \
+  --issues all \
+  --localize-mode pipeline \
+  --thinking-profile '{"enable_thinking":true,"thinking_budget":81920}' \
+  -f \
+  --retest \
+  --retest-force
 ```
 
 主要参数：
@@ -174,6 +197,7 @@ uv run python agent/run_batch.py \
 - `--model <name>`：可重复传入，按输入顺序执行。
 - `--models a,b,c`：逗号分隔模型列表。
 - `--issues all|<id>|<id1,id2,...>`：单个/多个/全部 issue（对所有模型生效）。
+- `--localize-mode pipeline|lite`：向 `run.py` 透传运行时 localization 模式。
 - `-f/--force`：向 `run.py` 透传 `-f`。
 - `--stop-on-error`：某个模型失败时立即停止（默认继续后续模型）。
 
