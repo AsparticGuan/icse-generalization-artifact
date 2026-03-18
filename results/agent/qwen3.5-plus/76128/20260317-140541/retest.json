@@ -1,0 +1,414 @@
+{
+  "wall_time": 38.06248593330383,
+  "knowledge": [
+    [
+      "base_model",
+      "1970-12-31+0000"
+    ]
+  ],
+  "build_count": 1,
+  "build_failure_count": 0,
+  "fast_check_count": 0,
+  "full_check_count": 0,
+  "fast_check_pass": false,
+  "full_check_pass": false,
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\nindex fc284bc61cce..b2574bd438b6 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n@@ -1581,6 +1581,79 @@ Instruction *InstCombinerImpl::visitAdd(BinaryOperator &I) {\n   if (match(&I, m_c_BinOp(m_ZExt(m_Value(A)), m_SExt(m_Deferred(A)))) &&\n       A->getType()->isIntOrIntVectorTy(1))\n     return replaceInstUsesWith(I, Constant::getNullValue(I.getType()));\n+  // (X / C) << N + (X % C) --> (X / C) * (2^N - C) + X\n+  // where the shift left is represented as (X / C) * 2^N, and 2^N >= C\n+  // This is valid because: (X/C)*2^N + X%C = (X/C)*2^N + (X - (X/C)*C) = (X/C)*(2^N-C) + X\n+  {\n+    Value *RemX, *MulOp;\n+    APInt RemC, MulC;\n+    bool RemIsSigned;\n+    \n+    // Helper lambda to match remainder\n+    auto MatchRem = [&](Value *E) -> bool {\n+      const APInt *AI;\n+      RemIsSigned = false;\n+      if (match(E, m_SRem(m_Value(RemX), m_APInt(AI)))) {\n+        RemIsSigned = true;\n+        RemC = *AI;\n+        return true;\n+      }\n+      if (match(E, m_URem(m_Value(RemX), m_APInt(AI)))) {\n+        RemC = *AI;\n+        return true;\n+      }\n+      return false;\n+    };\n+    \n+    // Helper lambda to match division\n+    auto MatchDiv = [&](Value *E, Value *&DivOp, APInt &DivC) -> bool {\n+      const APInt *AI;\n+      if (RemIsSigned && match(E, m_SDiv(m_Value(DivOp), m_APInt(AI)))) {\n+        DivC = *AI;\n+        return true;\n+      }\n+      if (!RemIsSigned) {\n+        if (match(E, m_UDiv(m_Value(DivOp), m_APInt(AI)))) {\n+          DivC = *AI;\n+          return true;\n+        }\n+      }\n+      return false;\n+    };\n+    \n+    // Helper lambda to match multiplication or shift\n+    auto MatchMulOrShl = [&](Value *E) -> bool {\n+      const APInt *AI;\n+      if (match(E, m_Mul(m_Value(MulOp), m_APInt(AI)))) {\n+        MulC = *AI;\n+        return true;\n+      }\n+      if (match(E, m_Shl(m_Value(MulOp), m_APInt(AI)))) {\n+        MulC = APInt(AI->getBitWidth(), 1);\n+        MulC <<= *AI;\n+        return true;\n+      }\n+      return false;\n+    };\n+    \n+    // Match pattern: (X / C) * M + (X % C) or (X % C) + (X / C) * M\n+    if (((MatchRem(LHS) && MatchMulOrShl(RHS)) ||\n+         (MatchRem(RHS) && MatchMulOrShl(LHS))) &&\n+        MulC.ugt(0)) {  // Ensure MulC is positive\n+      Value *DivOp;\n+      APInt DivC;\n+      // Check that MulOp is (X / C) with the same divisor C\n+      if (MatchDiv(MulOp, DivOp, DivC) &&\n+          DivOp == RemX && DivC == RemC) {\n+        // Check that MulC (2^N from shift) >= RemC (divisor)\n+        // This ensures the remainder bits don't overlap with the shifted quotient\n+        if (MulC.uge(RemC)) {\n+          Value *NewMul = Builder.CreateMul(MulOp, ConstantInt::get(Ty, MulC - RemC));\n+          return BinaryOperator::CreateAdd(NewMul, RemX);\n+        }\n+      }\n+    }\n+  }\n \n   // A+B --> A|B iff A and B have no bits set in common.\n   WithCache<const Value *> LHSCache(LHS), RHSCache(RHS);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex e1923a344179..badce7429772 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -3420,6 +3420,53 @@ Value *InstCombinerImpl::foldAndOrOfICmps(ICmpInst *LHS, ICmpInst *RHS,\n \n   return foldAndOrOfICmpsUsingRanges(LHS, RHS, IsAnd);\n }\n+// Helper functions to match division and remainder patterns for (X / C) * M | (X % C) optimization\n+static bool MatchRemForDivMulOr(Value *E, Value *&Op, APInt &C, bool &IsSigned) {\n+  const APInt *AI;\n+  IsSigned = false;\n+  if (match(E, m_SRem(m_Value(Op), m_APInt(AI)))) {\n+    IsSigned = true;\n+    C = *AI;\n+    return true;\n+  }\n+  if (match(E, m_URem(m_Value(Op), m_APInt(AI)))) {\n+    C = *AI;\n+    return true;\n+  }\n+  return false;\n+}\n+\n+static bool MatchDivForDivMulOr(Value *E, Value *&Op, APInt &C, bool IsSigned) {\n+  const APInt *AI;\n+  if (IsSigned && match(E, m_SDiv(m_Value(Op), m_APInt(AI)))) {\n+    C = *AI;\n+    return true;\n+  }\n+  if (!IsSigned) {\n+    if (match(E, m_UDiv(m_Value(Op), m_APInt(AI)))) {\n+      C = *AI;\n+      return true;\n+    }\n+  }\n+  return false;\n+}\n+\n+// Matches multiplication or shift expression Op * C or Op << N where C is a constant.\n+// Returns the constant value in C and the other operand in Op. Returns true if such a\n+// match is found.\n+static bool MatchMulOrShlForDivMulOr(Value *E, Value *&Op, APInt &C) {\n+  const APInt *AI;\n+  if (match(E, m_Mul(m_Value(Op), m_APInt(AI)))) {\n+    C = *AI;\n+    return true;\n+  }\n+  if (match(E, m_Shl(m_Value(Op), m_APInt(AI)))) {\n+    C = APInt(AI->getBitWidth(), 1);\n+    C <<= *AI;\n+    return true;\n+  }\n+  return false;\n+}\n \n // FIXME: We use commutative matchers (m_c_*) for some, but not all, matches\n // here. We should standardize that construct where it is needed or choose some\n@@ -3505,6 +3552,36 @@ Instruction *InstCombinerImpl::visitOr(BinaryOperator &I) {\n     Value *IncrementY = Builder.CreateAdd(Y, ConstantInt::get(Ty, 1));\n     return BinaryOperator::CreateMul(X, IncrementY);\n   }\n+  // (X / C) << N | (X % C) --> (X / C) * (2^N - C) + X\n+  // where the shift left is represented as (X / C) * 2^N, and 2^N >= C\n+  // This is valid because: (X/C)*2^N + X%C = (X/C)*2^N + (X - (X/C)*C) = (X/C)*(2^N-C) + X\n+  {\n+    Value *RemX, *MulOp;\n+    APInt RemC, MulC;\n+    bool RemIsSigned;\n+    \n+    // Match pattern: (X / C) * M | (X % C) or (X % C) | (X / C) * M\n+    if (((MatchRemForDivMulOr(Op0, RemX, RemC, RemIsSigned) &&\n+          MatchMulOrShlForDivMulOr(Op1, MulOp, MulC)) ||\n+         (MatchRemForDivMulOr(Op1, RemX, RemC, RemIsSigned) &&\n+          MatchMulOrShlForDivMulOr(Op0, MulOp, MulC))) &&\n+        MulC.ugt(0)) {  // Ensure MulC is positive\n+      Value *DivOp;\n+      APInt DivC;\n+      // Check that MulOp is (X / C) with the same divisor C\n+      if (MatchDivForDivMulOr(MulOp, DivOp, DivC, RemIsSigned) &&\n+          DivOp == RemX && DivC == RemC) {\n+        // Check that MulC (2^N from shift) >= RemC (divisor)\n+        // This ensures the remainder bits don't overlap with the shifted quotient\n+        if (MulC.uge(RemC)) {\n+          Value *NewMul = Builder.CreateMul(MulOp, ConstantInt::get(Ty, MulC - RemC));\n+          return BinaryOperator::CreateAdd(NewMul, RemX);\n+        }\n+      }\n+    }\n+  }\n+\n+\n \n   // (A & C) | (B & D)\n   Value *A, *B, *C, *D;\n",
+  "log": {
+    "patch_source_file": "/data/zrwang/auto-opt/results/agent/qwen3.5-plus/76128/20260317-140541/fix.json",
+    "patch_issue_id": "76128",
+    "patch_timestamp": "20260317-140541",
+    "test_issue_id": "76128",
+    "pass": false,
+    "retest_results": [
+      {
+        "func_name": null,
+        "file_path": null,
+        "source_check_fast_pass": true,
+        "source_check_full_pass": false,
+        "patch_apply": {
+          "ok": true,
+          "log": "<stdin>:16: trailing whitespace.\n    \n<stdin>:32: trailing whitespace.\n    \n<stdin>:48: trailing whitespace.\n    \n<stdin>:63: trailing whitespace.\n    \n<stdin>:154: trailing whitespace.\n    \nwarning: 5 lines add whitespace errors.\n"
+        },
+        "check_more": {
+          "ok": false,
+          "log": [
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_commuted",
+              "body": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_commuted(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_commuted(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 noundef %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %#0 = mul nuw i32 %div, 6\n  %add = add i32 %#0, noundef %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 13,
+                  "current_optimized_program": 13
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_commuted(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_to_mul",
+              "body": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL:%.*]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+              "result": false,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL:%.*]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 noundef %val, 7\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 noundef %val, 7\n  %mul2 = mul nsw nuw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 24,
+                  "expect_optimized_program": 2,
+                  "current_optimized_program": 24
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL:%.*]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                  "log": "Command '['/data/zrwang/auto-opt/build/76128/bin/FileCheck', '/data/zrwang/auto-opt/.tmp/tmpep4ls3a1']' returned non-zero exit status 1.\n/data/zrwang/auto-opt/.tmp/tmpep4ls3a1:4:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[ADD:%.*]] = mul i32 [[VAL:%.*]], 3\n              ^\n<stdin>:5:7: note: scanning from here\nentry:\n      ^\n<stdin>:7:2: note: possible intended match here\n %mul1 = mul i32 %div, 21\n ^\n\nInput file: <stdin>\nCheck file: /data/zrwang/auto-opt/.tmp/tmpep4ls3a1\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) { \n          5: entry: \nnext:4'0           X error: no match found\n          6:  %div = udiv i32 %val, 7 \nnext:4'0     ~~~~~~~~~~~~~~~~~~~~~~~~~\n          7:  %mul1 = mul i32 %div, 21 \nnext:4'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\nnext:4'1      ?                         possible intended match\n          8:  %rem = urem i32 %val, 7 \nnext:4'0     ~~~~~~~~~~~~~~~~~~~~~~~~~\n          9:  %mul2 = mul nuw nsw i32 %rem, 3 \nnext:4'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n         10:  %add = add i32 %mul1, %mul2 \nnext:4'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n         11:  ret i32 %add \nnext:4'0     ~~~~~~~~~~~~~~\n         12: } \nnext:4'0     ~~\n>>>>>>\n"
+                },
+                "source_program": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %add = mul i32 %val, 3\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem_to_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_or_disjoint",
+              "body": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_or_disjoint(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_or_disjoint(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 noundef %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %#0 = mul nuw i32 %div, 6\n  %add = add i32 %#0, noundef %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 13,
+                  "current_optimized_program": 13
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_or_disjoint(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem_or_disjoint(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_sdiv_srem",
+              "body": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_sdiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = sdiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nsw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = sdiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_sdiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = sdiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nsw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = sdiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 %val, 10\n  %0 = mul nsw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 noundef %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 noundef %val, 10\n  %#0 = mul nsw i32 %div, 6\n  %add = add i32 %#0, noundef %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 13,
+                  "current_optimized_program": 13
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_sdiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = sdiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nsw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = sdiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 %val, 10\n  %0 = mul nsw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 %val, 10\n  %0 = mul nsw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_sdiv_srem(i32 noundef %val) {\nentry:\n  %div = sdiv i32 %val, 10\n  %0 = mul nsw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_to_mul_multiuse",
+              "body": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul_multiuse(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL:%.*]], 7\n; CHECK-NEXT:    call void @use(i32 [[REM]])\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+              "result": false,
+              "log": {
+                "alive2": {
+                  "src": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul_multiuse(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL:%.*]], 7\n; CHECK-NEXT:    call void @use(i32 [[REM]])\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 noundef %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 noundef %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul nsw nuw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 24,
+                  "expect_optimized_program": 12,
+                  "current_optimized_program": 24
+                },
+                "filecheck": {
+                  "src": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_to_mul_multiuse(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL:%.*]], 7\n; CHECK-NEXT:    call void @use(i32 [[REM]])\n; CHECK-NEXT:    [[ADD:%.*]] = mul i32 [[VAL]], 3\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                  "log": "Command '['/data/zrwang/auto-opt/build/76128/bin/FileCheck', '/data/zrwang/auto-opt/.tmp/tmpyw3wi9lj']' returned non-zero exit status 1.\n/data/zrwang/auto-opt/.tmp/tmpyw3wi9lj:6:15: error: CHECK-NEXT: is not on the line after the previous match\n; CHECK-NEXT: [[REM:%.*]] = urem i32 [[VAL:%.*]], 7\n              ^\n<stdin>:10:2: note: 'next' match was here\n %rem = urem i32 %val, 7\n ^\n<stdin>:7:7: note: previous match ended here\nentry:\n      ^\n<stdin>:8:1: note: non-matching line after previous match is here\n %div = udiv i32 %val, 7\n^\n\nInput file: <stdin>\nCheck file: /data/zrwang/auto-opt/.tmp/tmpyw3wi9lj\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n        .\n        .\n        .\n        5:  \n        6: define i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) { \n        7: entry: \n        8:  %div = udiv i32 %val, 7 \n        9:  %mul1 = mul i32 %div, 21 \n       10:  %rem = urem i32 %val, 7 \nnext:6      !~~~~~~~~~~~~~~~~~~~~~~  error: match on wrong line\n       11:  call void @use(i32 %rem) \n       12:  %mul2 = mul nuw nsw i32 %rem, 3 \n       13:  %add = add i32 %mul1, %mul2 \n       14:  ret i32 %add \n       15: } \n>>>>>>\n"
+                },
+                "source_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %add = mul i32 %val, 3\n  ret i32 %add\n}\n",
+                "current_optimized_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_to_mul_multiuse(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul1 = mul i32 %div, 21\n  %rem = urem i32 %val, 7\n  call void @use(i32 %rem)\n  %mul2 = mul nuw nsw i32 %rem, 3\n  %add = add i32 %mul1, %mul2\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_without_noundef",
+              "body": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_without_noundef(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_without_noundef(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %#0 = mul nuw i32 %div, 6\n  %add = add i32 %#0, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 23,
+                  "current_optimized_program": 13
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_without_noundef(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "Command '['/data/zrwang/auto-opt/build/76128/bin/FileCheck', '/data/zrwang/auto-opt/.tmp/tmpyo3tc8w9']' returned non-zero exit status 1.\n/data/zrwang/auto-opt/.tmp/tmpyo3tc8w9:5:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[SHL:%.*]] = shl i32 [[DIV]], 4\n              ^\n<stdin>:6:26: note: scanning from here\n %div = udiv i32 %val, 10\n                         ^\n<stdin>:6:26: note: with \"DIV\" equal to \"%div\"\n %div = udiv i32 %val, 10\n                         ^\n<stdin>:8:2: note: possible intended match here\n %add = add i32 %0, %val\n ^\n\nInput file: <stdin>\nCheck file: /data/zrwang/auto-opt/.tmp/tmpyo3tc8w9\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i32 @fold_add_udiv_urem_without_noundef(i32 %val) { \n          5: entry: \n          6:  %div = udiv i32 %val, 10 \nnext:5'0                              X error: no match found\nnext:5'1                                with \"DIV\" equal to \"%div\"\n          7:  %0 = mul nuw i32 %div, 6 \nnext:5'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %add = add i32 %0, %val \nnext:5'0     ~~~~~~~~~~~~~~~~~~~~~~~~~\nnext:5'2      ?                        possible intended match\n          9:  ret i32 %add \nnext:5'0     ~~~~~~~~~~~~~~\n         10: } \nnext:5'0     ~~\n>>>>>>\n"
+                },
+                "source_program": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem_without_noundef(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "not_match_overflow",
+              "body": "define i32 @not_match_overflow(i32 %x) {\n; CHECK-LABEL: @not_match_overflow(\n; CHECK-NEXT:    [[X_FR:%.*]] = freeze i32 [[X:%.*]]\n; CHECK-NEXT:    [[T:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[TMP1:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[T3:%.*]] = sub nuw i32 [[X_FR]], [[TMP1]]\n; CHECK-NEXT:    [[T4:%.*]] = add i32 [[T]], [[T3]]\n; CHECK-NEXT:    ret i32 [[T4]]\n  %t = urem i32 %x, 299\n  %t1 = udiv i32 %x, 299\n  %t2 = urem i32 %t1, 147483647\n  %t3 = mul i32 %t2, 299\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @not_match_overflow(i32 %x) {\n; CHECK-LABEL: @not_match_overflow(\n; CHECK-NEXT:    [[X_FR:%.*]] = freeze i32 [[X:%.*]]\n; CHECK-NEXT:    [[T:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[TMP1:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[T3:%.*]] = sub nuw i32 [[X_FR]], [[TMP1]]\n; CHECK-NEXT:    [[T4:%.*]] = add i32 [[T]], [[T3]]\n; CHECK-NEXT:    ret i32 [[T4]]\n  %t = urem i32 %x, 299\n  %t1 = udiv i32 %x, 299\n  %t2 = urem i32 %t1, 147483647\n  %t3 = mul i32 %t2, 299\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @not_match_overflow(i32 %x) {\n  %x.fr = freeze i32 %x\n  %t = urem i32 %x.fr, 299\n  %1 = urem i32 %x.fr, 299\n  %t3 = sub nuw i32 %x.fr, %1\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @not_match_overflow(i32 %x) {\n#0:\n  %t = urem i32 %x, 299\n  %t1 = udiv i32 %x, 299\n  %t2 = urem i32 %t1, 147483647\n  %t3 = mul i32 %t2, 299\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n=>\ndefine i32 @not_match_overflow(i32 %x) {\n#0:\n  %x.fr = freeze i32 %x\n  %t = urem i32 %x.fr, 299\n  %#1 = urem i32 %x.fr, 299\n  %t3 = sub nuw i32 %x.fr, %#1\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 33,
+                  "expect_optimized_program": 24,
+                  "current_optimized_program": 24
+                },
+                "filecheck": {
+                  "src": "define i32 @not_match_overflow(i32 %x) {\n; CHECK-LABEL: @not_match_overflow(\n; CHECK-NEXT:    [[X_FR:%.*]] = freeze i32 [[X:%.*]]\n; CHECK-NEXT:    [[T:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[TMP1:%.*]] = urem i32 [[X_FR]], 299\n; CHECK-NEXT:    [[T3:%.*]] = sub nuw i32 [[X_FR]], [[TMP1]]\n; CHECK-NEXT:    [[T4:%.*]] = add i32 [[T]], [[T3]]\n; CHECK-NEXT:    ret i32 [[T4]]\n  %t = urem i32 %x, 299\n  %t1 = udiv i32 %x, 299\n  %t2 = urem i32 %t1, 147483647\n  %t3 = mul i32 %t2, 299\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @not_match_overflow(i32 %x) {\n  %x.fr = freeze i32 %x\n  %t = urem i32 %x.fr, 299\n  %1 = urem i32 %x.fr, 299\n  %t3 = sub nuw i32 %x.fr, %1\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @not_match_overflow(i32 %x) {\n  %t = urem i32 %x, 299\n  %t1 = udiv i32 %x, 299\n  %t2 = urem i32 %t1, 147483647\n  %t3 = mul i32 %t2, 299\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n",
+                "expect_optimized_program": "define i32 @not_match_overflow(i32 %x) {\n  %x.fr = freeze i32 %x\n  %t = urem i32 %x.fr, 299\n  %1 = urem i32 %x.fr, 299\n  %t3 = sub nuw i32 %x.fr, %1\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n",
+                "current_optimized_program": "define i32 @not_match_overflow(i32 %x) {\n  %x.fr = freeze i32 %x\n  %t = urem i32 %x.fr, 299\n  %1 = urem i32 %x.fr, 299\n  %t3 = sub nuw i32 %x.fr, %1\n  %t4 = add i32 %t, %t3\n  ret i32 %t4\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem",
+              "body": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 noundef %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %#0 = mul nuw i32 %div, 6\n  %add = add i32 %#0, noundef %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 13,
+                  "current_optimized_program": 13
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[TMP0:%.*]] = mul nuw i32 [[DIV]], 6\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[TMP0]], [[VAL]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_srem",
+              "body": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = srem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = srem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 noundef %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 noundef %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 23,
+                  "current_optimized_program": 23
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_srem(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = srem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_srem(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = srem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_multiuse_mul",
+              "body": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_multiuse_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    call void @use(i32 [[SHL]])\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_multiuse_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    call void @use(i32 [[SHL]])\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 noundef %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 noundef %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %#0 = mul nuw i32 %div, 6\n  %add = add i32 %#0, noundef %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 23,
+                  "current_optimized_program": 14
+                },
+                "filecheck": {
+                  "src": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\n; CHECK-LABEL: @fold_add_udiv_urem_multiuse_mul(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], 10\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    call void @use(i32 [[SHL]])\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], 10\n; CHECK-NEXT:    [[ADD:%.*]] = or disjoint i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                  "log": "Command '['/data/zrwang/auto-opt/build/76128/bin/FileCheck', '/data/zrwang/auto-opt/.tmp/tmpf4ihhsaq']' returned non-zero exit status 1.\n/data/zrwang/auto-opt/.tmp/tmpf4ihhsaq:9:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[REM:%.*]] = urem i32 [[VAL]], 10\n              ^\n<stdin>:10:26: note: scanning from here\n call void @use(i32 %shl)\n                         ^\n<stdin>:10:26: note: with \"VAL\" equal to \"%val\"\n call void @use(i32 %shl)\n                         ^\n<stdin>:12:2: note: possible intended match here\n %add = add i32 %0, %val\n ^\n\nInput file: <stdin>\nCheck file: /data/zrwang/auto-opt/.tmp/tmpf4ihhsaq\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          .\n          .\n          .\n          5:  \n          6: define i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) { \n          7: entry: \n          8:  %div = udiv i32 %val, 10 \n          9:  %shl = shl i32 %div, 4 \n         10:  call void @use(i32 %shl) \nnext:9'0                              X error: no match found\nnext:9'1                                with \"VAL\" equal to \"%val\"\n         11:  %0 = mul nuw i32 %div, 6 \nnext:9'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\n         12:  %add = add i32 %0, %val \nnext:9'0     ~~~~~~~~~~~~~~~~~~~~~~~~~\nnext:9'2      ?                        possible intended match\n         13:  ret i32 %add \nnext:9'0     ~~~~~~~~~~~~~~\n         14: } \nnext:9'0     ~~\n>>>>>>\n"
+                },
+                "source_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "current_optimized_program": "declare void @use(i32)\n\ndefine i32 @fold_add_udiv_urem_multiuse_mul(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  call void @use(i32 %shl)\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "match_unsigned",
+              "body": "define i64 @match_unsigned(i64 %x) {\n; CHECK-LABEL: @match_unsigned(\n; CHECK-NEXT:    [[UREM:%.*]] = urem i64 [[X:%.*]], 19136\n; CHECK-NEXT:    ret i64 [[UREM]]\n  %t = urem i64 %x, 299\n  %t1 = udiv i64 %x, 299\n  %t2 = urem i64 %t1, 64\n  %t3 = mul i64 %t2, 299\n  %t4 = add i64 %t, %t3\n  ret i64 %t4\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i64 @match_unsigned(i64 %x) {\n; CHECK-LABEL: @match_unsigned(\n; CHECK-NEXT:    [[UREM:%.*]] = urem i64 [[X:%.*]], 19136\n; CHECK-NEXT:    ret i64 [[UREM]]\n  %t = urem i64 %x, 299\n  %t1 = udiv i64 %x, 299\n  %t2 = urem i64 %t1, 64\n  %t3 = mul i64 %t2, 299\n  %t4 = add i64 %t, %t3\n  ret i64 %t4\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @match_unsigned(i64 %x) {\n  %urem = urem i64 %x, 19136\n  ret i64 %urem\n}\n",
+                  "log": "\n----------------------------------------\ndefine i64 @match_unsigned(i64 %x) {\n#0:\n  %t = urem i64 %x, 299\n  %t1 = udiv i64 %x, 299\n  %t2 = urem i64 %t1, 64\n  %t3 = mul i64 %t2, 299\n  %t4 = add i64 %t, %t3\n  ret i64 %t4\n}\n=>\ndefine i64 @match_unsigned(i64 %x) {\n#0:\n  %urem = urem i64 %x, 19136\n  ret i64 %urem\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 33,
+                  "expect_optimized_program": 11,
+                  "current_optimized_program": 11
+                },
+                "filecheck": {
+                  "src": "define i64 @match_unsigned(i64 %x) {\n; CHECK-LABEL: @match_unsigned(\n; CHECK-NEXT:    [[UREM:%.*]] = urem i64 [[X:%.*]], 19136\n; CHECK-NEXT:    ret i64 [[UREM]]\n  %t = urem i64 %x, 299\n  %t1 = udiv i64 %x, 299\n  %t2 = urem i64 %t1, 64\n  %t3 = mul i64 %t2, 299\n  %t4 = add i64 %t, %t3\n  ret i64 %t4\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @match_unsigned(i64 %x) {\n  %urem = urem i64 %x, 19136\n  ret i64 %urem\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i64 @match_unsigned(i64 %x) {\n  %t = urem i64 %x, 299\n  %t1 = udiv i64 %x, 299\n  %t2 = urem i64 %t1, 64\n  %t3 = mul i64 %t2, 299\n  %t4 = add i64 %t, %t3\n  ret i64 %t4\n}\n",
+                "expect_optimized_program": "define i64 @match_unsigned(i64 %x) {\n  %urem = urem i64 %x, 19136\n  ret i64 %urem\n}\n",
+                "current_optimized_program": "define i64 @match_unsigned(i64 %x) {\n  %urem = urem i64 %x, 19136\n  ret i64 %urem\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/add4.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "fold_add_udiv_urem_non_constant",
+              "body": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\n; CHECK-LABEL: @fold_add_udiv_urem_non_constant(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], [[C:%.*]]\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], [[C]]\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\n; CHECK-LABEL: @fold_add_udiv_urem_non_constant(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], [[C:%.*]]\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], [[C]]\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                  "log": "\n----------------------------------------\ndefine i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 noundef %val, noundef %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 noundef %val, noundef %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 noundef %val, noundef %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 noundef %val, noundef %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 23,
+                  "expect_optimized_program": 23,
+                  "current_optimized_program": 23
+                },
+                "filecheck": {
+                  "src": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\n; CHECK-LABEL: @fold_add_udiv_urem_non_constant(\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[DIV:%.*]] = udiv i32 [[VAL:%.*]], [[C:%.*]]\n; CHECK-NEXT:    [[SHL:%.*]] = shl i32 [[DIV]], 4\n; CHECK-NEXT:    [[REM:%.*]] = urem i32 [[VAL]], [[C]]\n; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[SHL]], [[REM]]\n; CHECK-NEXT:    ret i32 [[ADD]]\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "expect_optimized_program": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "current_optimized_program": "define i32 @fold_add_udiv_urem_non_constant(i32 noundef %val, i32 noundef %c) {\nentry:\n  %div = udiv i32 %val, %c\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, %c\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n",
+                "opt_stderr": ""
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "check_fast_log": [],
+  "check_full_log": []
+}
