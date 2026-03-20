@@ -69,6 +69,27 @@ class LLVMFixAgent(DefaultAgent):
     def _is_submit_signal(cmd: str) -> bool:
         return "SUBMIT_PATCH" in cmd and cmd.strip().startswith("echo")
 
+    @staticmethod
+    def _has_fast_and_full_pass_signal(messages: list[dict]) -> bool:
+        has_fast_pass = False
+        has_full_pass = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            if (
+                "BUILD SUCCESS + FAST CHECK PASSED" in content
+                or "FAST CHECK PASSED" in content
+            ):
+                has_fast_pass = True
+            if "FULL CHECK PASSED" in content:
+                has_full_pass = True
+            if has_fast_pass and has_full_pass:
+                return True
+        return False
+
     def _can_submit(self) -> tuple[bool, str]:
         messages = getattr(self, "messages", []) or []
 
@@ -106,6 +127,20 @@ class LLVMFixAgent(DefaultAgent):
         return True, ""
 
     def execute_actions(self, message: dict) -> list[dict]:
+        # 0) 任何时刻只要 fast/full 都通过，立即提前结束后续动作。
+        messages = getattr(self, "messages", []) or []
+        if self._has_fast_and_full_pass_signal(messages):
+            raise Submitted(
+                {
+                    "role": "exit",
+                    "content": "Both fast and full checks have passed; early stop.",
+                    "extra": {
+                        "exit_status": "ChecksPassedEarlyStop",
+                        "submission": "",
+                    },
+                }
+            )
+
         actions = message.get("extra", {}).get("actions", [])
 
         for action in actions:

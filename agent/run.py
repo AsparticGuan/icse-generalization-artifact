@@ -1525,34 +1525,12 @@ def build_task_description(
     bug_type = env.get_bug_type()
     components = list(env.get_hint_components() or [])
     component = components[0] if components else "Unknown"
-    bug_funcs = env.get_hint_bug_functions() or {}
-    hints = env.data.get("hints", {}) if isinstance(env.data, dict) else {}
-    bug_lines = hints.get("bug_location_lineno", {}) if isinstance(hints, dict) else {}
 
     issue_desc = _first_missed_optimization_desc(env)
 
     desc = f"**Issue ID**: {issue_id}\n"
     desc += f"**Bug Type**: {bug_type}\n"
     desc += f"**Component**: {component}\n"
-
-    if bug_funcs:
-        for fname, funcs in bug_funcs.items():
-            desc += f"**Hint — Bug Location**: {fname} → {', '.join(funcs)}\n"
-
-    if isinstance(bug_lines, dict):
-        for fname, ranges in bug_lines.items():
-            if not isinstance(fname, str):
-                continue
-            if not isinstance(ranges, list):
-                continue
-            render_ranges: list[str] = []
-            for item in ranges:
-                if isinstance(item, (list, tuple)) and len(item) == 2:
-                    start, end = item
-                    if isinstance(start, int) and isinstance(end, int):
-                        render_ranges.append(f"{start}-{end}")
-            if render_ranges:
-                desc += f"**Hint — Bug Lines**: {fname} → {', '.join(render_ranges)}\n"
 
     desc += f"\n{issue_desc}"
 
@@ -1730,14 +1708,16 @@ def _extract_text_messages(messages: list[dict]) -> list[str]:
     return texts
 
 
-def _has_fast_or_full_pass_signal(messages: list[dict]) -> bool:
+def _has_fast_and_full_pass_signal(messages: list[dict]) -> bool:
     texts = _extract_text_messages(messages)
+    has_fast_pass = False
+    has_full_pass = False
     for text in texts:
-        if (
-            "BUILD SUCCESS + FAST CHECK PASSED" in text
-            or "FAST CHECK PASSED" in text
-            or "FULL CHECK PASSED" in text
-        ):
+        if "BUILD SUCCESS + FAST CHECK PASSED" in text or "FAST CHECK PASSED" in text:
+            has_fast_pass = True
+        if "FULL CHECK PASSED" in text:
+            has_full_pass = True
+        if has_fast_pass and has_full_pass:
             return True
     return False
 
@@ -1747,7 +1727,8 @@ def _should_retry_after_limits(exit_status: str, messages: list[dict]) -> bool:
         return False
     if exit_status != "LimitsExceeded":
         return False
-    return _has_fast_or_full_pass_signal(messages)
+    # 额度耗尽后默认允许 +25 补尝试；若两项检查都已通过，则无需再重试。
+    return not _has_fast_and_full_pass_signal(messages)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1985,8 +1966,8 @@ def fix_issue(
     if _should_retry_after_limits(exit_status, agent_messages):
         retry_step_limit = cfg.step_limit + LIMITS_RETRY_EXTRA_STEPS
         print(
-            f"[Retry] exit_status=LimitsExceeded but pass signals detected; "
-            f"rerun with step_limit={retry_step_limit}"
+            f"[Retry] exit_status=LimitsExceeded; rerun with step_limit={retry_step_limit} "
+            "to continue attempting remaining checks"
         )
         retry_agent = LLVMFixAgent(
             model,
@@ -2146,7 +2127,7 @@ You can also use standard bash commands (grep, find, cat, head, tail, etc.) for 
 ## Workflow
 
 1. **Understand**: Read the task description to understand the missed optimization. If needed, run `issue_info.py` for more details.
-2. **Locate**: Find the relevant source file and function using hints, grep, or your LLVM knowledge.
+2. **Locate**: Find the relevant source file and function using localization predictions, grep, or your LLVM knowledge.
 3. **Analyze**: Study the existing code to understand why the optimization is missing.
 4. **Implement**: Make minimal, targeted changes using `apply_code.py` or direct file edits.
 5. **Build & Test Frequently**: After each code edit (every `apply_code.py write/sed`), immediately run `cd {{cwd}} && python $AGENT_TOOLS_DIR/build_and_check.py`.

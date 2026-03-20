@@ -10,7 +10,6 @@
 
 import os
 import sys
-import json
 
 import _setup  # noqa: F401 — 初始化 sys.path
 from _setup import get_env_or_die
@@ -32,7 +31,6 @@ def main():
     # 基本信息
     bug_type = env.get_bug_type()
     components = list(env.get_hint_components() or [])
-    bug_funcs = env.get_hint_bug_functions() or {}
     base_commit = env.get_base_commit()
 
     # Issue 描述
@@ -55,24 +53,12 @@ def main():
             t["already_optimized"] = (src == exp) if src and exp else False
             tests_info.append(t)
 
-    # 定位信息（hint）
-    hint_files = []
-    try:
-        lineno = env.get_hint_line_level_bug_locations()
-        if lineno:
-            hint_files = list(lineno.keys())
-    except Exception:
-        pass
-
     # 输出
     print(f"=== Issue {issue_id} ===")
     print(f"Bug Type: {bug_type}")
     print(f"Components: {', '.join(components)}")
     print(f"Base Commit: {base_commit}")
     print(f"Issue Title: {issue_title}")
-    print(f"Bug Functions (hint): {json.dumps(bug_funcs, ensure_ascii=False)}")
-    if hint_files:
-        print(f"Bug Files (hint): {', '.join(hint_files)}")
     print()
 
     # 打印未优化的测试用例
@@ -84,9 +70,13 @@ def main():
         if t["source_program"]:
             print(f"Source program:\n```llvm\n{t['source_program']}\n```")
         if t["expect_optimized_program"]:
-            print(f"Expected optimized program:\n```llvm\n{t['expect_optimized_program']}\n```")
+            print(
+                f"Expected optimized program:\n```llvm\n{t['expect_optimized_program']}\n```"
+            )
         if t["current_optimized_program"]:
-            print(f"Current (wrong) optimized program:\n```llvm\n{t['current_optimized_program']}\n```")
+            print(
+                f"Current (wrong) optimized program:\n```llvm\n{t['current_optimized_program']}\n```"
+            )
         print()
 
 
