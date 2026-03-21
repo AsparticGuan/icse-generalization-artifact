@@ -161,6 +161,10 @@ LOCALIZE_CANDIDATE_FILES = [
     "llvm/lib/Transforms/InstCombine/InstCombineAtomicRMW.cpp",
     "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp",
     "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp",
+    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp"
+    "llvm/lib/Analysis/InstructionSimplify.cpp",
+    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
+    "llvm/lib/Analysis/ValueTracking.cpp",
 ]
 
 LOCALIZE_SYS_PROMPT_FILE = (
