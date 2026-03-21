@@ -145,31 +145,80 @@ LIMITS_RETRY_EXTRA_STEPS = max(
     5, _safe_env_int("LAB_AGENT_LIMITS_RETRY_EXTRA_STEPS", 25)
 )
 
-LOCALIZE_CANDIDATE_FILES = [
-    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp",
-    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineAtomicRMW.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp",
-    "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp",
-    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp"
-    "llvm/lib/Analysis/InstructionSimplify.cpp",
-    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
-    "llvm/lib/Analysis/ValueTracking.cpp",
-]
+LOCALIZE_CATEGORY_CHOICES = (
+    "ConstraintElimination",
+    "IR",
+    "InstCombine",
+    "InstructionSimplify",
+    "SimplifyCFG",
+    "ValueTracking",
+)
+LOCALIZE_DEFAULT_CATEGORY = "InstCombine"
 
+LOCALIZE_CATEGORY_TO_PASS = {
+    "ConstraintElimination": "constraint-elimination",
+    "IR": "default<O2>",
+    "InstCombine": "instcombine",
+    "InstructionSimplify": "instsimplify",
+    "SimplifyCFG": "simplifycfg",
+    "ValueTracking": "valuetracking",
+}
+
+LOCALIZE_CANDIDATE_FILES_BY_CATEGORY: dict[str, list[str]] = {
+    "ConstraintElimination": [
+        "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp",
+    ],
+    "IR": [
+        "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp",
+        "llvm/lib/Analysis/InstructionSimplify.cpp",
+        "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
+        "llvm/lib/Analysis/ValueTracking.cpp",
+    ],
+    "InstCombine": [
+        "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp",
+        "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineAtomicRMW.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp",
+        "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp",
+    ],
+    "InstructionSimplify": [
+        "llvm/lib/Analysis/InstructionSimplify.cpp",
+    ],
+    "SimplifyCFG": [
+        "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
+    ],
+    "ValueTracking": [
+        "llvm/lib/Analysis/ValueTracking.cpp",
+    ],
+}
+
+LOCALIZE_CANDIDATE_FILES: list[str] = []
+LOCALIZE_FILE_TO_CATEGORIES: dict[str, list[str]] = {}
+for _category in LOCALIZE_CATEGORY_CHOICES:
+    for _file in LOCALIZE_CANDIDATE_FILES_BY_CATEGORY.get(_category, []):
+        if _file not in LOCALIZE_CANDIDATE_FILES:
+            LOCALIZE_CANDIDATE_FILES.append(_file)
+        LOCALIZE_FILE_TO_CATEGORIES.setdefault(_file, [])
+        if _category not in LOCALIZE_FILE_TO_CATEGORIES[_file]:
+            LOCALIZE_FILE_TO_CATEGORIES[_file].append(_category)
+
+LOCALIZE_SYS_PROMPT_CATEGORY = (
+    "You are an LLVM maintainer. Users reported a missed optimization. "
+    "Before file-level localization, choose the single most likely LLVM pass category."
+)
 LOCALIZE_SYS_PROMPT_FILE = (
     "You are an LLVM maintainer. Users reported a missed optimization. "
-    "Identify which InstCombine source file is most likely responsible."
+    "Identify which source files in the selected localization category are most likely responsible."
 )
 LOCALIZE_SYS_PROMPT_FUNC = (
     "You are an LLVM maintainer. Users reported a missed optimization. "
@@ -628,6 +677,11 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
             "优先级：CLI > LAB_AGENT_LOCALIZE_MODE > pipeline（默认）。"
         ),
     )
+    parser.add_argument(
+        "--localize-refresh",
+        action="store_true",
+        help="强制重算 localization：忽略并覆盖 issue 目录下现有 localization.json。",
+    )
 
     # 通用强度档位（会根据模型自动映射到 reasoning/thinking 参数）
     parser.add_argument(
@@ -935,15 +989,160 @@ def _extract_topk_lines_from_model_output(model_output: str, top_k: int) -> list
     return cleaned
 
 
-def _build_file_localize_prompt_lite(issue_desc: str) -> str:
-    """Build lightweight file localization prompt."""
-    candidate_lines = "\n".join(os.path.basename(x) for x in LOCALIZE_CANDIDATE_FILES)
+def _resolve_localize_category(raw: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().strip("`").strip()
+    if not text:
+        return None
+
+    for category in LOCALIZE_CATEGORY_CHOICES:
+        if re.search(rf"\b{re.escape(category)}\b", text, re.IGNORECASE):
+            return category
+
+    pass_aliases = {
+        "constraint-elimination": "ConstraintElimination",
+        "default<o2>": "IR",
+        "instcombine": "InstCombine",
+        "instsimplify": "InstructionSimplify",
+        "simplifycfg": "SimplifyCFG",
+        "valuetracking": "ValueTracking",
+    }
+    lowered = text.lower()
+    if lowered in pass_aliases:
+        return pass_aliases[lowered]
+
+    normalized = re.sub(r"[^a-z]", "", lowered)
+    category_aliases = {
+        "constraintelimination": "ConstraintElimination",
+        "ir": "IR",
+        "instcombine": "InstCombine",
+        "instructionsimplify": "InstructionSimplify",
+        "simplifycfg": "SimplifyCFG",
+        "valuetracking": "ValueTracking",
+    }
+    return category_aliases.get(normalized)
+
+
+def _localize_pass_for_category(category: str) -> str:
+    return LOCALIZE_CATEGORY_TO_PASS.get(
+        category,
+        LOCALIZE_CATEGORY_TO_PASS[LOCALIZE_DEFAULT_CATEGORY],
+    )
+
+
+def _candidate_files_for_category(category: str) -> list[str]:
+    files = LOCALIZE_CANDIDATE_FILES_BY_CATEGORY.get(category)
+    if files:
+        return list(files)
+    return list(LOCALIZE_CANDIDATE_FILES_BY_CATEGORY[LOCALIZE_DEFAULT_CATEGORY])
+
+
+def _infer_localize_category(
+    pred_files: list[str],
+    pred_funcs: dict[str, list[str]] | None = None,
+) -> str | None:
+    scores: dict[str, int] = {category: 0 for category in LOCALIZE_CATEGORY_CHOICES}
+    all_files = list(pred_files)
+    if pred_funcs:
+        for fpath in pred_funcs:
+            if fpath not in all_files:
+                all_files.append(fpath)
+
+    for fpath in all_files:
+        for category in LOCALIZE_FILE_TO_CATEGORIES.get(fpath, []):
+            scores[category] += 1
+
+    ranked = sorted(
+        ((category, score) for category, score in scores.items() if score > 0),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    return ranked[0][0]
+
+
+def _build_localize_category_prompt(issue_desc: str, component_hint: str) -> str:
+    category_lines = "\n".join(
+        f"- {category} (pass: {LOCALIZE_CATEGORY_TO_PASS[category]})"
+        for category in LOCALIZE_CATEGORY_CHOICES
+    )
+    component_context = (
+        f"\nComponent hint from metadata: {component_hint}\n" if component_hint else ""
+    )
     return f"""
-LLVM has a missed optimization bug. Locate where to edit in InstCombine.
+LLVM has a missed optimization bug.
+Before file-level localization, choose one primary localization category.
+
+{issue_desc}{component_context}
+
+Candidate categories:
+{category_lines}
+
+Output exactly one category name from the list above, wrapped in a ```text block.
+Expected format:
+```text
+InstCombine
+```
+""".strip()
+
+
+def _decide_localize_category(
+    issue_id: str,
+    issue_desc: str,
+    *,
+    component_hint: str,
+    default_category: str,
+) -> tuple[str, str]:
+    fallback = _resolve_localize_category(default_category) or LOCALIZE_DEFAULT_CATEGORY
+    if not LOCALIZE_RUNTIME_ENABLED:
+        return fallback, "runtime_disabled"
+    if not issue_desc.strip():
+        return fallback, "empty_issue_desc"
+
+    prompt = _build_localize_category_prompt(issue_desc, component_hint)
+    model_output = _call_localize_model(prompt, sys_prompt=LOCALIZE_SYS_PROMPT_CATEGORY)
+    chosen = _extract_topk_lines_from_model_output(model_output, 1)
+    if chosen:
+        resolved = _resolve_localize_category(chosen[0])
+        if resolved:
+            print(
+                f"[Localize] Category decision for issue {issue_id}: "
+                f"{resolved} (pass={_localize_pass_for_category(resolved)})"
+            )
+            return resolved, "model"
+
+    print(
+        f"[Localize] Category decision fallback for issue {issue_id}: "
+        f"{fallback} (pass={_localize_pass_for_category(fallback)})"
+    )
+    return fallback, "fallback"
+
+
+def _build_file_localize_prompt_lite(
+    issue_desc: str,
+    *,
+    category: str,
+    pass_name: str,
+    candidate_files: list[str],
+) -> str:
+    """Build lightweight file localization prompt."""
+    candidate_basenames = [os.path.basename(x) for x in candidate_files]
+    file_top_k = min(LOCALIZE_TOP_K_FILES, len(candidate_basenames))
+    candidate_lines = "\n".join(candidate_basenames)
+    example_lines = "\n".join(candidate_basenames[:file_top_k])
+    return f"""
+LLVM has a missed optimization bug. Locate where to edit in the selected category.
+
+Target category: `{category}`
+Target pass: `{pass_name}`
 
 {issue_desc}
 
-Choose exactly {LOCALIZE_TOP_K_FILES} files from the candidate list below, ranked by likelihood.
+Choose exactly {file_top_k} files from the candidate list below, ranked by likelihood.
 Output only file names from the list, one per line, wrapped in a ```text block.
 
 Candidate files:
@@ -951,9 +1150,7 @@ Candidate files:
 
 Expected output format:
 ```text
-InstCombineAddSub.cpp
-InstCombineCompares.cpp
-InstructionCombining.cpp
+{example_lines}
 ```
 """.strip()
 
@@ -987,10 +1184,18 @@ InstCombinerImpl::visitMul
 
 
 def _build_file_localize_prompt_pipeline(
-    issue_desc: str, debug_output: str | None
+    issue_desc: str,
+    debug_output: str | None,
+    *,
+    category: str,
+    pass_name: str,
+    candidate_files: list[str],
 ) -> str:
     """Build pipeline/localize.py-style file localization prompt."""
-    candidate_lines = "\n".join(os.path.basename(x) for x in LOCALIZE_CANDIDATE_FILES)
+    candidate_basenames = [os.path.basename(x) for x in candidate_files]
+    file_top_k = min(LOCALIZE_TOP_K_FILES, len(candidate_basenames))
+    candidate_lines = "\n".join(candidate_basenames)
+    example_lines = "\n".join(candidate_basenames[:file_top_k])
     debug_context = ""
     if debug_output:
         debug_context = f"""
@@ -1020,7 +1225,7 @@ def _build_file_localize_prompt_pipeline(
 
     verify_section = (
         "### 3. Verify\n"
-        f"**Content**: Justify why these {LOCALIZE_TOP_K_FILES} specific files are the most appropriate locations for the change:"
+        f"**Content**: Justify why these {file_top_k} specific files are the most appropriate locations for the change:"
     )
     if debug_output:
         verify_section += (
@@ -1036,9 +1241,12 @@ def _build_file_localize_prompt_pipeline(
     prompt = f"""
 LLVM is currently unable to perform this optimization successfully. Your task is to identify which files below are most likely to be modified to implement the missing optimization. Use the exact Markdown section headings and structure provided.
 
+Target category: `{category}`
+Target pass: `{pass_name}`
+
 {issue_desc}{debug_context}
 
-You must choose exactly {LOCALIZE_TOP_K_FILES} files from this list (ranked by likelihood):
+You must choose exactly {file_top_k} files from this list (ranked by likelihood):
 
 {candidate_lines}
 
@@ -1047,7 +1255,7 @@ You must choose exactly {LOCALIZE_TOP_K_FILES} files from this list (ranked by l
 {analyze_section}
 
 ### 2. Propose positions
-**Content**: You must output exactly {LOCALIZE_TOP_K_FILES} file names from the list above, ranked by likelihood (most likely first). Do not explain here; only output the chosen file names exactly as written in the list, one per line.
+**Content**: You must output exactly {file_top_k} file names from the list above, ranked by likelihood (most likely first). Do not explain here; only output the chosen file names exactly as written in the list, one per line.
 
 {verify_section}
 
@@ -1055,9 +1263,7 @@ You must choose exactly {LOCALIZE_TOP_K_FILES} files from this list (ranked by l
 **Content**: Provide the final answer by outputting file names (one per line), enclosed in a Markdown code block with language tag `text`, like:
 
 ```text
-InstCombineXXX.cpp
-InstCombineYYY.cpp
-InstCombineZZZ.cpp
+{example_lines}
 ```
 """.strip()
     return prompt
@@ -1255,13 +1461,17 @@ def _call_localize_model(prompt: str, *, sys_prompt: str) -> str:
         return ""
 
 
-def _resolve_localize_file_path(pred_file: str) -> str | None:
+def _resolve_localize_file_path(
+    pred_file: str,
+    candidate_files: list[str] | None = None,
+) -> str | None:
     """Map model-predicted filename to canonical candidate file path."""
+    search_space = candidate_files if candidate_files else LOCALIZE_CANDIDATE_FILES
     value = pred_file.strip().strip("`").strip()
     if not value:
         return None
 
-    if value in LOCALIZE_CANDIDATE_FILES:
+    if value in search_space:
         return value
 
     if value.startswith("llvm/"):
@@ -1269,7 +1479,7 @@ def _resolve_localize_file_path(pred_file: str) -> str | None:
     else:
         base = os.path.basename(value)
 
-    for candidate in LOCALIZE_CANDIDATE_FILES:
+    for candidate in search_space:
         if os.path.basename(candidate) == base:
             return candidate
     return None
@@ -1291,20 +1501,29 @@ def _read_localize_file_text(issue_llvm_dir: str, rel_path: str) -> str:
 
 def _load_precomputed_localization(
     issue_id: str,
-) -> tuple[list[str], dict[str, list[str]], str]:
+    *,
+    force_refresh: bool = False,
+) -> tuple[list[str], dict[str, list[str]], str, str | None]:
     """Load issue-scoped localization cache from results/agent/<model>/<issue>/."""
     localize_output = os.path.join(
         _issue_results_dir(issue_id), LOCALIZE_CACHE_FILENAME
     )
+    if force_refresh:
+        print(
+            f"[Localize] Force refresh enabled for issue {issue_id}; "
+            f"ignore cache: {localize_output}"
+        )
+        return [], {}, localize_output, None
+
     if not os.path.isfile(localize_output):
-        return [], {}, localize_output
+        return [], {}, localize_output, None
 
     try:
         with open(localize_output, "r", encoding="utf-8") as f:
             localize_data = json.load(f)
     except Exception as exc:
         print(f"[Localize] Failed to read {localize_output}: {exc}")
-        return [], {}, localize_output
+        return [], {}, localize_output, None
 
     issue_data = localize_data
     if isinstance(localize_data, dict) and (
@@ -1312,7 +1531,7 @@ def _load_precomputed_localization(
     ):
         issue_data = localize_data.get(issue_id)
     if not isinstance(issue_data, dict):
-        return [], {}, localize_output
+        return [], {}, localize_output, None
 
     pred_files: list[str] = []
     for raw_file in _normalize_str_list(
@@ -1327,7 +1546,14 @@ def _load_precomputed_localization(
         resolved = _resolve_localize_file_path(raw_file) or raw_file
         pred_funcs[resolved] = funcs[:LOCALIZE_TOP_K_FUNCS]
 
-    return pred_files, pred_funcs, localize_output
+    raw_category = issue_data.get("pred_category")
+    if not isinstance(raw_category, str):
+        raw_category = issue_data.get("category")
+    pred_category = _resolve_localize_category(raw_category)
+    if not pred_category:
+        pred_category = _infer_localize_category(pred_files, pred_funcs)
+
+    return pred_files, pred_funcs, localize_output, pred_category
 
 
 def _persist_issue_localization(
@@ -1335,6 +1561,8 @@ def _persist_issue_localization(
     pred_files: list[str],
     pred_funcs: dict[str, list[str]],
     *,
+    pred_category: str,
+    category_source: str,
     localize_mode: str,
     source: str,
 ) -> str:
@@ -1344,6 +1572,9 @@ def _persist_issue_localization(
     )
     payload = {
         "issue_id": issue_id,
+        "pred_category": pred_category,
+        "pred_pass": _localize_pass_for_category(pred_category),
+        "category_source": category_source,
         "pred_files": _normalize_str_list(pred_files, limit=LOCALIZE_TOP_K_FILES),
         "pred_funcs": {},
         "localize_mode": localize_mode,
@@ -1370,6 +1601,7 @@ def _run_runtime_localization_lite(
     issue_id: str,
     issue_desc: str,
     issue_llvm_dir: str,
+    localize_category: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Run lightweight (file -> function) runtime localization."""
     if not LOCALIZE_RUNTIME_ENABLED:
@@ -1377,16 +1609,32 @@ def _run_runtime_localization_lite(
     if not issue_desc.strip():
         return [], {}
 
-    print(f"[Localize][lite] Running runtime localization for issue {issue_id}...")
+    candidate_files = _candidate_files_for_category(localize_category)
+    file_top_k = min(LOCALIZE_TOP_K_FILES, len(candidate_files))
+    if file_top_k <= 0:
+        return [], {}
+    pass_name = _localize_pass_for_category(localize_category)
 
-    file_prompt = _build_file_localize_prompt_lite(issue_desc)
+    print(
+        f"[Localize][lite] Running runtime localization for issue {issue_id} "
+        f"(category={localize_category}, pass={pass_name})..."
+    )
+
+    file_prompt = _build_file_localize_prompt_lite(
+        issue_desc,
+        category=localize_category,
+        pass_name=pass_name,
+        candidate_files=candidate_files,
+    )
     file_output = _call_localize_model(file_prompt, sys_prompt=LOCALIZE_SYS_PROMPT_FILE)
-    raw_files = _extract_topk_lines_from_model_output(file_output, LOCALIZE_TOP_K_FILES)
+    raw_files = _extract_topk_lines_from_model_output(file_output, file_top_k)
 
     pred_files: list[str] = []
     pred_funcs: dict[str, list[str]] = {}
     for raw_file in raw_files:
-        resolved = _resolve_localize_file_path(raw_file)
+        resolved = _resolve_localize_file_path(
+            raw_file, candidate_files=candidate_files
+        )
         if not resolved:
             continue
         if resolved not in pred_files:
@@ -1421,6 +1669,7 @@ def _run_runtime_localization_pipeline(
     env: Env,
     issue_llvm_dir: str,
     build_dir: str,
+    localize_category: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Run pipeline/localize.py-aligned runtime localization."""
     if not LOCALIZE_RUNTIME_ENABLED:
@@ -1441,7 +1690,16 @@ def _run_runtime_localization_pipeline(
     if not issue_desc.strip():
         return [], {}
 
-    print(f"[Localize][pipeline] Running runtime localization for issue {issue_id}...")
+    candidate_files = _candidate_files_for_category(localize_category)
+    file_top_k = min(LOCALIZE_TOP_K_FILES, len(candidate_files))
+    if file_top_k <= 0:
+        return [], {}
+    pass_name = _localize_pass_for_category(localize_category)
+
+    print(
+        f"[Localize][pipeline] Running runtime localization for issue {issue_id} "
+        f"(category={localize_category}, pass={pass_name})..."
+    )
     debug_output = _collect_pipeline_debug_output(
         env=env,
         issue_id=issue_id,
@@ -1450,14 +1708,22 @@ def _run_runtime_localization_pipeline(
         build_dir=build_dir,
     )
 
-    file_prompt = _build_file_localize_prompt_pipeline(issue_desc, debug_output)
+    file_prompt = _build_file_localize_prompt_pipeline(
+        issue_desc,
+        debug_output,
+        category=localize_category,
+        pass_name=pass_name,
+        candidate_files=candidate_files,
+    )
     file_output = _call_localize_model(file_prompt, sys_prompt=LOCALIZE_SYS_PROMPT_FILE)
-    raw_files = _extract_topk_lines_from_model_output(file_output, LOCALIZE_TOP_K_FILES)
+    raw_files = _extract_topk_lines_from_model_output(file_output, file_top_k)
 
     pred_files: list[str] = []
     pred_funcs: dict[str, list[str]] = {}
     for raw_file in raw_files:
-        resolved = _resolve_localize_file_path(raw_file)
+        resolved = _resolve_localize_file_path(
+            raw_file, candidate_files=candidate_files
+        )
         if not resolved:
             continue
         if resolved not in pred_files:
@@ -1495,6 +1761,7 @@ def _run_runtime_localization(
     env: Env,
     build_dir: str,
     localize_mode: str,
+    localize_category: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Run runtime localization dispatcher by selected mode."""
     if localize_mode == LOCALIZE_MODE_PIPELINE:
@@ -1503,18 +1770,21 @@ def _run_runtime_localization(
             env=env,
             issue_llvm_dir=issue_llvm_dir,
             build_dir=build_dir,
+            localize_category=localize_category,
         )
     if localize_mode == LOCALIZE_MODE_LITE:
         return _run_runtime_localization_lite(
             issue_id=issue_id,
             issue_desc=issue_desc,
             issue_llvm_dir=issue_llvm_dir,
+            localize_category=localize_category,
         )
     print(f"[Localize] Unknown mode={localize_mode!r}, fallback to lite.")
     return _run_runtime_localization_lite(
         issue_id=issue_id,
         issue_desc=issue_desc,
         issue_llvm_dir=issue_llvm_dir,
+        localize_category=localize_category,
     )
 
 
@@ -1524,11 +1794,16 @@ def build_task_description(
     issue_llvm_dir: str,
     build_dir: str,
     localize_mode: str,
+    localize_refresh: bool = False,
 ) -> str:
     """构造传给 agent.run(task=...) 的任务描述文本。"""
     bug_type = env.get_bug_type()
     components = list(env.get_hint_components() or [])
     component = components[0] if components else "Unknown"
+    component_hint = component if component != "Unknown" else ""
+    fallback_category = (
+        _resolve_localize_category(component_hint) or LOCALIZE_DEFAULT_CATEGORY
+    )
 
     issue_desc = _first_missed_optimization_desc(env)
 
@@ -1538,15 +1813,30 @@ def build_task_description(
 
     desc += f"\n{issue_desc}"
 
-    pred_files, pred_funcs, localize_output = _load_precomputed_localization(issue_id)
+    pred_files, pred_funcs, localize_output, localize_category = (
+        _load_precomputed_localization(issue_id, force_refresh=localize_refresh)
+    )
     localize_source = ""
+    category_source = ""
     if pred_files or pred_funcs:
         localize_source = f"issue localization cache ({localize_output})"
+        if localize_category:
+            category_source = "cache"
+        else:
+            localize_category = fallback_category
+            category_source = "component fallback"
     else:
         print(
             f"[Localize] No issue cache for {issue_id}: {localize_output}; "
             f"fallback to runtime ({localize_mode})."
         )
+        localize_category, category_decision_source = _decide_localize_category(
+            issue_id=issue_id,
+            issue_desc=issue_desc,
+            component_hint=component_hint,
+            default_category=fallback_category,
+        )
+        category_source = f"runtime decision ({category_decision_source})"
         pred_files, pred_funcs = _run_runtime_localization(
             issue_id=issue_id,
             issue_desc=issue_desc,
@@ -1554,10 +1844,13 @@ def build_task_description(
             env=env,
             build_dir=build_dir,
             localize_mode=localize_mode,
+            localize_category=localize_category,
         )
         if LOCALIZE_RUNTIME_ENABLED:
             _persist_issue_localization(
                 issue_id=issue_id,
+                pred_category=localize_category,
+                category_source=category_decision_source,
                 pred_files=pred_files,
                 pred_funcs=pred_funcs,
                 localize_mode=localize_mode,
@@ -1569,6 +1862,14 @@ def build_task_description(
             print(
                 f"[Localize] Runtime localization returned empty for issue {issue_id}."
             )
+
+    if localize_category:
+        pass_name = _localize_pass_for_category(localize_category)
+        source_text = f", source: {category_source}" if category_source else ""
+        desc += (
+            f"\n**Localization Category**: {localize_category} "
+            f"(pass: {pass_name}{source_text})\n"
+        )
 
     if pred_files or pred_funcs:
         desc += f"\n**Localization Predictions** ({localize_source}):\n"
@@ -1794,6 +2095,7 @@ def fix_issue(
     *,
     model_name: str,
     localize_mode: str,
+    localize_refresh: bool = False,
     fresh_run: bool = False,
     thinking_overrides: dict[str, object] | None = None,
 ):
@@ -1858,6 +2160,7 @@ def fix_issue(
         issue_llvm_dir=issue_llvm_dir,
         build_dir=build_dir,
         localize_mode=localize_mode,
+        localize_refresh=localize_refresh,
     )
 
     # 5. 创建 mini-swe-agent 组件
@@ -2131,7 +2434,7 @@ You can also use standard bash commands (grep, find, cat, head, tail, etc.) for 
 ## Workflow
 
 1. **Understand**: Read the task description to understand the missed optimization. If needed, run `issue_info.py` for more details.
-2. **Locate**: Find the relevant source file and function using localization predictions, grep, or your LLVM knowledge.
+2. **Locate**: Use the concrete **Localization Predictions** in the task description as your primary scope. Start from the top-ranked file/function first, and only broaden search after an edit + `build_and_check.py` cycle shows no progress.
 3. **Analyze**: Study the existing code to understand why the optimization is missing.
 4. **Implement**: Make minimal, targeted changes using `apply_code.py` or direct file edits.
 5. **Build & Test Frequently**: After each code edit (every `apply_code.py write/sed`), immediately run `cd {{cwd}} && python $AGENT_TOOLS_DIR/build_and_check.py`.
@@ -2141,7 +2444,7 @@ You can also use standard bash commands (grep, find, cat, head, tail, etc.) for 
 
 ## Strict Execution Rules
 
-- Start from the top-ranked localization candidate; do not browse more than 2 files before the first code edit.
+- Keep localization predictions as the primary working set: start from the top-ranked candidate and do not browse more than 2 files before the first code edit.
 - Within the first 8 actions, you must make at least one `apply_code.py` edit and run `build_and_check.py`.
 - Never run more than 3 consecutive exploration actions (`view_source.py`, `grep`, `find`) without either `apply_code.py` or `build_and_check.py`.
 - After every `apply_code.py` edit, run `build_and_check.py` immediately before more exploration.
@@ -2170,7 +2473,7 @@ def _load_instance_template() -> str:
 
 Start by examining the test cases in the task description above. Then locate the relevant source code.
 Use `cd {{cwd}} && python $AGENT_TOOLS_DIR/view_source.py <file> <start> <end>` to browse the code.
-Use `cd {{cwd}} && grep -rn '<pattern>' llvm/lib/Transforms/` to search for relevant code.
+Prioritize the top-ranked file/function in **Localization Predictions** first; use `grep` within predicted files or their pass directory before broader search.
 
 When ready, make your changes. After each `apply_code.py` edit, immediately run
 `cd {{cwd}} && python $AGENT_TOOLS_DIR/build_and_check.py`.
@@ -2239,6 +2542,7 @@ if __name__ == "__main__":
     print(f"Agent workflow — {len(task_list)} issue(s) to process")
     print(f"Model: {cfg.llm_model}")
     print(f"Localization mode: {localize_mode} (source={localize_mode_source})")
+    print(f"Localization refresh: {args.localize_refresh}")
     print("Thinking overrides:")
     if thinking_overrides:
         print(json.dumps(thinking_overrides, indent=2, ensure_ascii=False))
@@ -2260,6 +2564,7 @@ if __name__ == "__main__":
                 override=override,
                 model_name=cfg.llm_model,
                 localize_mode=localize_mode,
+                localize_refresh=args.localize_refresh,
                 fresh_run=args.fresh_run,
                 thinking_overrides=thinking_overrides,
             )

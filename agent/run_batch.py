@@ -299,6 +299,7 @@ def _build_cmd(
     *,
     fresh_run: bool,
     localize_mode: str | None,
+    localize_refresh: bool,
     ordered_effort: str | None,
     profile_args: list[str],
     retest: bool,
@@ -311,6 +312,8 @@ def _build_cmd(
         cmd.append(issue_arg)
     if localize_mode is not None:
         cmd.extend(["--localize-mode", localize_mode])
+    if localize_refresh:
+        cmd.append("--localize-refresh")
     if ordered_effort is not None:
         cmd.extend(["--effort", ordered_effort])
     cmd.extend(profile_args)
@@ -400,6 +403,11 @@ def main() -> int:
             "可选：pipeline/lite；不传时使用 run.py 默认解析"
             "（CLI > LAB_AGENT_LOCALIZE_MODE > pipeline）。"
         ),
+    )
+    parser.add_argument(
+        "--localize-refresh",
+        action="store_true",
+        help="透传给 run.py：强制重算 localization，忽略并覆盖已有 localization.json。",
     )
 
     # 按模型顺序传通用思考强度：1个=应用到全部模型；N个=与模型一一对应
@@ -544,6 +552,7 @@ def main() -> int:
         "Localization mode: "
         + (args.localize_mode if args.localize_mode is not None else "(run.py default)")
     )
+    print(f"Localization refresh: {args.localize_refresh}")
     print(f"Force overwrite: {args.force}")
     print(f"Fresh run: {args.fresh_run}")
     print(
@@ -607,6 +616,7 @@ def main() -> int:
             args.force,
             fresh_run=args.fresh_run,
             localize_mode=args.localize_mode,
+            localize_refresh=args.localize_refresh,
             ordered_effort=None,
             profile_args=per_model_profile_args,
             retest=args.retest_patches,
