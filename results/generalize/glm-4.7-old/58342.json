@@ -1,0 +1,571 @@
+{
+  "issue_id": "58342",
+  "dataset_file": "58342.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @icmp_ule_basic_negative(i32 %arg) {\n  %sub = call i32 @llvm.usub.sat.i32(i32 %arg, i32 -6)\n  %cmp = icmp ule i32 %sub, 3\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\ndefine i1 @icmp_ule_basic_negative(i32 %arg) {\n  %cmp = icmp ult i32 %arg, -2\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize comparisons (`icmp`) against `llvm.usub.sat` intrinsic results by transforming the comparison into a direct check against the first operand, adjusted by the constants. This avoids the costly usub.sat intrinsic and the intermediate subtraction.\",\n  \"before_after\": \"Transform `icmp P (usub.sat X, C1), C2` into `icmp P' X, C3` (or `true`/`false`), where `P'` and `C3` are derived from `P`, `C1`, and `C2`. For the specific example `icmp ule (usub.sat X, -6), 3`, it becomes `icmp ule X, -3` (which canonicalizes to `icmp ult X, -2`).\",\n  \"preconditions\": [\n    \"The operand to `icmp` must be a call to `llvm.usub.sat`.\",\n    \"The second operand of `usub.sat` (`C1`) and the operand of `icmp` (`C2`) must be constants (ConstantInt).\",\n    \"The comparison predicate (`P`) must be an unsigned integer comparison (eq, ne, ule, ult, uge, ugt).\",\n    \"The types must match (integer or vector of integers).\"\n  ],\n  \"pattern\": \"Let `X` be the first operand of `usub.sat`, `C1` the second operand, and `C2` the RHS of the icmp. Let `Sum = C1 + C2` (unsigned). Let `NoWrap = (Sum uge C1`). The transformation depends on the predicate `P`:\\n\\n- **`ule`**: `X <= Sum` if `NoWrap`; `true` otherwise.\\n- **`ult`**: `X < Sum` if `NoWrap` and `C2 != 0`; `false` if `C2 == 0`; `true` otherwise.\\n- **`uge`**: `X >= Sum` if `NoWrap` and `C2 != 0`; `true` if `C2 == 0`; `false` otherwise.\\n- **`ugt`**: `X > Sum` if `NoWrap`; `false` otherwise.\\n- **`eq`**: `X == Sum` if `C2 != 0` and `NoWrap`; `X <= C1` if `C2 == 0`; `false` otherwise.\\n- **`ne`**: `X != Sum` if `C2 != 0` and `NoWrap`; `X > C1` if `C2 == 0`; `true` otherwise.\",\n  \"testcases\": [\n    {\n      \"name\": \"ule_basic_original\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 -6)\\n  %c = icmp ule i32 %s, 3\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ult i32 %a, -2\\n  ret i1 %c\\n}\",\n      \"why\": \"Original case: C1=-6, C2=3. Sum=-3. NoWrap. ule X, -3 -> ult X, -2.\"\n    },\n    {\n      \"name\": \"ult_simple\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ult i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ult i32 %a, 15\\n  ret i1 %c\\n}\",\n      \"why\": \"ult X, Sum (10+5=15).\"\n    },\n    {\n      \"name\": \"uge_simple\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp uge i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp uge i32 %a, 15\\n  ret i1 %c\\n}\",\n      \"why\": \"uge X, Sum (10+5=15).\"\n    },\n    {\n      \"name\": \"ugt_simple\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ugt i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ugt i32 %a, 15\\n  ret i1 %c\\n}\",\n      \"why\": \"ugt X, Sum (10+5=15).\"\n    },\n    {\n      \"name\": \"eq_simple\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp eq i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp eq i32 %a, 15\\n  ret i1 %c\\n}\",\n      \"why\": \"eq X, Sum (10+5=15).\"\n    },\n    {\n      \"name\": \"ne_simple\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ne i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ne i32 %a, 15\\n  ret i1 %c\\n}\",\n      \"why\": \"ne X, Sum (10+5=15).\"\n    },\n    {\n      \"name\": \"eq_c2_zero\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp eq i32 %s, 0\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ule i32 %a, 10\\n  ret i1 %c\\n}\",\n      \"why\": \"eq (usub.sat X, C1), 0 -> ule X, C1.\"\n    },\n    {\n      \"name\": \"ne_c2_zero\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ne i32 %s, 0\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ugt i32 %a, 10\\n  ret i1 %c\\n}\",\n      \"why\": \"ne (usub.sat X, C1), 0 -> ugt X, C1.\"\n    },\n    {\n      \"name\": \"wrap_ule_true\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\\n  %c = icmp ule i8 %s, 20\\n  ret i1 %c\\n}\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  ret i1 true\\n}\",\n      \"why\": \"C1=250, C2=20. Sum wraps (14). ule with wrap is always true.\"\n    },\n    {\n      \"name\": \"wrap_ugt_false\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\\n  %c = icmp ugt i8 %s, 20\\n  ret i1 %c\\n}\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  ret i1 false\\n}\",\n      \"why\": \"C1=250, C2=20. Sum wraps. ugt with wrap is always false.\"\n    },\n    {\n      \"name\": \"vector_case\",\n      \"ir\": \"define <4 x i1> @test(<4 x i32> %a) {\\n  %s = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\\n  %c = icmp ule <4 x i32> %s, <i32 2, i32 2, i32 2, i32 2>\\n  ret <4 x i1> %c\\n}\\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i32> %a) {\\n  %c = icmp ule <4 x i32> %a, <i32 7, i32 7, i32 7, i32 7>\\n  ret <4 x i1> %c\\n}\",\n      \"why\": \"Vector fold: Sum = 7.\"\n    },\n    {\n      \"name\": \"c1_zero\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 0)\\n  %c = icmp ule i32 %s, 10\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %c = icmp ule i32 %a, 10\\n  ret i1 %c\\n}\",\n      \"why\": \"usub.sat(X, 0) is X.\"\n    },\n    {\n      \"name\": \"multiple_uses_of_sub\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ule i32 %s, 5\\n  %dummy = add i32 %s, 1\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ult i32 %a, 15\\n  %dummy = add i32 %s, 1\\n  ret i1 %c\\n}\",\n      \"why\": \"Icmp should be folded even if %s is used elsewhere. %s must remain.\"\n    },\n    {\n      \"name\": \"neg_signed_predicate\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp sle i32 %s, 5\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp sle i32 %s, 5\\n  ret i1 %c\\n}\",\n      \"why\": \"Signed predicates are not handled by this pattern (unless trivial).\"\n    },\n    {\n      \"name\": \"neg_non_constant_rhs\",\n      \"ir\": \"define i1 @test(i32 %a, i32 %b) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ule i32 %s, %b\\n  ret i1 %c\\n}\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a, i32 %b) {\\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\\n  %c = icmp ule i32 %s, %b\\n  ret i1 %c\\n}\",\n      \"why\": \"Fold requires constant RHS for the icmp.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement this in `InstCombineCompares.cpp` inside `visitICmpInst`. Match the pattern `match(ICmp, m_ICmp(Pred, m_Intrinsic<Intrinsic::usub_sat>(m_Value(X), m_ConstantInt(C1)), m_ConstantInt(C2)))`. Compute `Sum` and check for overflow using `APInt::add` or `uadd_sat` logic. Apply the predicate transformation table. Ensure the intrinsic is not erased if it has multiple uses.\",\n  \"regression_test_notes\": \"Use `opt -passes=instcombine -S` to test. Verify that the call to `llvm.usub.sat` is removed (if 1 use) or kept (if multiple uses). Check FileCheck directives for the transformed icmp.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Optimize comparisons (`icmp`) against `llvm.usub.sat` intrinsic results by transforming the comparison into a direct check against the first operand, adjusted by the constants. This avoids the costly usub.sat intrinsic and the intermediate subtraction.",
+    "before_after": "Transform `icmp P (usub.sat X, C1), C2` into `icmp P' X, C3` (or `true`/`false`), where `P'` and `C3` are derived from `P`, `C1`, and `C2`. For the specific example `icmp ule (usub.sat X, -6), 3`, it becomes `icmp ule X, -3` (which canonicalizes to `icmp ult X, -2`).",
+    "preconditions": [
+      "The operand to `icmp` must be a call to `llvm.usub.sat`.",
+      "The second operand of `usub.sat` (`C1`) and the operand of `icmp` (`C2`) must be constants (ConstantInt).",
+      "The comparison predicate (`P`) must be an unsigned integer comparison (eq, ne, ule, ult, uge, ugt).",
+      "The types must match (integer or vector of integers)."
+    ],
+    "pattern": "Let `X` be the first operand of `usub.sat`, `C1` the second operand, and `C2` the RHS of the icmp. Let `Sum = C1 + C2` (unsigned). Let `NoWrap = (Sum uge C1`). The transformation depends on the predicate `P`:\n\n- **`ule`**: `X <= Sum` if `NoWrap`; `true` otherwise.\n- **`ult`**: `X < Sum` if `NoWrap` and `C2 != 0`; `false` if `C2 == 0`; `true` otherwise.\n- **`uge`**: `X >= Sum` if `NoWrap` and `C2 != 0`; `true` if `C2 == 0`; `false` otherwise.\n- **`ugt`**: `X > Sum` if `NoWrap`; `false` otherwise.\n- **`eq`**: `X == Sum` if `C2 != 0` and `NoWrap`; `X <= C1` if `C2 == 0`; `false` otherwise.\n- **`ne`**: `X != Sum` if `C2 != 0` and `NoWrap`; `X > C1` if `C2 == 0`; `true` otherwise.",
+    "testcases": [
+      {
+        "name": "ule_basic_original",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 -6)\n  %c = icmp ule i32 %s, 3\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, -2\n  ret i1 %c\n}",
+        "why": "Original case: C1=-6, C2=3. Sum=-3. NoWrap. ule X, -3 -> ult X, -2."
+      },
+      {
+        "name": "ult_simple",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}",
+        "why": "ult X, Sum (10+5=15)."
+      },
+      {
+        "name": "uge_simple",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp uge i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}",
+        "why": "uge X, Sum (10+5=15)."
+      },
+      {
+        "name": "ugt_simple",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}",
+        "why": "ugt X, Sum (10+5=15)."
+      },
+      {
+        "name": "eq_simple",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}",
+        "why": "eq X, Sum (10+5=15)."
+      },
+      {
+        "name": "ne_simple",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}",
+        "why": "ne X, Sum (10+5=15)."
+      },
+      {
+        "name": "eq_c2_zero",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+        "why": "eq (usub.sat X, C1), 0 -> ule X, C1."
+      },
+      {
+        "name": "ne_c2_zero",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}",
+        "why": "ne (usub.sat X, C1), 0 -> ugt X, C1."
+      },
+      {
+        "name": "wrap_ule_true",
+        "ir": "define i1 @test(i8 %a) {\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\n  %c = icmp ule i8 %s, 20\n  ret i1 %c\n}\ndeclare i8 @llvm.usub.sat.i8(i8, i8)",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  ret i1 true\n}",
+        "why": "C1=250, C2=20. Sum wraps (14). ule with wrap is always true."
+      },
+      {
+        "name": "wrap_ugt_false",
+        "ir": "define i1 @test(i8 %a) {\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\n  %c = icmp ugt i8 %s, 20\n  ret i1 %c\n}\ndeclare i8 @llvm.usub.sat.i8(i8, i8)",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+        "why": "C1=250, C2=20. Sum wraps. ugt with wrap is always false."
+      },
+      {
+        "name": "vector_case",
+        "ir": "define <4 x i1> @test(<4 x i32> %a) {\n  %s = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %c = icmp ule <4 x i32> %s, <i32 2, i32 2, i32 2, i32 2>\n  ret <4 x i1> %c\n}\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i32> %a) {\n  %c = icmp ule <4 x i32> %a, <i32 7, i32 7, i32 7, i32 7>\n  ret <4 x i1> %c\n}",
+        "why": "Vector fold: Sum = 7."
+      },
+      {
+        "name": "c1_zero",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 0)\n  %c = icmp ule i32 %s, 10\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+        "why": "usub.sat(X, 0) is X."
+      },
+      {
+        "name": "multiple_uses_of_sub",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, 5\n  %dummy = add i32 %s, 1\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ult i32 %a, 15\n  %dummy = add i32 %s, 1\n  ret i1 %c\n}",
+        "why": "Icmp should be folded even if %s is used elsewhere. %s must remain."
+      },
+      {
+        "name": "neg_signed_predicate",
+        "ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}",
+        "why": "Signed predicates are not handled by this pattern (unless trivial)."
+      },
+      {
+        "name": "neg_non_constant_rhs",
+        "ir": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}",
+        "why": "Fold requires constant RHS for the icmp."
+      }
+    ],
+    "implementation_notes": "Implement this in `InstCombineCompares.cpp` inside `visitICmpInst`. Match the pattern `match(ICmp, m_ICmp(Pred, m_Intrinsic<Intrinsic::usub_sat>(m_Value(X), m_ConstantInt(C1)), m_ConstantInt(C2)))`. Compute `Sum` and check for overflow using `APInt::add` or `uadd_sat` logic. Apply the predicate transformation table. Ensure the intrinsic is not erased if it has multiple uses.",
+    "regression_test_notes": "Use `opt -passes=instcombine -S` to test. Verify that the call to `llvm.usub.sat` is removed (if 1 use) or kept (if multiple uses). Check FileCheck directives for the transformed icmp.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "ule_basic_original",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 -6)\n  %c = icmp ule i32 %s, 3\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, -2\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 4294967290\n  %c = icmp ule i32 %s, 3\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 4294967294\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 -6)\n  %c = icmp ult i32 %s, 4\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, -2\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 4294967290\n  %c = icmp ult i32 %s, 4\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 4294967294\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, -2\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 -6)\n  %c = icmp ult i32 %s, 4\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 4294967294\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 4294967290\n  %c = icmp ult i32 %s, 4\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ult_simple",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 15\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ult i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "uge_simple",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp uge i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp uge i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 4\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ugt i32 %s, 4\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 4\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp uge i32 %a, 15\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ugt i32 %s, 4\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ugt_simple",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 15\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ugt i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "eq_simple",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp eq i32 %a, 15\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp eq i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ne_simple",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ne i32 %a, 15\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ne i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "eq_c2_zero",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ne_c2_zero",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ugt i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "wrap_ule_true",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\n  %c = icmp ule i8 %s, 20\n  ret i1 %c\n}\ndeclare i8 @llvm.usub.sat.i8(i8, i8)",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %s = usub_sat i8 %a, 250\n  %c = icmp ule i8 %s, 20\n  ret i1 %c\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.usub.sat.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.usub.sat.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "wrap_ugt_false",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %s = call i8 @llvm.usub.sat.i8(i8 %a, i8 250)\n  %c = icmp ugt i8 %s, 20\n  ret i1 %c\n}\ndeclare i8 @llvm.usub.sat.i8(i8, i8)",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %s = usub_sat i8 %a, 250\n  %c = icmp ugt i8 %s, 20\n  ret i1 %c\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.usub.sat.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.usub.sat.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_case",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i32> %a) {\n  %s = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %c = icmp ule <4 x i32> %s, <i32 2, i32 2, i32 2, i32 2>\n  ret <4 x i1> %c\n}\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)",
+          "tgt": "define <4 x i1> @test(<4 x i32> %a) {\n  %c = icmp ule <4 x i32> %a, <i32 7, i32 7, i32 7, i32 7>\n  ret <4 x i1> %c\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %s = usub_sat <4 x i32> %a, { 5, 5, 5, 5 }\n  %c = icmp ule <4 x i32> %s, { 2, 2, 2, 2 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %c = icmp ule <4 x i32> %a, { 7, 7, 7, 7 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %a) {\n  %s = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %c = icmp ult <4 x i32> %s, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i1> %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @test(<4 x i32> %a) {\n  %c = icmp ule <4 x i32> %a, <i32 7, i32 7, i32 7, i32 7>\n  ret <4 x i1> %c\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %s = usub_sat <4 x i32> %a, { 5, 5, 5, 5 }\n  %c = icmp ult <4 x i32> %s, { 3, 3, 3, 3 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %c = icmp ule <4 x i32> %a, { 7, 7, 7, 7 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i32> %a) {\n  %c = icmp ule <4 x i32> %a, <i32 7, i32 7, i32 7, i32 7>\n  ret <4 x i1> %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %a) {\n  %s = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %c = icmp ult <4 x i32> %s, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i1> %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %c = icmp ule <4 x i32> %a, { 7, 7, 7, 7 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %a) {\n#0:\n  %s = usub_sat <4 x i32> %a, { 5, 5, 5, 5 }\n  %c = icmp ult <4 x i32> %s, { 3, 3, 3, 3 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "c1_zero",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 0)\n  %c = icmp ule i32 %s, 10\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 0\n  %c = icmp ule i32 %s, 10\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ule i32 %a, 10\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %c = icmp ult i32 %a, 11\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multiple_uses_of_sub",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 6,
+        "current_opt": 5,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "neg_signed_predicate",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp slt i32 %s, 6\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp slt i32 %s, 6\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp slt i32 %s, 6\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp sle i32 %s, 5\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp slt i32 %s, 6\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "neg_non_constant_rhs",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\ndeclare i32 @llvm.usub.sat.i32(i32, i32)",
+          "tgt": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a, i32 %b) {\n  %s = call i32 @llvm.usub.sat.i32(i32 %a, i32 10)\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\n=>\ndefine i1 @test(i32 %a, i32 %b) {\n#0:\n  %s = usub_sat i32 %a, 10\n  %c = icmp ule i32 %s, %b\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0091 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:16 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.6s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

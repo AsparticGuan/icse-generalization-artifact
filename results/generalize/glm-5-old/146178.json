@@ -1,0 +1,446 @@
+{
+  "issue_id": "146178",
+  "dataset_file": "146178.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i8 @scmp_from_select_ne_const_and_gt_commuted1(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n\ndefine i8 @scmp_from_select_ne_const_and_gt_commuted1(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare range(i8 -1, 2) i8 @llvm.scmp.i8.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+  "model_output": "```json\n{\n  \"summary\": \"Identify a missed optimization where a nested `select` structure implementing a signed three-way comparison (returning -1, 0, 1) is not folded into the `llvm.scmp` intrinsic. The pattern specifically handles cases where the inner select separates values greater/less than a threshold, and the outer select injects the zero for the equality case.\",\n  \"before_after\": {\n    \"description\": \"Transforms a specific tree of `icmp` and `select` instructions into a single intrinsic call.\",\n    \"original\": \"%ne = icmp ne i32 %x, 5\\n%gt = icmp sgt i32 %x, 4\\n%sel1 = select i1 %gt, i8 1, i8 -1\\n%r = select i1 %ne, i8 %sel1, i8 0\",\n    \"optimized\": \"%r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\"\n  },\n  \"preconditions\": [\n    \"The outer `select` must choose between a constant `0` (or `zeroinitializer`) and the result of the inner `select`.\",\n    \"The inner `select` must choose between constants `1` and `-1` (or their vector equivalents).\",\n    \"The conditions must be `icmp` instructions operating on the same value (e.g., `%x`).\",\n    \"The constants compared in the `icmp`s must be related by an offset of 1 (e.g., `C` and `C-1`).\",\n    \"The comparison predicates must be signed (for `scmp`) or unsigned (for `ucmp`).\",\n    \"The type of the select operands (result type) may differ from the type of the comparison operands (input type).\"\n  ],\n  \"pattern\": \"Pattern: `select (icmp %x, C), 0, select (icmp %x, C-1), 1, -1` (with predicate variations)\\n\\nCanonical Forms:\\n1. `select (ne %x, C), select (sgt %x, C-1), 1, -1, 0` (Original)\\n2. `select (eq %x, C), 0, select (slt %x, C), -1, 1`\\n3. `select (ne %x, C), select (ugt %x, C-1), 1, -1, 0` (Unsigned variant)\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_Missed_Optimization\",\n      \"ir\": \"define i8 @test(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp sgt i32 %x, 4\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i32 %x) {\\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\\n  ret i8 %r\\n}\",\n      \"why\": \"The original example provided by the user.\"\n    },\n    {\n      \"name\": \"Variant_Eq_And_Slt\",\n      \"ir\": \"define i8 @test_eq_slt(i32 %x) {\\n  %eq = icmp eq i32 %x, 5\\n  %lt = icmp slt i32 %x, 5\\n  %sel1 = select i1 %lt, i8 -1, i8 1\\n  %r = select i1 %eq, i8 0, i8 %sel1\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_eq_slt(i32 %x) {\\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\\n  ret i8 %r\\n}\",\n      \"why\": \"Semantically equivalent structure using `eq` and `slt` instead of `ne` and `sgt`.\"\n    },\n    {\n      \"name\": \"Variant_Unsigned_UCmp\",\n      \"ir\": \"define i8 @test_ucmp(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp ugt i32 %x, 4\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_ucmp(i32 %x) {\\n  %r = call i8 @llvm.ucmp.i8.i32(i32 %x, i32 5)\\n  ret i8 %r\\n}\",\n      \"why\": \"Tests the unsigned comparison variant (ucmp).\"\n    },\n    {\n      \"name\": \"Vector_Variant\",\n      \"ir\": \"define <4 x i8> @test_vec(<4 x i32> %x) {\\n  %ne = icmp ne <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\\n  %gt = icmp sgt <4 x i32> %x, <i32 4, i32 4, i32 4, i32 4>\\n  %sel1 = select <4 x i1> %gt, <4 x i8> <i8 1, i8 1, i8 1, i8 1>, <4 x i8> <i8 -1, i8 -1, i8 -1, i8 -1>\\n  %r = select <4 x i1> %ne, <4 x i8> %sel1, <4 x i8> zeroinitializer\\n  ret <4 x i8> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i8> @test_vec(<4 x i32> %x) {\\n  %r = call <4 x i8> @llvm.scmp.v4i8.v4i32(<4 x i32> %x, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\\n  ret <4 x i8> %r\\n}\",\n      \"why\": \"Ensures the pattern matching works for vectors.\"\n    },\n    {\n      \"name\": \"Type_Variation_i64\",\n      \"ir\": \"define i32 @test_i64(i64 %x) {\\n  %ne = icmp ne i64 %x, 500\\n  %gt = icmp sgt i64 %x, 499\\n  %sel1 = select i1 %gt, i32 1, i32 -1\\n  %r = select i1 %ne, i32 %sel1, i32 0\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_i64(i64 %x) {\\n  %r = call i32 @llvm.scmp.i32.i64(i64 %x, i64 500)\\n  ret i32 %r\\n}\",\n      \"why\": \"Tests different bitwidths for input and output types.\"\n    },\n    {\n      \"name\": \"Negative_Constants_Mismatch\",\n      \"ir\": \"define i8 @test_neg_mismatch(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp sgt i32 %x, 3\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_neg_mismatch(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp sgt i32 %x, 3\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"why\": \"Constants differ by 2 (5 and 3), not 1. Fold should not happen.\"\n    },\n    {\n      \"name\": \"Negative_Wrong_Select_Values\",\n      \"ir\": \"define i8 @test_wrong_vals(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp sgt i32 %x, 4\\n  %sel1 = select i1 %gt, i8 2, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_wrong_vals(i32 %x) {\\n  %ne = icmp ne i32 %x, 5\\n  %gt = icmp sgt i32 %x, 4\\n  %sel1 = select i1 %gt, i8 2, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"why\": \"Inner select uses 2 instead of 1. Fold should not happen.\"\n    },\n    {\n      \"name\": \"Boundary_Case_IntMax\",\n      \"ir\": \"define i8 @test_intmax(i32 %x) {\\n  %ne = icmp ne i32 %x, 2147483647\\n  %gt = icmp sgt i32 %x, 2147483646\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_intmax(i32 %x) {\\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 2147483647)\\n  ret i8 %r\\n}\",\n      \"why\": \"Tests boundary condition with INT_MAX.\"\n    },\n    {\n      \"name\": \"Noise_Operations\",\n      \"ir\": \"define i8 @test_noise(i32 %x) {\\n  %x0 = add i32 %x, 0\\n  %ne = icmp ne i32 %x0, 5\\n  %gt = icmp sgt i32 %x0, 4\\n  %sel1 = select i1 %gt, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_noise(i32 %x) {\\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\\n  ret i8 %r\\n}\",\n      \"why\": \"Includes transparent no-op adds that InstCombine should see through.\"\n    },\n    {\n      \"name\": \"Commutated_ICMP\",\n      \"ir\": \"define i8 @test_commuted(i32 %x) {\\n  %ne = icmp ne i32 5, %x\\n  %gt = icmp sgt i32 4, %x\\n  ; Note: sgt 4, x is x < 4, which is NOT x >= 5. \\n  ; Wait, let's make it valid logic but commuted args.\\n  ; sgt x, 4 is correct. sgt 4, x is wrong logic for scmp.\\n  ; Let's use slt with commuted args: slt 4, x == x > 4.\\n  %gt2 = icmp slt i32 4, %x \\n  %sel1 = select i1 %gt2, i8 1, i8 -1\\n  %r = select i1 %ne, i8 %sel1, i8 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_commuted(i32 %x) {\\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\\n  ret i8 %r\\n}\",\n      \"why\": \"Uses commuted arguments in ICMP (slt 4, x instead of sgt x, 4).\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"strategy\": \"1. Visit SelectInst.\\n2. Check if one operand is 0 and the other is another SelectInst.\\n3. Check the inner SelectInst has operands 1 and -1.\\n4. Check conditions are ICmpInst.\\n5. Extract constants C1 (from outer/equality check) and C2 (from inner/threshold check).\\n6. Verify relationship |C1 - C2| == 1.\\n7. Verify predicates match signed/unsigned requirements.\\n8. Verify operands of ICmp are identical (ignoring commutation).\",\n    \"pitfalls\": [\n      \"Handling vector types correctly (checking for ConstantAggregateZero for 0 and ConstantVector for 1/-1).\",\n      \"Ensuring the signedness of the comparison matches the intended intrinsic (scmp vs ucmp).\",\n      \"Handling cases where the select values are negated (e.g. -1 and 1 swapped) which would invert the logic.\",\n      \"The intrinsic name mangling (@llvm.scmp.i8.i32) depends on the specific backend/target capabilities; ensure the declaration matches the datalayout.\"\n    ]\n  },\n  \"regression_test_notes\": \"Run `opt -passes=instcombine -S` on the input IR and verify the output matches the expected IR using FileCheck. Ensure the intrinsic declarations are present in the test file or provided via a header.\",\n  \"clarifying_questions\": [\n    \"Should the implementation also handle the unsigned comparison variant (`llvm.ucmp`) automatically, or should that be a separate fold?\",\n    \"Is the intrinsic `@llvm.scmp.i8.i32` a standard intrinsic in your target environment, or is it a custom intrinsic declaration needed for the test?\",\n    \"Should the pattern match if the constants are `C` and `C+1` (e.g., `x > 5` and `x != 4`)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Identify a missed optimization where a nested `select` structure implementing a signed three-way comparison (returning -1, 0, 1) is not folded into the `llvm.scmp` intrinsic. The pattern specifically handles cases where the inner select separates values greater/less than a threshold, and the outer select injects the zero for the equality case.",
+    "before_after": {
+      "description": "Transforms a specific tree of `icmp` and `select` instructions into a single intrinsic call.",
+      "original": "%ne = icmp ne i32 %x, 5\n%gt = icmp sgt i32 %x, 4\n%sel1 = select i1 %gt, i8 1, i8 -1\n%r = select i1 %ne, i8 %sel1, i8 0",
+      "optimized": "%r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)"
+    },
+    "preconditions": [
+      "The outer `select` must choose between a constant `0` (or `zeroinitializer`) and the result of the inner `select`.",
+      "The inner `select` must choose between constants `1` and `-1` (or their vector equivalents).",
+      "The conditions must be `icmp` instructions operating on the same value (e.g., `%x`).",
+      "The constants compared in the `icmp`s must be related by an offset of 1 (e.g., `C` and `C-1`).",
+      "The comparison predicates must be signed (for `scmp`) or unsigned (for `ucmp`).",
+      "The type of the select operands (result type) may differ from the type of the comparison operands (input type)."
+    ],
+    "pattern": "Pattern: `select (icmp %x, C), 0, select (icmp %x, C-1), 1, -1` (with predicate variations)\n\nCanonical Forms:\n1. `select (ne %x, C), select (sgt %x, C-1), 1, -1, 0` (Original)\n2. `select (eq %x, C), 0, select (slt %x, C), -1, 1`\n3. `select (ne %x, C), select (ugt %x, C-1), 1, -1, 0` (Unsigned variant)",
+    "testcases": [
+      {
+        "name": "Original_Missed_Optimization",
+        "ir": "define i8 @test(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+        "why": "The original example provided by the user."
+      },
+      {
+        "name": "Variant_Eq_And_Slt",
+        "ir": "define i8 @test_eq_slt(i32 %x) {\n  %eq = icmp eq i32 %x, 5\n  %lt = icmp slt i32 %x, 5\n  %sel1 = select i1 %lt, i8 -1, i8 1\n  %r = select i1 %eq, i8 0, i8 %sel1\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+        "why": "Semantically equivalent structure using `eq` and `slt` instead of `ne` and `sgt`."
+      },
+      {
+        "name": "Variant_Unsigned_UCmp",
+        "ir": "define i8 @test_ucmp(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_ucmp(i32 %x) {\n  %r = call i8 @llvm.ucmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+        "why": "Tests the unsigned comparison variant (ucmp)."
+      },
+      {
+        "name": "Vector_Variant",
+        "ir": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %ne = icmp ne <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %gt = icmp sgt <4 x i32> %x, <i32 4, i32 4, i32 4, i32 4>\n  %sel1 = select <4 x i1> %gt, <4 x i8> <i8 1, i8 1, i8 1, i8 1>, <4 x i8> <i8 -1, i8 -1, i8 -1, i8 -1>\n  %r = select <4 x i1> %ne, <4 x i8> %sel1, <4 x i8> zeroinitializer\n  ret <4 x i8> %r\n}",
+        "expected_optimized_ir": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %r = call <4 x i8> @llvm.scmp.v4i8.v4i32(<4 x i32> %x, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  ret <4 x i8> %r\n}",
+        "why": "Ensures the pattern matching works for vectors."
+      },
+      {
+        "name": "Type_Variation_i64",
+        "ir": "define i32 @test_i64(i64 %x) {\n  %ne = icmp ne i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 -1\n  %r = select i1 %ne, i32 %sel1, i32 0\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test_i64(i64 %x) {\n  %r = call i32 @llvm.scmp.i32.i64(i64 %x, i64 500)\n  ret i32 %r\n}",
+        "why": "Tests different bitwidths for input and output types."
+      },
+      {
+        "name": "Negative_Constants_Mismatch",
+        "ir": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "why": "Constants differ by 2 (5 and 3), not 1. Fold should not happen."
+      },
+      {
+        "name": "Negative_Wrong_Select_Values",
+        "ir": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "why": "Inner select uses 2 instead of 1. Fold should not happen."
+      },
+      {
+        "name": "Boundary_Case_IntMax",
+        "ir": "define i8 @test_intmax(i32 %x) {\n  %ne = icmp ne i32 %x, 2147483647\n  %gt = icmp sgt i32 %x, 2147483646\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_intmax(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 2147483647)\n  ret i8 %r\n}",
+        "why": "Tests boundary condition with INT_MAX."
+      },
+      {
+        "name": "Noise_Operations",
+        "ir": "define i8 @test_noise(i32 %x) {\n  %x0 = add i32 %x, 0\n  %ne = icmp ne i32 %x0, 5\n  %gt = icmp sgt i32 %x0, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_noise(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+        "why": "Includes transparent no-op adds that InstCombine should see through."
+      },
+      {
+        "name": "Commutated_ICMP",
+        "ir": "define i8 @test_commuted(i32 %x) {\n  %ne = icmp ne i32 5, %x\n  %gt = icmp sgt i32 4, %x\n  ; Note: sgt 4, x is x < 4, which is NOT x >= 5. \n  ; Wait, let's make it valid logic but commuted args.\n  ; sgt x, 4 is correct. sgt 4, x is wrong logic for scmp.\n  ; Let's use slt with commuted args: slt 4, x == x > 4.\n  %gt2 = icmp slt i32 4, %x \n  %sel1 = select i1 %gt2, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test_commuted(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+        "why": "Uses commuted arguments in ICMP (slt 4, x instead of sgt x, 4)."
+      }
+    ],
+    "implementation_notes": {
+      "strategy": "1. Visit SelectInst.\n2. Check if one operand is 0 and the other is another SelectInst.\n3. Check the inner SelectInst has operands 1 and -1.\n4. Check conditions are ICmpInst.\n5. Extract constants C1 (from outer/equality check) and C2 (from inner/threshold check).\n6. Verify relationship |C1 - C2| == 1.\n7. Verify predicates match signed/unsigned requirements.\n8. Verify operands of ICmp are identical (ignoring commutation).",
+      "pitfalls": [
+        "Handling vector types correctly (checking for ConstantAggregateZero for 0 and ConstantVector for 1/-1).",
+        "Ensuring the signedness of the comparison matches the intended intrinsic (scmp vs ucmp).",
+        "Handling cases where the select values are negated (e.g. -1 and 1 swapped) which would invert the logic.",
+        "The intrinsic name mangling (@llvm.scmp.i8.i32) depends on the specific backend/target capabilities; ensure the declaration matches the datalayout."
+      ]
+    },
+    "regression_test_notes": "Run `opt -passes=instcombine -S` on the input IR and verify the output matches the expected IR using FileCheck. Ensure the intrinsic declarations are present in the test file or provided via a header.",
+    "clarifying_questions": [
+      "Should the implementation also handle the unsigned comparison variant (`llvm.ucmp`) automatically, or should that be a separate fold?",
+      "Is the intrinsic `@llvm.scmp.i8.i32` a standard intrinsic in your target environment, or is it a custom intrinsic declaration needed for the test?",
+      "Should the pattern match if the constants are `C` and `C+1` (e.g., `x > 5` and `x != 4`)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "Original_Missed_Optimization",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Variant_Eq_And_Slt",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_eq_slt(i32 %x) {\n  %eq = icmp eq i32 %x, 5\n  %lt = icmp slt i32 %x, 5\n  %sel1 = select i1 %lt, i8 -1, i8 1\n  %r = select i1 %eq, i8 0, i8 %sel1\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %eq = icmp eq i32 %x, 5\n  %lt = icmp slt i32 %x, 5\n  %sel1 = select i1 %lt, i8 255, i8 1\n  %r = select i1 %eq, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare range(i8 -1, 2) i8 @llvm.scmp.i8.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_eq_slt(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare range(i8 -1, 2) i8 @llvm.scmp.i8.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_eq_slt(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Variant_Unsigned_UCmp",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_ucmp(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_ucmp(i32 %x) {\n  %r = call i8 @llvm.ucmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %r = ucmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_ucmp(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_ucmp(i32 %x) {\n  %r = call i8 @llvm.ucmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %r = ucmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_ucmp(i32 %x) {\n  %r = call i8 @llvm.ucmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_ucmp(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %r = ucmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_ucmp(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp ugt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector_Variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %ne = icmp ne <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %gt = icmp sgt <4 x i32> %x, <i32 4, i32 4, i32 4, i32 4>\n  %sel1 = select <4 x i1> %gt, <4 x i8> <i8 1, i8 1, i8 1, i8 1>, <4 x i8> <i8 -1, i8 -1, i8 -1, i8 -1>\n  %r = select <4 x i1> %ne, <4 x i8> %sel1, <4 x i8> zeroinitializer\n  ret <4 x i8> %r\n}",
+          "tgt": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %r = call <4 x i8> @llvm.scmp.v4i8.v4i32(<4 x i32> %x, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  ret <4 x i8> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %ne = icmp ne <4 x i32> %x, { 5, 5, 5, 5 }\n  %gt = icmp sgt <4 x i32> %x, { 4, 4, 4, 4 }\n  %sel1 = select <4 x i1> %gt, <4 x i8> { 1, 1, 1, 1 }, <4 x i8> { 255, 255, 255, 255 }\n  %r = select <4 x i1> %ne, <4 x i8> %sel1, <4 x i8> { 0, 0, 0, 0 }\n  ret <4 x i8> %r\n}\n=>\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %r = scmp <4 x i8> <4 x i32> %x, { 5, 5, 5, 5 }\n  %#range_0_%r = !range <4 x i8> %r, i8 255, i8 2\n  ret <4 x i8> %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n  %ne.not = icmp eq <4 x i32> %x, splat (i32 5)\n  %gt = icmp sgt <4 x i32> %x, splat (i32 4)\n  %sel1 = select <4 x i1> %gt, <4 x i8> splat (i8 1), <4 x i8> splat (i8 -1)\n  %r = select <4 x i1> %ne.not, <4 x i8> zeroinitializer, <4 x i8> %sel1\n  ret <4 x i8> %r\n}\n",
+          "tgt": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %r = call <4 x i8> @llvm.scmp.v4i8.v4i32(<4 x i32> %x, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  ret <4 x i8> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %ne.not = icmp eq <4 x i32> %x, { 5, 5, 5, 5 }\n  %gt = icmp sgt <4 x i32> %x, { 4, 4, 4, 4 }\n  %sel1 = select <4 x i1> %gt, <4 x i8> { 1, 1, 1, 1 }, <4 x i8> { 255, 255, 255, 255 }\n  %r = select <4 x i1> %ne.not, <4 x i8> { 0, 0, 0, 0 }, <4 x i8> %sel1\n  ret <4 x i8> %r\n}\n=>\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %r = scmp <4 x i8> <4 x i32> %x, { 5, 5, 5, 5 }\n  %#range_0_%r = !range <4 x i8> %r, i8 255, i8 2\n  ret <4 x i8> %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i8> @test_vec(<4 x i32> %x) {\n  %r = call <4 x i8> @llvm.scmp.v4i8.v4i32(<4 x i32> %x, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  ret <4 x i8> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n  %ne.not = icmp eq <4 x i32> %x, splat (i32 5)\n  %gt = icmp sgt <4 x i32> %x, splat (i32 4)\n  %sel1 = select <4 x i1> %gt, <4 x i8> splat (i8 1), <4 x i8> splat (i8 -1)\n  %r = select <4 x i1> %ne.not, <4 x i8> zeroinitializer, <4 x i8> %sel1\n  ret <4 x i8> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %r = scmp <4 x i8> <4 x i32> %x, { 5, 5, 5, 5 }\n  %#range_0_%r = !range <4 x i8> %r, i8 255, i8 2\n  ret <4 x i8> %#range_0_%r\n}\n=>\ndefine <4 x i8> @test_vec(<4 x i32> %x) {\n#0:\n  %ne.not = icmp eq <4 x i32> %x, { 5, 5, 5, 5 }\n  %gt = icmp sgt <4 x i32> %x, { 4, 4, 4, 4 }\n  %sel1 = select <4 x i1> %gt, <4 x i8> { 1, 1, 1, 1 }, <4 x i8> { 255, 255, 255, 255 }\n  %r = select <4 x i1> %ne.not, <4 x i8> { 0, 0, 0, 0 }, <4 x i8> %sel1\n  ret <4 x i8> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Type_Variation_i64",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_i64(i64 %x) {\n  %ne = icmp ne i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 -1\n  %r = select i1 %ne, i32 %sel1, i32 0\n  ret i32 %r\n}",
+          "tgt": "define i32 @test_i64(i64 %x) {\n  %r = call i32 @llvm.scmp.i32.i64(i64 %x, i64 500)\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %ne = icmp ne i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 4294967295\n  %r = select i1 %ne, i32 %sel1, i32 0\n  ret i32 %r\n}\n=>\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %r = scmp i32 i64 %x, 500\n  %#range_0_%r = !range i32 %r, i32 4294967295, i32 2\n  ret i32 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_i64(i64 %x) {\n  %ne.not = icmp eq i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 -1\n  %r = select i1 %ne.not, i32 0, i32 %sel1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test_i64(i64 %x) {\n  %r = call i32 @llvm.scmp.i32.i64(i64 %x, i64 500)\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %ne.not = icmp eq i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 4294967295\n  %r = select i1 %ne.not, i32 0, i32 %sel1\n  ret i32 %r\n}\n=>\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %r = scmp i32 i64 %x, 500\n  %#range_0_%r = !range i32 %r, i32 4294967295, i32 2\n  ret i32 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_i64(i64 %x) {\n  %r = call i32 @llvm.scmp.i32.i64(i64 %x, i64 500)\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_i64(i64 %x) {\n  %ne.not = icmp eq i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 -1\n  %r = select i1 %ne.not, i32 0, i32 %sel1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %r = scmp i32 i64 %x, 500\n  %#range_0_%r = !range i32 %r, i32 4294967295, i32 2\n  ret i32 %#range_0_%r\n}\n=>\ndefine i32 @test_i64(i64 %x) {\n#0:\n  %ne.not = icmp eq i64 %x, 500\n  %gt = icmp sgt i64 %x, 499\n  %sel1 = select i1 %gt, i32 1, i32 4294967295\n  %r = select i1 %ne.not, i32 0, i32 %sel1\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Constants_Mismatch",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_neg_mismatch(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_neg_mismatch(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_neg_mismatch(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_neg_mismatch(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 3\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Wrong_Select_Values",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_wrong_vals(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_wrong_vals(i32 %x) {\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_wrong_vals(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_wrong_vals(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 2, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Boundary_Case_IntMax",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_intmax(i32 %x) {\n  %ne = icmp ne i32 %x, 2147483647\n  %gt = icmp sgt i32 %x, 2147483646\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_intmax(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 2147483647)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %ne = icmp ne i32 %x, 2147483647\n  %gt = icmp sgt i32 %x, 2147483646\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 2147483647\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_intmax(i32 %x) {\n  %ne.not = icmp ne i32 %x, 2147483647\n  %r = sext i1 %ne.not to i8\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_intmax(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 2147483647)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %ne.not = icmp ne i32 %x, 2147483647\n  %r = sext i1 %ne.not to i8\n  ret i8 %r\n}\n=>\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 2147483647\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_intmax(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 2147483647)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_intmax(i32 %x) {\n  %ne.not = icmp ne i32 %x, 2147483647\n  %r = sext i1 %ne.not to i8\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 2147483647\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_intmax(i32 %x) {\n#0:\n  %ne.not = icmp ne i32 %x, 2147483647\n  %r = sext i1 %ne.not to i8\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Noise_Operations",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_noise(i32 %x) {\n  %x0 = add i32 %x, 0\n  %ne = icmp ne i32 %x0, 5\n  %gt = icmp sgt i32 %x0, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_noise(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %x0 = add i32 %x, 0\n  %ne = icmp ne i32 %x0, 5\n  %gt = icmp sgt i32 %x0, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_noise(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_noise(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_noise(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_noise(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_noise(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutated_ICMP",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test_commuted(i32 %x) {\n  %ne = icmp ne i32 5, %x\n  %gt = icmp sgt i32 4, %x\n  ; Note: sgt 4, x is x < 4, which is NOT x >= 5. \n  ; Wait, let's make it valid logic but commuted args.\n  ; sgt x, 4 is correct. sgt 4, x is wrong logic for scmp.\n  ; Let's use slt with commuted args: slt 4, x == x > 4.\n  %gt2 = icmp slt i32 4, %x \n  %sel1 = select i1 %gt2, i8 1, i8 -1\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}",
+          "tgt": "define i8 @test_commuted(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %ne = icmp ne i32 5, %x\n  %gt2 = icmp slt i32 4, %x\n  %sel1 = select i1 %gt2, i8 1, i8 255\n  %r = select i1 %ne, i8 %sel1, i8 0\n  ret i8 %r\n}\n=>\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_commuted(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt2 = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt2, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test_commuted(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt2 = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt2, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n=>\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test_commuted(i32 %x) {\n  %r = call i8 @llvm.scmp.i8.i32(i32 %x, i32 5)\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test_commuted(i32 %x) {\n  %ne.not = icmp eq i32 %x, 5\n  %gt2 = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt2, i8 1, i8 -1\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %r = scmp i8 i32 %x, 5\n  %#range_0_%r = !range i8 %r, i8 255, i8 2\n  ret i8 %#range_0_%r\n}\n=>\ndefine i8 @test_commuted(i32 %x) {\n#0:\n  %ne.not = icmp eq i32 %x, 5\n  %gt2 = icmp sgt i32 %x, 4\n  %sel1 = select i1 %gt2, i8 1, i8 255\n  %r = select i1 %ne.not, i8 0, i8 %sel1\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

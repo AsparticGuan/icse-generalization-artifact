@@ -1,0 +1,312 @@
+{
+  "issue_id": "57831",
+  "dataset_file": "57831.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @icmp_or_xor_3_3(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\n\ndefine i1 @icmp_or_xor_3_3(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %1 = icmp eq i64 %x1, %y1\n  %2 = icmp eq i64 %x2, %y2\n  %3 = and i1 %1, %2\n  %4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %3, %4\n  ret i1 %cmp\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"The optimization missed is the conversion of a bitwise OR-of-XORs equality check against zero into a logical AND of equality checks. Specifically, `icmp eq (or (xor A, B), (xor C, D), ...), 0` is equivalent to `and (icmp eq A, B), (icmp eq C, D), ...`. This pattern generalizes the distributive law of logic over bitwise arithmetic: a bitwise OR is zero only if all its operands are zero, and `X ^ Y == 0` implies `X == Y`. Converting this to boolean logic (`i1`) often exposes further optimization opportunities (e.g., dead code elimination, branch prediction) that are obscured in the integer domain.\",\n  \"before_after\": \"Transform:\\n  icmp eq (or (xor %a, %b), (xor %c, %d), ...), 0\\nInto:\\n  and (icmp eq %a, %b), (icmp eq %c, %d), ...\\n\\nThis eliminates the XOR and OR instructions in favor of comparisons and boolean logic.\",\n  \"preconditions\": \"1. The `icmp` predicate must be `eq` (or `ne` with inverted logic).\\n2. The RHS of the `icmp` must be the constant 0 (or -1 for `ne`).\\n3. The LHS of the `icmp` must be a tree of `or` instructions.\\n4. The operands of the `or` instructions are expected to be `xor` instructions (though the fold is valid for any value, it is most profitable for `xor`).\\n5. Types must be integers or vectors of integers.\",\n  \"pattern\": \"Pattern:\\n  match: (icmp eq (or (xor X, Y), (xor Z, W), ...), 0)\\n  replace with: (and (icmp eq X, Y), (icmp eq Z, W), ...)\\n\\nFor `ne` predicate:\\n  match: (icmp ne (or (xor X, Y), ...), 0)\\n  replace with: (or (icmp ne X, Y), ...)\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_2_operands\",\n      \"ir\": \"define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\\n  %x1 = xor i64 %a, %b\\n  %x2 = xor i64 %c, %d\\n  %o = or i64 %x1, %x2\\n  %cmp = icmp eq i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\\n  %1 = icmp eq i64 %a, %b\\n  %2 = icmp eq i64 %c, %d\\n  %cmp = and i1 %1, %2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Simplest case of the pattern with two XOR operands.\"\n    },\n    {\n      \"name\": \"original_3_operands_nested\",\n      \"ir\": \"define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\\n  %xor = xor i64 %x1, %y1\\n  %xor1 = xor i64 %x2, %y2\\n  %or = or i64 %xor, %xor1\\n  %xor2 = xor i64 %x3, %y3\\n  %or1 = or i64 %xor2, %or\\n  %cmp = icmp eq i64 %or1, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\\n  %1 = icmp eq i64 %x1, %y1\\n  %2 = icmp eq i64 %x2, %y2\\n  %3 = and i1 %1, %2\\n  %4 = icmp eq i64 %x3, %y3\\n  %cmp = and i1 %3, %4\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Original user example with right-leaning OR tree to test associativity matching.\"\n    },\n    {\n      \"name\": \"vector_case\",\n      \"ir\": \"define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\\n  %x1 = xor <4 x i32> %a, %b\\n  %x2 = xor <4 x i32> %c, %d\\n  %o = or <4 x i32> %x1, %x2\\n  %cmp = icmp eq <4 x i32> %o, zeroinitializer\\n  ret <4 x i1> %cmp\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\\n  %1 = icmp eq <4 x i32> %a, %b\\n  %2 = icmp eq <4 x i32> %c, %d\\n  %cmp = and <4 x i1> %1, %2\\n  ret <4 x i1> %cmp\\n}\",\n      \"why\": \"Ensures the pattern works for vector types (SIMD).\"\n    },\n    {\n      \"name\": \"ne_predicate\",\n      \"ir\": \"define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\\n  %x1 = xor i64 %a, %b\\n  %x2 = xor i64 %c, %d\\n  %o = or i64 %x1, %x2\\n  %cmp = icmp ne i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\\n  %1 = icmp ne i64 %a, %b\\n  %2 = icmp ne i64 %c, %d\\n  %cmp = or i1 %1, %2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Tests the dual case with 'ne' predicate, which should distribute to an OR of comparisons.\"\n    },\n    {\n      \"name\": \"mixed_operands\",\n      \"ir\": \"define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\\n  %x = xor i64 %a, %b\\n  %o = or i64 %x, %c\\n  %cmp = icmp eq i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\\n  %1 = icmp eq i64 %a, %b\\n  %2 = icmp eq i64 %c, 0\\n  %cmp = and i1 %1, %2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies handling when an OR operand is not a XOR (just a variable).\"\n    },\n    {\n      \"name\": \"constant_zero_operand\",\n      \"ir\": \"define i1 @test_const0(i64 %a, i64 %b) {\\n  %x = xor i64 %a, %b\\n  %o = or i64 %x, 0\\n  %cmp = icmp eq i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_const0(i64 %a, %b) {\\n  %cmp = icmp eq i64 %a, %b\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Identity optimization: OR with 0 should be absorbed.\"\n    },\n    {\n      \"name\": \"constant_nonzero_operand\",\n      \"ir\": \"define i1 @test_const_nonzero(i64 %a, i64 %b) {\\n  %x = xor i64 %a, %b\\n  %o = or i64 %x, 5\\n  %cmp = icmp eq i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_const_nonzero(i64 %a, %b) {\\n  ret i1 false\\n}\",\n      \"why\": \"Contradiction: OR with non-zero constant can never be zero.\"\n    },\n    {\n      \"name\": \"i8_type\",\n      \"ir\": \"define i1 @test_i8(i8 %a, i8 %b) {\\n  %x = xor i8 %a, %b\\n  %cmp = icmp eq i8 %x, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_i8(i8 %a, %b) {\\n  %cmp = icmp eq i8 %a, %b\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Boundary case: non-standard bitwidth (i8).\"\n    },\n    {\n      \"name\": \"undef_operand\",\n      \"ir\": \"define i1 @test_undef(i64 %a, i64 %b) {\\n  %x = xor i64 %a, %b\\n  %o = or i64 %x, undef\\n  %cmp = icmp eq i64 %o, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_undef(i64 %a, %b) {\\n  ret i1 undef\\n}\",\n      \"why\": \"Safety check: OR with undef is undef, so comparison is undef.\"\n    }\n  ],\n  \"implementation_notes\": \"Implementation should be added to `InstCombinerImpl::visitICmp` (or a helper like `foldICmpEqWithAndOr`).\\n\\n1. Match the pattern: `(icmp eq (or ...), 0)`.\\n2. Recursively flatten the `or` tree to collect all operands into a vector.\\n3. Iterate through operands:\\n   - If operand is `xor A, B`: simplify to `icmp eq A, B`.\\n   - If operand is `and A, B`: `icmp eq (and A, B), 0` (cannot simplify to `eq A, B` directly, but can be kept).\\n   - Else: simplify to `icmp eq Operand, 0`.\\n   - If operand is a known non-zero constant, return `false` immediately.\\n   - If operand is 0, skip it (identity).\\n4. Combine the resulting `i1` conditions using `and`.\\n5. Handle the `ne` case similarly, combining with `or`.\\n\\nPitfalls:\\n- Excessive instruction count: Converting a wide integer `or` to many `i1` operations might increase instruction count if the result is immediately cast back to an integer (e.g., `zext i1 to i32`). However, for `i1` returns or branches, this is usually superior.\\n- Type consistency: Ensure all `or` operands are the same type before matching.\\n- `undef` handling: `or x, undef` is `undef`. Ensure the implementation doesn't crash or incorrectly fold `undef` to `0` or `1`.\",\n  \"regression_test_notes\": \"These tests should be added to `llvm/test/Transforms/InstCombine/icmp-or-xor.ll`. Use `opt -instcombine -S` to verify. Tests should cover the structural variants (2, 3, 4 operands), type variants (i32, i64, vector), and predicate variants (eq, ne).\",\n  \"clarifying_questions\": [\n    \"Should this fold be limited by the number of operands in the OR chain to avoid ballooning instruction count (e.g., max 8 operands)?\",\n    \"Does this need to handle `icmp eq (or (and A, B), ...), -1` (the all-ones case) in the same implementation, or is that a separate pattern?\",\n    \"Should we attempt to recombine the resulting boolean `and` tree back into an integer `and` if the `icmp` result is used by `zext`?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "The optimization missed is the conversion of a bitwise OR-of-XORs equality check against zero into a logical AND of equality checks. Specifically, `icmp eq (or (xor A, B), (xor C, D), ...), 0` is equivalent to `and (icmp eq A, B), (icmp eq C, D), ...`. This pattern generalizes the distributive law of logic over bitwise arithmetic: a bitwise OR is zero only if all its operands are zero, and `X ^ Y == 0` implies `X == Y`. Converting this to boolean logic (`i1`) often exposes further optimization opportunities (e.g., dead code elimination, branch prediction) that are obscured in the integer domain.",
+    "before_after": "Transform:\n  icmp eq (or (xor %a, %b), (xor %c, %d), ...), 0\nInto:\n  and (icmp eq %a, %b), (icmp eq %c, %d), ...\n\nThis eliminates the XOR and OR instructions in favor of comparisons and boolean logic.",
+    "preconditions": "1. The `icmp` predicate must be `eq` (or `ne` with inverted logic).\n2. The RHS of the `icmp` must be the constant 0 (or -1 for `ne`).\n3. The LHS of the `icmp` must be a tree of `or` instructions.\n4. The operands of the `or` instructions are expected to be `xor` instructions (though the fold is valid for any value, it is most profitable for `xor`).\n5. Types must be integers or vectors of integers.",
+    "pattern": "Pattern:\n  match: (icmp eq (or (xor X, Y), (xor Z, W), ...), 0)\n  replace with: (and (icmp eq X, Y), (icmp eq Z, W), ...)\n\nFor `ne` predicate:\n  match: (icmp ne (or (xor X, Y), ...), 0)\n  replace with: (or (icmp ne X, Y), ...)",
+    "testcases": [
+      {
+        "name": "basic_2_operands",
+        "ir": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+        "why": "Simplest case of the pattern with two XOR operands."
+      },
+      {
+        "name": "original_3_operands_nested",
+        "ir": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %1 = icmp eq i64 %x1, %y1\n  %2 = icmp eq i64 %x2, %y2\n  %3 = and i1 %1, %2\n  %4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %3, %4\n  ret i1 %cmp\n}",
+        "why": "Original user example with right-leaning OR tree to test associativity matching."
+      },
+      {
+        "name": "vector_case",
+        "ir": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %x1 = xor <4 x i32> %a, %b\n  %x2 = xor <4 x i32> %c, %d\n  %o = or <4 x i32> %x1, %x2\n  %cmp = icmp eq <4 x i32> %o, zeroinitializer\n  ret <4 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}",
+        "why": "Ensures the pattern works for vector types (SIMD)."
+      },
+      {
+        "name": "ne_predicate",
+        "ir": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp ne i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}",
+        "why": "Tests the dual case with 'ne' predicate, which should distribute to an OR of comparisons."
+      },
+      {
+        "name": "mixed_operands",
+        "ir": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, 0\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+        "why": "Verifies handling when an OR operand is not a XOR (just a variable)."
+      },
+      {
+        "name": "constant_zero_operand",
+        "ir": "define i1 @test_const0(i64 %a, i64 %b) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, 0\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_const0(i64 %a, %b) {\n  %cmp = icmp eq i64 %a, %b\n  ret i1 %cmp\n}",
+        "why": "Identity optimization: OR with 0 should be absorbed."
+      },
+      {
+        "name": "constant_nonzero_operand",
+        "ir": "define i1 @test_const_nonzero(i64 %a, i64 %b) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, 5\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_const_nonzero(i64 %a, %b) {\n  ret i1 false\n}",
+        "why": "Contradiction: OR with non-zero constant can never be zero."
+      },
+      {
+        "name": "i8_type",
+        "ir": "define i1 @test_i8(i8 %a, i8 %b) {\n  %x = xor i8 %a, %b\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_i8(i8 %a, %b) {\n  %cmp = icmp eq i8 %a, %b\n  ret i1 %cmp\n}",
+        "why": "Boundary case: non-standard bitwidth (i8)."
+      },
+      {
+        "name": "undef_operand",
+        "ir": "define i1 @test_undef(i64 %a, i64 %b) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, undef\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_undef(i64 %a, %b) {\n  ret i1 undef\n}",
+        "why": "Safety check: OR with undef is undef, so comparison is undef."
+      }
+    ],
+    "implementation_notes": "Implementation should be added to `InstCombinerImpl::visitICmp` (or a helper like `foldICmpEqWithAndOr`).\n\n1. Match the pattern: `(icmp eq (or ...), 0)`.\n2. Recursively flatten the `or` tree to collect all operands into a vector.\n3. Iterate through operands:\n   - If operand is `xor A, B`: simplify to `icmp eq A, B`.\n   - If operand is `and A, B`: `icmp eq (and A, B), 0` (cannot simplify to `eq A, B` directly, but can be kept).\n   - Else: simplify to `icmp eq Operand, 0`.\n   - If operand is a known non-zero constant, return `false` immediately.\n   - If operand is 0, skip it (identity).\n4. Combine the resulting `i1` conditions using `and`.\n5. Handle the `ne` case similarly, combining with `or`.\n\nPitfalls:\n- Excessive instruction count: Converting a wide integer `or` to many `i1` operations might increase instruction count if the result is immediately cast back to an integer (e.g., `zext i1 to i32`). However, for `i1` returns or branches, this is usually superior.\n- Type consistency: Ensure all `or` operands are the same type before matching.\n- `undef` handling: `or x, undef` is `undef`. Ensure the implementation doesn't crash or incorrectly fold `undef` to `0` or `1`.",
+    "regression_test_notes": "These tests should be added to `llvm/test/Transforms/InstCombine/icmp-or-xor.ll`. Use `opt -instcombine -S` to verify. Tests should cover the structural variants (2, 3, 4 operands), type variants (i32, i64, vector), and predicate variants (eq, ne).",
+    "clarifying_questions": [
+      "Should this fold be limited by the number of operands in the OR chain to avoid ballooning instruction count (e.g., max 8 operands)?",
+      "Does this need to handle `icmp eq (or (and A, B), ...), -1` (the all-ones case) in the same implementation, or is that a separate pattern?",
+      "Should we attempt to recombine the resulting boolean `and` tree back into an integer `and` if the `icmp` result is used by `zext`?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_2_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, %d\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, %d\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, %d\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, %d\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, %d\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, %d\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "original_3_operands_nested",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 6,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %1 = icmp eq i64 %x1, %y1\n  %2 = icmp eq i64 %x2, %y2\n  %3 = and i1 %1, %2\n  %4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %3, %4\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %#1 = icmp eq i64 %x1, %y1\n  %#2 = icmp eq i64 %x2, %y2\n  %#3 = and i1 %#1, %#2\n  %#4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %#3, %#4\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %1 = icmp eq i64 %x1, %y1\n  %2 = icmp eq i64 %x2, %y2\n  %3 = and i1 %1, %2\n  %4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %3, %4\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %#1 = icmp eq i64 %x1, %y1\n  %#2 = icmp eq i64 %x2, %y2\n  %#3 = and i1 %#1, %#2\n  %#4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %#3, %#4\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %1 = icmp eq i64 %x1, %y1\n  %2 = icmp eq i64 %x2, %y2\n  %3 = and i1 %1, %2\n  %4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %3, %4\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %#1 = icmp eq i64 %x1, %y1\n  %#2 = icmp eq i64 %x2, %y2\n  %#3 = and i1 %#1, %#2\n  %#4 = icmp eq i64 %x3, %y3\n  %cmp = and i1 %#3, %#4\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x1, i64 %y1, i64 %x2, i64 %y2, i64 %x3, i64 %y3) {\n#0:\n  %xor = xor i64 %x1, %y1\n  %xor1 = xor i64 %x2, %y2\n  %or = or i64 %xor, %xor1\n  %xor2 = xor i64 %x3, %y3\n  %or1 = or i64 %xor2, %or\n  %cmp = icmp eq i64 %or1, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_case",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %x1 = xor <4 x i32> %a, %b\n  %x2 = xor <4 x i32> %c, %d\n  %o = or <4 x i32> %x1, %x2\n  %cmp = icmp eq <4 x i32> %o, zeroinitializer\n  ret <4 x i1> %cmp\n}",
+          "tgt": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %x1 = xor <4 x i32> %a, %b\n  %x2 = xor <4 x i32> %c, %d\n  %o = or <4 x i32> %x1, %x2\n  %cmp = icmp eq <4 x i32> %o, { 0, 0, 0, 0 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %#1 = icmp eq <4 x i32> %a, %b\n  %#2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %#1, %#2\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}\n",
+          "tgt": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %#1 = icmp eq <4 x i32> %a, %b\n  %#2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %#1, %#2\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %#1 = icmp eq <4 x i32> %a, %b\n  %#2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %#1, %#2\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n  %1 = icmp eq <4 x i32> %a, %b\n  %2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %1, %2\n  ret <4 x i1> %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %#1 = icmp eq <4 x i32> %a, %b\n  %#2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %#1, %#2\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c, <4 x i32> %d) {\n#0:\n  %#1 = icmp eq <4 x i32> %a, %b\n  %#2 = icmp eq <4 x i32> %c, %d\n  %cmp = and <4 x i1> %#1, %#2\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ne_predicate",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp ne i64 %o, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %x1 = xor i64 %a, %b\n  %x2 = xor i64 %c, %d\n  %o = or i64 %x1, %x2\n  %cmp = icmp ne i64 %o, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp ne i64 %a, %b\n  %#2 = icmp ne i64 %c, %d\n  %cmp = or i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp ne i64 %a, %b\n  %#2 = icmp ne i64 %c, %d\n  %cmp = or i1 %#1, %#2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp ne i64 %a, %b\n  %#2 = icmp ne i64 %c, %d\n  %cmp = or i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n  %1 = icmp ne i64 %a, %b\n  %2 = icmp ne i64 %c, %d\n  %cmp = or i1 %1, %2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp ne i64 %a, %b\n  %#2 = icmp ne i64 %c, %d\n  %cmp = or i1 %#1, %#2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_ne(i64 %a, i64 %b, i64 %c, i64 %d) {\n#0:\n  %#1 = icmp ne i64 %a, %b\n  %#2 = icmp ne i64 %c, %d\n  %cmp = or i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mixed_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, 0\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, 0\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, 0\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, 0\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %1 = icmp eq i64 %a, %b\n  %2 = icmp eq i64 %c, 0\n  %cmp = and i1 %1, %2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %#1 = icmp eq i64 %a, %b\n  %#2 = icmp eq i64 %c, 0\n  %cmp = and i1 %#1, %#2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_mixed(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = xor i64 %a, %b\n  %o = or i64 %x, %c\n  %cmp = icmp eq i64 %o, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_zero_operand",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmpmhhh2gje.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmpmhhh2gje.ll:2:26: error: use of undefined value '%b'\n  %cmp = icmp eq i64 %a, %b\n                         ^\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "constant_nonzero_operand",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmp1x_skxpp.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmp1x_skxpp.ll:1:39: error: use of undefined type named 'b'\ndefine i1 @test_const_nonzero(i64 %a, %b) {\n                                      ^\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "i8_type",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmpmj8i1z18.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmpmj8i1z18.ll:2:25: error: use of undefined value '%b'\n  %cmp = icmp eq i8 %a, %b\n                        ^\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "undef_operand",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmp9oy2wxh4.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmp9oy2wxh4.ll:1:31: error: use of undefined type named 'b'\ndefine i1 @test_undef(i64 %a, %b) {\n                              ^\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0091 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:16 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Performing Test C_SUPPORTS_CMAKE_CXX_FLAGS\n-- Performing Test C_SUPPORTS_CMAKE_CXX_FLAGS - Success\n-- Performing Test CXX_SUPPORTS_CMAKE_CXX_FLAGS\n-- Performing Test CXX_SUPPORTS_CMAKE_CXX_FLAGS - Success\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.6s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

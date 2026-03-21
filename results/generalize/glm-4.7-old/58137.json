@@ -1,0 +1,407 @@
+{
+  "issue_id": "58137",
+  "dataset_file": "58137.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndeclare void @use(i8)\n\ndefine i8 @sdiv_mul_shl_nsw_use1(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n\ndeclare void @use(i8)\n\ndefine i8 @sdiv_mul_shl_nsw_use1(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize `sdiv` of two `nsw` operations that share a common multiplicative factor. Specifically, `(mul nsw X, Y) sdiv (shl nsw X, Z)` simplifies to `Y sdiv (shl nuw 1, Z)`, effectively canceling `X` from the dividend and divisor.\",\n  \"before_after\": \"Simplify `sdiv (mul nsw X, Y), (shl nsw X, Z)` into `sdiv Y, (shl nuw 1, Z)`. The common factor `X` is removed. The `shl` in the divisor transforms from `X << Z` to `1 << Z`.\",\n  \"preconditions\": [\n    \"The `mul` and `shl` instructions must have the `nsw` (No Signed Wrap) flag to ensure the multiplicative relationship holds mathematically without overflow.\",\n    \"The common factor `X` must be non-zero. If `X` is zero, the original expression is `0 / 0` (poison), whereas the optimized expression `Y / (1 << Z)` is defined. Optimizing poison to defined values is illegal.\",\n    \"The shift amount `Z` must be such that `1 << Z` does not overflow the bit width of the type. If `1 << Z` overflows (e.g., `i8`, `Z=7`), creating `shl nuw 1, Z` introduces poison where the original expression (e.g., with `X=-1`) was defined.\",\n    \"Types must be integers or vectors of integers.\"\n  ],\n  \"pattern\": \"Canonical form:\\nLHS: `mul nsw %X, %Y` (or commuted)\\nRHS: `shl nsw %X, %Z`\\nResult: `sdiv %Y, (shl nuw 1, %Z)`\\n\\nConstraints:\\n- `isKnownNonZero(%X)`\\n- `1 << Z` does not overflow (checked via `ComputeKnownBits` or range analysis on `Z`)\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_i8_const_shift\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl nsw i8 %x, 3\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %d = sdiv i8 %y, 8\\n  ret i8 %d\\n}\",\n      \"why\": \"X cancels out. Z=3 is constant, 1<<3=8 fits in i8. X is assumed non-zero implicitly or proven.\"\n    },\n    {\n      \"name\": \"basic_i8_variable_shift\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %1 = shl nuw i8 1, %z\\n  %d = sdiv i8 %y, %1\\n  ret i8 %d\\n}\",\n      \"why\": \"X cancels out. Requires assumption that Z is small enough (<=6 for i8) and X!=0.\"\n    },\n    {\n      \"name\": \"commuted_mul\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %y, %x\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %1 = shl nuw i8 1, %z\\n  %d = sdiv i8 %y, %1\\n  ret i8 %d\\n}\",\n      \"why\": \"Handles commuted operands of the mul instruction.\"\n    },\n    {\n      \"name\": \"vector_case\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\\n  %m1 = mul nsw <4 x i32> %x, %y\\n  %m2 = shl nsw <4 x i32> %x, %z\\n  %d = sdiv <4 x i32> %m1, %m2\\n  ret <4 x i32> %d\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\\n  %1 = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %z\\n  %d = sdiv <4 x i32> %y, %1\\n  ret <4 x i32> %d\\n}\",\n      \"why\": \"Pattern matching should work on vectors.\"\n    },\n    {\n      \"name\": \"extra_use_mul\",\n      \"ir\": \"declare void @use(i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  call void @use(i8 %m1)\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  call void @use(i8 %m1)\\n  %1 = shl nuw i8 1, %z\\n  %d = sdiv i8 %y, %1\\n  ret i8 %d\\n}\",\n      \"why\": \"The mul instruction has another use, so it cannot be deleted, but the sdiv operands are simplified.\"\n    },\n    {\n      \"name\": \"negative_missing_nsw_mul\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"why\": \"Missing nsw on mul means overflow is possible, which invalidates the algebraic cancellation.\"\n    },\n    {\n      \"name\": \"negative_missing_nsw_shl\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"why\": \"Missing nsw on shl means overflow is possible.\"\n    },\n    {\n      \"name\": \"negative_x_is_zero\",\n      \"ir\": \"define i8 @test(i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 0, %y\\n  %m2 = shl nsw i8 0, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %y, i8 %z) {\\n  %d = sdiv i8 0, 0\\n  ret i8 %d\\n}\",\n      \"why\": \"X is 0. Original is 0/0 (poison). Optimized Y/(1<<Z) is defined. Optimization must NOT happen.\"\n    },\n    {\n      \"name\": \"select_x_nonzero\",\n      \"ir\": \"define i8 @test(i1 %c, i8 %y, i8 %z) {\\n  %x = select i1 %c, i8 5, i8 10\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i1 %c, i8 %y, i8 %z) {\\n  %1 = shl nuw i8 1, %z\\n  %d = sdiv i8 %y, %1\\n  ret i8 %d\\n}\",\n      \"why\": \"X is a select of non-zero constants. ValueTracking should prove X!=0.\"\n    },\n    {\n      \"name\": \"udiv_variant\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nuw i8 %x, %y\\n  %m2 = shl nuw i8 %x, %z\\n  %d = udiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %1 = shl nuw i8 1, %z\\n  %d = udiv i8 %y, %1\\n  ret i8 %d\\n}\",\n      \"why\": \"Equivalent pattern exists for unsigned integers with nuw flags.\"\n    },\n    {\n      \"name\": \"shl_amount_overflow_risk\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %m1 = mul nsw i8 %x, %y\\n  %m2 = shl nsw i8 %x, %z\\n  %d = sdiv i8 %m1, %m2\\n  ret i8 %d\\n}\",\n      \"why\": \"If Z can be 7 (for i8), 1<<Z overflows. Without proof that Z<7, we cannot safely emit the optimized shl nuw.\"\n    }\n  ],\n  \"implementation_notes\": \"The implementation should be in `InstCombine::visitSDiv` (and `visitUDiv`).\\n\\n1. Match `LHS = mul nsw X, Y` and `RHS = shl nsw X, Z`. Handle commutation for Mul.\\n2. Verify `isKnownNonZero(X)` using `computeKnownBits`. This is critical to avoid turning `0/0` poison into a defined value.\\n3. Verify that `1 << Z` is safe to compute. Since we need to emit `shl nuw 1, Z`, we must ensure this operation does not overflow.\\n   - If Z is a constant, check `1 << Z < BitWidth`.\\n   - If Z is variable, we might need `KnownBits` to prove Z is small enough, or conservatively skip the fold.\\n4. Construct `NewRHS = Builder.CreateShl(ConstantInt::get(Type::getInt32Ty(Ctx), 1), Z, \\\"\\\", false, true)` (NUW=true).\\n5. Replace `SDiv` with `Builder.CreateSDiv(Y, NewRHS)`.\\n\\nNote on `shl nuw 1, Z`: Since `1` is positive, `nuw` ensures the result is strictly positive and does not overflow the unsigned representation, which mathematically corresponds to the power of 2 required.\",\n  \"regression_test_notes\": \"Tests should be added to `llvm/test/Transforms/InstCombine/div.ll`.\\nUse `CHECK-LABEL` and `CHECK` directives.\\nEnsure negative cases (like `missing_nsw` or `x=0`) verify that the instructions are NOT optimized (use `CHECK-NOT` for the specific simplified pattern).\",\n  \"clarifying_questions\": [\n    \"How should the optimization handle the case where Z is a variable that might overflow the bit width (e.g., Z=7 for i8)? Should we rely on `computeKnownBits` to prove Z is small, or skip the fold for variable Z?\",\n    \"Is it acceptable to introduce a `freeze` instruction if we cannot prove `X != 0` but want to perform the optimization speculatively? (Generally no for InstCombine, but confirming).\",\n    \"Should this pattern be extended to `sdiv (mul nsw X, Y), (mul nsw X, Z)` -> `sdiv Y, Z` as a more general fold, or keep it specific to `shl` for now?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize `sdiv` of two `nsw` operations that share a common multiplicative factor. Specifically, `(mul nsw X, Y) sdiv (shl nsw X, Z)` simplifies to `Y sdiv (shl nuw 1, Z)`, effectively canceling `X` from the dividend and divisor.",
+    "before_after": "Simplify `sdiv (mul nsw X, Y), (shl nsw X, Z)` into `sdiv Y, (shl nuw 1, Z)`. The common factor `X` is removed. The `shl` in the divisor transforms from `X << Z` to `1 << Z`.",
+    "preconditions": [
+      "The `mul` and `shl` instructions must have the `nsw` (No Signed Wrap) flag to ensure the multiplicative relationship holds mathematically without overflow.",
+      "The common factor `X` must be non-zero. If `X` is zero, the original expression is `0 / 0` (poison), whereas the optimized expression `Y / (1 << Z)` is defined. Optimizing poison to defined values is illegal.",
+      "The shift amount `Z` must be such that `1 << Z` does not overflow the bit width of the type. If `1 << Z` overflows (e.g., `i8`, `Z=7`), creating `shl nuw 1, Z` introduces poison where the original expression (e.g., with `X=-1`) was defined.",
+      "Types must be integers or vectors of integers."
+    ],
+    "pattern": "Canonical form:\nLHS: `mul nsw %X, %Y` (or commuted)\nRHS: `shl nsw %X, %Z`\nResult: `sdiv %Y, (shl nuw 1, %Z)`\n\nConstraints:\n- `isKnownNonZero(%X)`\n- `1 << Z` does not overflow (checked via `ComputeKnownBits` or range analysis on `Z`)",
+    "testcases": [
+      {
+        "name": "basic_i8_const_shift",
+        "ir": "define i8 @test(i8 %x, i8 %y) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y) {\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}",
+        "why": "X cancels out. Z=3 is constant, 1<<3=8 fits in i8. X is assumed non-zero implicitly or proven."
+      },
+      {
+        "name": "basic_i8_variable_shift",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+        "why": "X cancels out. Requires assumption that Z is small enough (<=6 for i8) and X!=0."
+      },
+      {
+        "name": "commuted_mul",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+        "why": "Handles commuted operands of the mul instruction."
+      },
+      {
+        "name": "vector_case",
+        "ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n  %m1 = mul nsw <4 x i32> %x, %y\n  %m2 = shl nsw <4 x i32> %x, %z\n  %d = sdiv <4 x i32> %m1, %m2\n  ret <4 x i32> %d\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n  %1 = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %z\n  %d = sdiv <4 x i32> %y, %1\n  ret <4 x i32> %d\n}",
+        "why": "Pattern matching should work on vectors."
+      },
+      {
+        "name": "extra_use_mul",
+        "ir": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+        "why": "The mul instruction has another use, so it cannot be deleted, but the sdiv operands are simplified."
+      },
+      {
+        "name": "negative_missing_nsw_mul",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "why": "Missing nsw on mul means overflow is possible, which invalidates the algebraic cancellation."
+      },
+      {
+        "name": "negative_missing_nsw_shl",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "why": "Missing nsw on shl means overflow is possible."
+      },
+      {
+        "name": "negative_x_is_zero",
+        "ir": "define i8 @test(i8 %y, i8 %z) {\n  %m1 = mul nsw i8 0, %y\n  %m2 = shl nsw i8 0, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %y, i8 %z) {\n  %d = sdiv i8 0, 0\n  ret i8 %d\n}",
+        "why": "X is 0. Original is 0/0 (poison). Optimized Y/(1<<Z) is defined. Optimization must NOT happen."
+      },
+      {
+        "name": "select_x_nonzero",
+        "ir": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+        "why": "X is a select of non-zero constants. ValueTracking should prove X!=0."
+      },
+      {
+        "name": "udiv_variant",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nuw i8 %x, %y\n  %m2 = shl nuw i8 %x, %z\n  %d = udiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = udiv i8 %y, %1\n  ret i8 %d\n}",
+        "why": "Equivalent pattern exists for unsigned integers with nuw flags."
+      },
+      {
+        "name": "shl_amount_overflow_risk",
+        "ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+        "why": "If Z can be 7 (for i8), 1<<Z overflows. Without proof that Z<7, we cannot safely emit the optimized shl nuw."
+      }
+    ],
+    "implementation_notes": "The implementation should be in `InstCombine::visitSDiv` (and `visitUDiv`).\n\n1. Match `LHS = mul nsw X, Y` and `RHS = shl nsw X, Z`. Handle commutation for Mul.\n2. Verify `isKnownNonZero(X)` using `computeKnownBits`. This is critical to avoid turning `0/0` poison into a defined value.\n3. Verify that `1 << Z` is safe to compute. Since we need to emit `shl nuw 1, Z`, we must ensure this operation does not overflow.\n   - If Z is a constant, check `1 << Z < BitWidth`.\n   - If Z is variable, we might need `KnownBits` to prove Z is small enough, or conservatively skip the fold.\n4. Construct `NewRHS = Builder.CreateShl(ConstantInt::get(Type::getInt32Ty(Ctx), 1), Z, \"\", false, true)` (NUW=true).\n5. Replace `SDiv` with `Builder.CreateSDiv(Y, NewRHS)`.\n\nNote on `shl nuw 1, Z`: Since `1` is positive, `nuw` ensures the result is strictly positive and does not overflow the unsigned representation, which mathematically corresponds to the power of 2 required.",
+    "regression_test_notes": "Tests should be added to `llvm/test/Transforms/InstCombine/div.ll`.\nUse `CHECK-LABEL` and `CHECK` directives.\nEnsure negative cases (like `missing_nsw` or `x=0`) verify that the instructions are NOT optimized (use `CHECK-NOT` for the specific simplified pattern).",
+    "clarifying_questions": [
+      "How should the optimization handle the case where Z is a variable that might overflow the bit width (e.g., Z=7 for i8)? Should we rely on `computeKnownBits` to prove Z is small, or skip the fold for variable Z?",
+      "Is it acceptable to introduce a `freeze` instruction if we cannot prove `X != 0` but want to perform the optimization speculatively? (Generally no for InstCombine, but confirming).",
+      "Should this pattern be extended to `sdiv (mul nsw X, Y), (mul nsw X, Z)` -> `sdiv Y, Z` as a more general fold, or keep it specific to `shl` for now?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_i8_const_shift",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 11,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 11\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %d = sdiv i8 %y, 8\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, 3\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = poison\n\nSource:\ni8 %d = poison\n\nTarget:\ni8 %m1 = poison\ni8 %m2 = #x00 (0)\ni8 %d = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "basic_i8_variable_shift",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 12,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 12\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\ni8 %z = #x00 (0)\n\nSource:\ni8 %#1 = #x01 (1)\ni8 %d = #x00 (0)\n\nTarget:\ni8 %m1 = #x00 (0)\ni8 %m2 = #x00 (0)\ni8 %d = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_mul",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 12,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 12\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %y, %x\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\ni8 %z = #x00 (0)\n\nSource:\ni8 %#1 = #x01 (1)\ni8 %d = #x00 (0)\n\nTarget:\ni8 %m1 = #x00 (0)\ni8 %m2 = #x00 (0)\ni8 %d = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_case",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 12,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 12\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n  %m1 = mul nsw <4 x i32> %x, %y\n  %m2 = shl nsw <4 x i32> %x, %z\n  %d = sdiv <4 x i32> %m1, %m2\n  ret <4 x i32> %d\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n  %1 = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %z\n  %d = sdiv <4 x i32> %y, %1\n  ret <4 x i32> %d\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n#0:\n  %m1 = mul nsw <4 x i32> %x, %y\n  %m2 = shl nsw <4 x i32> %x, %z\n  %d = sdiv <4 x i32> %m1, %m2\n  ret <4 x i32> %d\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %z) {\n#0:\n  %#1 = shl nuw <4 x i32> { 1, 1, 1, 1 }, %z\n  %d = sdiv <4 x i32> %y, %#1\n  ret <4 x i32> %d\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "extra_use_mul",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  call void @use(i8 %m1)\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\ni8 %z = #x00 (0)\n\nSource:\ni8 %m1 = #x00 (0)\nFunction @use returned\ni8 %#1 = #x01 (1)\ni8 %d = #x00 (0)\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x1\n\nTarget:\ni8 %m1 = #x00 (0)\nFunction @use returned\ni8 %m2 = #x00 (0)\ni8 %d = UB triggered!\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x1\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_missing_nsw_mul",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_missing_nsw_shl",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_x_is_zero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 11,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 11\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "select_x_nonzero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 12,
+        "current_opt": 14,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 12\n",
+        "current_opt_log": "Cost: 14\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i1 %c, i8 %y, i8 %z) {\n  %1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %1\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %#1 = shl nuw i8 1, %z\n  %d = sdiv i8 %y, %#1\n  ret i8 %d\n}\n=>\ndefine i8 @test(i1 %c, i8 %y, i8 %z) {\n#0:\n  %x = select i1 %c, i8 5, i8 10\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni1 %c = poison\ni8 %y = #x00 (0)\ni8 %z = #x00 (0)\n\nSource:\ni8 %#1 = #x01 (1)\ni8 %d = #x00 (0)\n\nTarget:\ni8 %x = poison\ni8 %m1 = poison\ni8 %m2 = poison\ni8 %d = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "udiv_variant",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 12,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 12\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "shl_amount_overflow_risk",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %m1 = mul nsw i8 %x, %y\n  %m2 = shl nsw i8 %x, %z\n  %d = sdiv i8 %m1, %m2\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at CMakeLists.txt:8 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\n\n\nCMake Deprecation Warning at CMakeLists.txt:13 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Go bindings disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.2s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

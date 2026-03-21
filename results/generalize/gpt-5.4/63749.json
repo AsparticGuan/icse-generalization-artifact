@@ -1,0 +1,906 @@
+{
+  "issue_id": "63749",
+  "dataset_file": "63749.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue was one specific overflow-boundary redundancy:  \n`(x != -1) & ((x + 1) <=u y)` can be simplified because the `x == -1` wraparound case is exactly the only reason `x+1` is not equivalent to comparing against `x`. So the pair collapses to a single unsigned compare: effectively `x <u y` / `y >u x` depending on operand order. The motivating test exposed that InstCombine only handled the special `eq/ne X, 0` form, not the equivalent shifted form around arbitrary constants.\n\nThe patch generalizes this by replacing `foldAndOrOfICmpEqZeroAndICmp` with `foldAndOrOfICmpEqConstantAndICmp`. Key changes:\n- match `icmp eq/ne X, C` for any integer/vector constant `C` (including undef lanes);\n- match the compare against either `X - C` encoded as `add X, -C`, or plain `X` when `C==0`;\n- support both operand orders (`ult Other, ...` and `ugt ..., Other`) and both boolean shapes via predicate inversion:\n  - `eq + or`\n  - `ne + and`\n- produce the canonical shifted compare by rewriting to compare `Other` against `X - (C+1)`;\n- preserve poison semantics with `freeze` for logical ops and allow int vectors.\n\nThe dev tests expand coverage far beyond the original:\n- nonzero constants: `±1`, `±5`, `±7`;\n- both `eq/or` and `ne/and` forms;\n- commuted compare operands;\n- scalar and vector types;\n- zero-constant legacy form;\n- undef-in-icmp / undef-in-add vector lane handling;\n- matching/nonmatching offset relationships (`equal` vs `unequal`).  \n\nThis is a good template: identify a boundary-exclusion compare paired with an offset unsigned compare, then lift from a single constant to affine `X - C` matching.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i8 %x, i8 %y) {\r\n  %add = add i8 %x, 1\r\n  %c1 = icmp ne i8 %x, -1\r\n  %c2 = icmp ule i8 %add, %y\r\n  %and = and i1 %c1, %c2\r\n  ret i1 %and\r\n}\n\ndefine i1 @test(i8 %x, i8 %y) {\r\n  %c = icmp ult i8 %x, %y\r\n  ret i1 %c\r\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Unsigned overflow-boundary exclusion combined with an offset unsigned comparison can be folded to a single unsigned comparison.\",\n    \"description\": \"Given an integer or integer-vector value X and constant C, InstCombine can fold a boolean combination of an equality test against the unique wraparound boundary with an unsigned compare on X shifted by 1 relative to that boundary. The canonical scalar form is: (icmp ne X, MAX) & (icmp ule (add X, 1), Y) -> icmp ult X, Y, where MAX is all-ones for the bitwidth. More generally, for arbitrary constant C, match eq/ne X, C together with an unsigned compare of Y against X - C or its equivalent affine form, and rewrite to the corresponding canonical unsigned compare with the compare boundary shifted by C+1. The motivating example is the C = -1 instance: excluding X == -1 removes the only wraparound case of X+1, so ((X != -1) & ((X+1) <=u Y)) is equivalent to (X <u Y).\",\n    \"generic_forms\": [\n      {\n        \"source\": \"(icmp ne X, C) & (icmp ule (X + (-C + 1 mod 2^n)), Y)\",\n        \"result\": \"icmp ult (X - C), Y\"\n      },\n      {\n        \"source\": \"(icmp ne X, C) & (icmp uge Y, (X + (-C + 1 mod 2^n)))\",\n        \"result\": \"icmp ugt Y, (X - C)\"\n      },\n      {\n        \"source\": \"(icmp eq X, C) | (icmp ule (X + (-C + 1 mod 2^n)), Y)\",\n        \"result\": \"icmp ult (X - C), Y\"\n      },\n      {\n        \"source\": \"(icmp eq X, C) | (icmp uge Y, (X + (-C + 1 mod 2^n)))\",\n        \"result\": \"icmp ugt Y, (X - C)\"\n      }\n    ],\n    \"special_case_from_example\": {\n      \"source\": \"(icmp ne iN X, -1) & (icmp ule (add X, 1), Y)\",\n      \"result\": \"icmp ult iN X, Y\"\n    },\n    \"matching_notes\": [\n      \"Handle both and/or logical shapes: ne+and and eq+or.\",\n      \"Handle both operand orders of the unsigned compare: ule Shifted, Y and uge Y, Shifted.\",\n      \"The shifted value may appear as add X, K where K is the modular constant encoding of (-C + 1).\",\n      \"When C == 0, this includes the legacy zero-boundary form.\",\n      \"Works for scalar integers and integer vectors lane-wise.\",\n      \"If lowered through logical and/or rather than bitwise i1 ops in vectors/scalars, preserve poison semantics with freeze as needed.\"\n    ],\n    \"preconditions\": [\n      \"Integer or integer vector type.\",\n      \"The add is ordinary modular integer addition; no extra nowrap assumption is required.\",\n      \"The constants must satisfy the affine relation between the equality-boundary C and the add constant K: K == (-C + 1) mod 2^n.\"\n    ],\n    \"canonicalization_preference\": [\n      \"Prefer an unsigned compare directly on X (or X - C in the generalized form) against Y.\",\n      \"For the concrete all-ones boundary case, canonical result is icmp ult X, Y or equivalently icmp ugt Y, X depending on operand order.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"scalar_i8_ne_and_ule_basic\",\n      \"ir\": \"define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\\n  %add = add i8 %x, 1\\n  %c1 = icmp ne i8 %x, -1\\n  %c2 = icmp ule i8 %add, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\\n  %c = icmp ult i8 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_eq_or_ule_basic\",\n      \"ir\": \"define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\\n  %add = add i8 %x, 1\\n  %c1 = icmp eq i8 %x, -1\\n  %c2 = icmp ule i8 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\\n  %c = icmp ult i8 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_ne_and_uge_commuted_cmp\",\n      \"ir\": \"define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\\n  %add = add i8 %x, 1\\n  %c1 = icmp ne i8 %x, -1\\n  %c2 = icmp uge i8 %y, %add\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\\n  %c = icmp ugt i8 %y, %x\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_eq_or_uge_commuted_cmp\",\n      \"ir\": \"define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\\n  %add = add i8 %x, 1\\n  %c1 = icmp eq i8 %x, -1\\n  %c2 = icmp uge i8 %y, %add\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\\n  %c = icmp ugt i8 %y, %x\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i16_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\\n  %add = add i16 %x, 1\\n  %c1 = icmp ne i16 %x, -1\\n  %c2 = icmp ule i16 %add, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\\n  %c = icmp ult i16 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp ne i32 %x, -1\\n  %c2 = icmp ule i32 %add, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\\n  %c = icmp ult i32 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_eq_or_ule\",\n      \"ir\": \"define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\\n  %add = add i64 %x, 1\\n  %c1 = icmp eq i64 %x, -1\\n  %c2 = icmp ule i64 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\\n  %c = icmp ult i64 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_ne_and_ule_add_on_rhs\",\n      \"ir\": \"define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\\n  %add = add i8 1, %x\\n  %c1 = icmp ne i8 %x, -1\\n  %c2 = icmp ule i8 %add, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\\n  %c = icmp ult i8 %x, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_zero_boundary_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\\n  %sub = add i8 %x, -255\\n  %c1 = icmp ne i8 %x, 0\\n  %c2 = icmp ule i8 %sub, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\\n  %xm1 = add i8 %x, -1\\n  %c = icmp ult i8 %xm1, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_zero_boundary_eq_or_uge\",\n      \"ir\": \"define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\\n  %sub = add i8 %x, -1\\n  %c1 = icmp eq i8 %x, 0\\n  %c2 = icmp uge i8 %y, %sub\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\\n  %xm1 = add i8 %x, -1\\n  %c = icmp ugt i8 %y, %xm1\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_const5_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\\n  %shift = add i8 %x, -4\\n  %c1 = icmp ne i8 %x, 5\\n  %c2 = icmp ule i8 %shift, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\\n  %norm = add i8 %x, -5\\n  %c = icmp ult i8 %norm, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_const5_eq_or_ule\",\n      \"ir\": \"define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\\n  %shift = add i8 %x, -4\\n  %c1 = icmp eq i8 %x, 5\\n  %c2 = icmp ule i8 %shift, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\\n  %norm = add i8 %x, -5\\n  %c = icmp ult i8 %norm, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_const5_ne_and_uge\",\n      \"ir\": \"define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\\n  %shift = add i8 %x, -4\\n  %c1 = icmp ne i8 %x, 5\\n  %c2 = icmp uge i8 %y, %shift\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\\n  %norm = add i8 %x, -5\\n  %c = icmp ugt i8 %y, %norm\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_const_minus7_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\\n  %shift = add i8 %x, 8\\n  %c1 = icmp ne i8 %x, -7\\n  %c2 = icmp ule i8 %shift, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\\n  %norm = add i8 %x, 7\\n  %c = icmp ult i8 %norm, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_const_minus7_eq_or_uge\",\n      \"ir\": \"define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\\n  %shift = add i8 %x, 8\\n  %c1 = icmp eq i8 %x, -7\\n  %c2 = icmp uge i8 %y, %shift\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\\n  %norm = add i8 %x, 7\\n  %c = icmp ugt i8 %y, %norm\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_const1_ne_and_ule\",\n      \"ir\": \"define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\\n  %shift = add i32 %x, 0\\n  %c1 = icmp ne i32 %x, 1\\n  %c2 = icmp ule i32 %shift, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\\n  %norm = add i32 %x, -1\\n  %c = icmp ult i32 %norm, %y\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_const1_eq_or_uge\",\n      \"ir\": \"define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\\n  %shift = add i32 %x, 0\\n  %c1 = icmp eq i32 %x, 1\\n  %c2 = icmp uge i32 %y, %shift\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\\n  %norm = add i32 %x, -1\\n  %c = icmp ugt i32 %y, %norm\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_ne_and_ule_allones_boundary\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\\n  %c2 = icmp ule <4 x i8> %add, %y\\n  %and = and <4 x i1> %c1, %c2\\n  ret <4 x i1> %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %c = icmp ult <4 x i8> %x, %y\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_eq_or_ule_allones_boundary\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\\n  %c2 = icmp ule <4 x i8> %add, %y\\n  %or = or <4 x i1> %c1, %c2\\n  ret <4 x i1> %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %c = icmp ult <4 x i8> %x, %y\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_ne_and_uge_allones_boundary\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\\n  %c2 = icmp uge <4 x i8> %y, %add\\n  %and = and <4 x i1> %c1, %c2\\n  ret <4 x i1> %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\\n  %c = icmp ugt <4 x i8> %y, %x\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_const5_ne_and_ule\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\\n  %shift = add <4 x i8> %x, <i8 -4, i8 -4, i8 -4, i8 -4>\\n  %c1 = icmp ne <4 x i8> %x, <i8 5, i8 5, i8 5, i8 5>\\n  %c2 = icmp ule <4 x i8> %shift, %y\\n  %and = and <4 x i1> %c1, %c2\\n  ret <4 x i1> %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\\n  %norm = add <4 x i8> %x, <i8 -5, i8 -5, i8 -5, i8 -5>\\n  %c = icmp ult <4 x i8> %norm, %y\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_const_minus7_eq_or_uge\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\\n  %shift = add <4 x i8> %x, <i8 8, i8 8, i8 8, i8 8>\\n  %c1 = icmp eq <4 x i8> %x, <i8 -7, i8 -7, i8 -7, i8 -7>\\n  %c2 = icmp uge <4 x i8> %y, %shift\\n  %or = or <4 x i1> %c1, %c2\\n  ret <4 x i1> %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\\n  %norm = add <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\\n  %c = icmp ugt <4 x i8> %y, %norm\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v2i16_ne_and_ule\",\n      \"ir\": \"define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\\n  %add = add <2 x i16> %x, <i16 1, i16 1>\\n  %c1 = icmp ne <2 x i16> %x, <i16 -1, i16 -1>\\n  %c2 = icmp ule <2 x i16> %add, %y\\n  %and = and <2 x i1> %c1, %c2\\n  ret <2 x i1> %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\\n  %c = icmp ult <2 x i16> %x, %y\\n  ret <2 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_undef_lane_constant_ne_and_ule\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 undef, i8 -1, i8 -1>\\n  %c2 = icmp ule <4 x i8> %add, %y\\n  %and = and <4 x i1> %c1, %c2\\n  ret <4 x i1> %and\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\\n  %c = icmp ult <4 x i8> %x, %y\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_undef_lane_constant_eq_or_uge\",\n      \"ir\": \"define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 undef, i8 -1>\\n  %c2 = icmp uge <4 x i8> %y, %add\\n  %or = or <4 x i1> %c1, %c2\\n  ret <4 x i1> %or\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\\n  %c = icmp ugt <4 x i8> %y, %x\\n  ret <4 x i1> %c\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Unsigned overflow-boundary exclusion combined with an offset unsigned comparison can be folded to a single unsigned comparison.",
+      "description": "Given an integer or integer-vector value X and constant C, InstCombine can fold a boolean combination of an equality test against the unique wraparound boundary with an unsigned compare on X shifted by 1 relative to that boundary. The canonical scalar form is: (icmp ne X, MAX) & (icmp ule (add X, 1), Y) -> icmp ult X, Y, where MAX is all-ones for the bitwidth. More generally, for arbitrary constant C, match eq/ne X, C together with an unsigned compare of Y against X - C or its equivalent affine form, and rewrite to the corresponding canonical unsigned compare with the compare boundary shifted by C+1. The motivating example is the C = -1 instance: excluding X == -1 removes the only wraparound case of X+1, so ((X != -1) & ((X+1) <=u Y)) is equivalent to (X <u Y).",
+      "generic_forms": [
+        {
+          "source": "(icmp ne X, C) & (icmp ule (X + (-C + 1 mod 2^n)), Y)",
+          "result": "icmp ult (X - C), Y"
+        },
+        {
+          "source": "(icmp ne X, C) & (icmp uge Y, (X + (-C + 1 mod 2^n)))",
+          "result": "icmp ugt Y, (X - C)"
+        },
+        {
+          "source": "(icmp eq X, C) | (icmp ule (X + (-C + 1 mod 2^n)), Y)",
+          "result": "icmp ult (X - C), Y"
+        },
+        {
+          "source": "(icmp eq X, C) | (icmp uge Y, (X + (-C + 1 mod 2^n)))",
+          "result": "icmp ugt Y, (X - C)"
+        }
+      ],
+      "special_case_from_example": {
+        "source": "(icmp ne iN X, -1) & (icmp ule (add X, 1), Y)",
+        "result": "icmp ult iN X, Y"
+      },
+      "matching_notes": [
+        "Handle both and/or logical shapes: ne+and and eq+or.",
+        "Handle both operand orders of the unsigned compare: ule Shifted, Y and uge Y, Shifted.",
+        "The shifted value may appear as add X, K where K is the modular constant encoding of (-C + 1).",
+        "When C == 0, this includes the legacy zero-boundary form.",
+        "Works for scalar integers and integer vectors lane-wise.",
+        "If lowered through logical and/or rather than bitwise i1 ops in vectors/scalars, preserve poison semantics with freeze as needed."
+      ],
+      "preconditions": [
+        "Integer or integer vector type.",
+        "The add is ordinary modular integer addition; no extra nowrap assumption is required.",
+        "The constants must satisfy the affine relation between the equality-boundary C and the add constant K: K == (-C + 1) mod 2^n."
+      ],
+      "canonicalization_preference": [
+        "Prefer an unsigned compare directly on X (or X - C in the generalized form) against Y.",
+        "For the concrete all-ones boundary case, canonical result is icmp ult X, Y or equivalently icmp ugt Y, X depending on operand order."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "scalar_i8_ne_and_ule_basic",
+        "ir": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_eq_or_ule_basic",
+        "ir": "define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_ne_and_uge_commuted_cmp",
+        "ir": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp uge i8 %y, %add\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_eq_or_uge_commuted_cmp",
+        "ir": "define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, -1\n  %c2 = icmp uge i8 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i16_ne_and_ule",
+        "ir": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, -1\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i32_ne_and_ule",
+        "ir": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i64_eq_or_ule",
+        "ir": "define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n  %add = add i64 %x, 1\n  %c1 = icmp eq i64 %x, -1\n  %c2 = icmp ule i64 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n  %c = icmp ult i64 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_ne_and_ule_add_on_rhs",
+        "ir": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %add = add i8 1, %x\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_zero_boundary_ne_and_ule",
+        "ir": "define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n  %sub = add i8 %x, -255\n  %c1 = icmp ne i8 %x, 0\n  %c2 = icmp ule i8 %sub, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n  %xm1 = add i8 %x, -1\n  %c = icmp ult i8 %xm1, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_zero_boundary_eq_or_uge",
+        "ir": "define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n  %sub = add i8 %x, -1\n  %c1 = icmp eq i8 %x, 0\n  %c2 = icmp uge i8 %y, %sub\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n  %xm1 = add i8 %x, -1\n  %c = icmp ugt i8 %y, %xm1\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_const5_ne_and_ule",
+        "ir": "define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_const5_eq_or_ule",
+        "ir": "define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp eq i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_const5_ne_and_uge",
+        "ir": "define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp uge i8 %y, %shift\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_const_minus7_ne_and_ule",
+        "ir": "define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, 8\n  %c1 = icmp ne i8 %x, -7\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, 7\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i8_const_minus7_eq_or_uge",
+        "ir": "define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n  %shift = add i8 %x, 8\n  %c1 = icmp eq i8 %x, -7\n  %c2 = icmp uge i8 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n  %norm = add i8 %x, 7\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i32_const1_ne_and_ule",
+        "ir": "define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n  %shift = add i32 %x, 0\n  %c1 = icmp ne i32 %x, 1\n  %c2 = icmp ule i32 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n  %norm = add i32 %x, -1\n  %c = icmp ult i32 %norm, %y\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_i32_const1_eq_or_uge",
+        "ir": "define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n  %shift = add i32 %x, 0\n  %c1 = icmp eq i32 %x, 1\n  %c2 = icmp uge i32 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n  %norm = add i32 %x, -1\n  %c = icmp ugt i32 %y, %norm\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_ne_and_ule_allones_boundary",
+        "ir": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_eq_or_ule_allones_boundary",
+        "ir": "define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_ne_and_uge_allones_boundary",
+        "ir": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp uge <4 x i8> %y, %add\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_const5_ne_and_ule",
+        "ir": "define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %shift = add <4 x i8> %x, <i8 -4, i8 -4, i8 -4, i8 -4>\n  %c1 = icmp ne <4 x i8> %x, <i8 5, i8 5, i8 5, i8 5>\n  %c2 = icmp ule <4 x i8> %shift, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %norm = add <4 x i8> %x, <i8 -5, i8 -5, i8 -5, i8 -5>\n  %c = icmp ult <4 x i8> %norm, %y\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_const_minus7_eq_or_uge",
+        "ir": "define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %shift = add <4 x i8> %x, <i8 8, i8 8, i8 8, i8 8>\n  %c1 = icmp eq <4 x i8> %x, <i8 -7, i8 -7, i8 -7, i8 -7>\n  %c2 = icmp uge <4 x i8> %y, %shift\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %norm = add <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %c = icmp ugt <4 x i8> %y, %norm\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v2i16_ne_and_ule",
+        "ir": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %add = add <2 x i16> %x, <i16 1, i16 1>\n  %c1 = icmp ne <2 x i16> %x, <i16 -1, i16 -1>\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_undef_lane_constant_ne_and_ule",
+        "ir": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 undef, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_v4i8_undef_lane_constant_eq_or_uge",
+        "ir": "define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 undef, i8 -1>\n  %c2 = icmp uge <4 x i8> %y, %add\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_i8_ne_and_ule_basic",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_basic(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i8_eq_or_ule_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i8_eq_or_ule_basic(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xff (255, -1)\ni8 %y = #x00 (0)\n\nSource:\ni8 %add = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %or = #x1 (1)\n\nTarget:\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_ne_and_uge_commuted_cmp",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp uge i8 %y, %add\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp uge i8 %y, %add\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_i8_ne_and_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i8_eq_or_uge_commuted_cmp",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, -1\n  %c2 = icmp uge i8 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp eq i8 %x, 255\n  %c2 = icmp uge i8 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i8_eq_or_uge_commuted_cmp(i8 %x, i8 %y) {\n#0:\n  %c = icmp ugt i8 %y, %x\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xff (255, -1)\ni8 %y = #x00 (0)\n\nSource:\ni8 %add = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %or = #x1 (1)\n\nTarget:\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i16_ne_and_ule",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, -1\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, 65535\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, -1\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, 65535\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, -1\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %c = icmp ult i16 %x, %y\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_i16_ne_and_ule(i16 %x, i16 %y) {\n#0:\n  %add = add i16 %x, 1\n  %c1 = icmp ne i16 %x, 65535\n  %c2 = icmp ule i16 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_ne_and_ule",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %c = icmp ult i32 %x, %y\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_i32_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i64_eq_or_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n  %add = add i64 %x, 1\n  %c1 = icmp eq i64 %x, -1\n  %c2 = icmp ule i64 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n  %c = icmp ult i64 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n#0:\n  %add = add i64 %x, 1\n  %c1 = icmp eq i64 %x, -1\n  %c2 = icmp ule i64 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i64_eq_or_ule(i64 %x, i64 %y) {\n#0:\n  %c = icmp ult i64 %x, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni64 %x = #xffffffffffffffff (18446744073709551615, -1)\ni64 %y = #x0000000000000000 (0)\n\nSource:\ni64 %add = #x0000000000000000 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %or = #x1 (1)\n\nTarget:\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_ne_and_ule_add_on_rhs",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %add = add i8 1, %x\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %add = add i8 1, %x\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, -1\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %c = icmp ult i8 %x, %y\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_i8_ne_and_ule_add_on_rhs(i8 %x, i8 %y) {\n#0:\n  %add = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 255\n  %c2 = icmp ule i8 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i8_zero_boundary_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n  %sub = add i8 %x, -255\n  %c1 = icmp ne i8 %x, 0\n  %c2 = icmp ule i8 %sub, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n  %xm1 = add i8 %x, -1\n  %c = icmp ult i8 %xm1, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %sub = add i8 %x, 1\n  %c1 = icmp ne i8 %x, 0\n  %c2 = icmp ule i8 %sub, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_zero_boundary_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %xm1 = add i8 %x, 255\n  %c = icmp ult i8 %xm1, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x01 (1)\ni8 %y = #x01 (1)\n\nSource:\ni8 %sub = #x02 (2)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x0 (0)\ni1 %and = #x0 (0)\n\nTarget:\ni8 %xm1 = #x00 (0)\ni1 %c = #x1 (1)\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_zero_boundary_eq_or_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n  %sub = add i8 %x, -1\n  %c1 = icmp eq i8 %x, 0\n  %c2 = icmp uge i8 %y, %sub\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n  %xm1 = add i8 %x, -1\n  %c = icmp ugt i8 %y, %xm1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n#0:\n  %sub = add i8 %x, 255\n  %c1 = icmp eq i8 %x, 0\n  %c2 = icmp uge i8 %y, %sub\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i8_zero_boundary_eq_or_uge(i8 %x, i8 %y) {\n#0:\n  %xm1 = add i8 %x, 255\n  %c = icmp ugt i8 %y, %xm1\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\n\nSource:\ni8 %sub = #xff (255, -1)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x0 (0)\ni1 %or = #x1 (1)\n\nTarget:\ni8 %xm1 = #xff (255, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_const5_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %shift = add i8 %x, 252\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_const5_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %norm = add i8 %x, 251\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x04 (4)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shift = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %and = #x1 (1)\n\nTarget:\ni8 %norm = #xff (255, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_const5_eq_or_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp eq i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n#0:\n  %shift = add i8 %x, 252\n  %c1 = icmp eq i8 %x, 5\n  %c2 = icmp ule i8 %shift, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i8_const5_eq_or_ule(i8 %x, i8 %y) {\n#0:\n  %norm = add i8 %x, 251\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x05 (5)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shift = #x01 (1)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x0 (0)\ni1 %or = #x1 (1)\n\nTarget:\ni8 %norm = #x00 (0)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_const5_ne_and_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n  %shift = add i8 %x, -4\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp uge i8 %y, %shift\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n  %norm = add i8 %x, -5\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n#0:\n  %shift = add i8 %x, 252\n  %c1 = icmp ne i8 %x, 5\n  %c2 = icmp uge i8 %y, %shift\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_const5_ne_and_uge(i8 %x, i8 %y) {\n#0:\n  %norm = add i8 %x, 251\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x04 (4)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shift = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %and = #x1 (1)\n\nTarget:\ni8 %norm = #xff (255, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_const_minus7_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n  %shift = add i8 %x, 8\n  %c1 = icmp ne i8 %x, -7\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n  %norm = add i8 %x, 7\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %shift = add i8 %x, 8\n  %c1 = icmp ne i8 %x, 249\n  %c2 = icmp ule i8 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i8_const_minus7_ne_and_ule(i8 %x, i8 %y) {\n#0:\n  %norm = add i8 %x, 7\n  %c = icmp ult i8 %norm, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xf8 (248, -8)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shift = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %and = #x1 (1)\n\nTarget:\ni8 %norm = #xff (255, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_const_minus7_eq_or_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n  %shift = add i8 %x, 8\n  %c1 = icmp eq i8 %x, -7\n  %c2 = icmp uge i8 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n  %norm = add i8 %x, 7\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n#0:\n  %shift = add i8 %x, 8\n  %c1 = icmp eq i8 %x, 249\n  %c2 = icmp uge i8 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i8_const_minus7_eq_or_uge(i8 %x, i8 %y) {\n#0:\n  %norm = add i8 %x, 7\n  %c = icmp ugt i8 %y, %norm\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xf9 (249, -7)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shift = #x01 (1)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x0 (0)\ni1 %or = #x1 (1)\n\nTarget:\ni8 %norm = #x00 (0)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i32_const1_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n  %shift = add i32 %x, 0\n  %c1 = icmp ne i32 %x, 1\n  %c2 = icmp ule i32 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n  %norm = add i32 %x, -1\n  %c = icmp ult i32 %norm, %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %shift = add i32 %x, 0\n  %c1 = icmp ne i32 %x, 1\n  %c2 = icmp ule i32 %shift, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @scalar_i32_const1_ne_and_ule(i32 %x, i32 %y) {\n#0:\n  %norm = add i32 %x, 4294967295\n  %c = icmp ult i32 %norm, %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %shift = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %c2 = #x1 (1)\ni1 %and = #x1 (1)\n\nTarget:\ni32 %norm = #xffffffff (4294967295, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i32_const1_eq_or_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n  %shift = add i32 %x, 0\n  %c1 = icmp eq i32 %x, 1\n  %c2 = icmp uge i32 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n  %norm = add i32 %x, -1\n  %c = icmp ugt i32 %y, %norm\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n#0:\n  %shift = add i32 %x, 0\n  %c1 = icmp eq i32 %x, 1\n  %c2 = icmp uge i32 %y, %shift\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @scalar_i32_const1_eq_or_uge(i32 %x, i32 %y) {\n#0:\n  %norm = add i32 %x, 4294967295\n  %c = icmp ugt i32 %y, %norm\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %shift = #x00000000 (0)\ni1 %c1 = #x0 (0)\ni1 %c2 = #x1 (1)\ni1 %or = #x1 (1)\n\nTarget:\ni32 %norm = #xffffffff (4294967295, -1)\ni1 %c = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_v4i8_ne_and_ule_allones_boundary",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i8_eq_or_ule_allones_boundary",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp eq <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @vector_v4i8_eq_or_ule_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i8> %x = < #x00 (0), #x00 (0), #xff (255, -1), #x00 (0) >\n<4 x i8> %y = < #x00 (0), #x00 (0), #x00 (0), #x00 (0) >\n\nSource:\n<4 x i8> %add = < #x01 (1), #x01 (1), #x00 (0), #x01 (1) >\n<4 x i1> %c1 = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n<4 x i1> %c2 = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n<4 x i1> %or = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n\nTarget:\n<4 x i1> %c = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nSource value: < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_v4i8_ne_and_uge_allones_boundary",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp uge <4 x i8> %y, %add\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp uge <4 x i8> %y, %add\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 -1, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_v4i8_ne_and_uge_allones_boundary(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, 255, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i8_const5_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %shift = add <4 x i8> %x, <i8 -4, i8 -4, i8 -4, i8 -4>\n  %c1 = icmp ne <4 x i8> %x, <i8 5, i8 5, i8 5, i8 5>\n  %c2 = icmp ule <4 x i8> %shift, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %norm = add <4 x i8> %x, <i8 -5, i8 -5, i8 -5, i8 -5>\n  %c = icmp ult <4 x i8> %norm, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %shift = add <4 x i8> %x, { 252, 252, 252, 252 }\n  %c1 = icmp ne <4 x i8> %x, { 5, 5, 5, 5 }\n  %c2 = icmp ule <4 x i8> %shift, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_const5_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %norm = add <4 x i8> %x, { 251, 251, 251, 251 }\n  %c = icmp ult <4 x i8> %norm, %y\n  ret <4 x i1> %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i8> %x = < #x00 (0), #x00 (0), #x04 (4), #x00 (0) >\n<4 x i8> %y = < #x00 (0), #x00 (0), #x00 (0), #x00 (0) >\n\nSource:\n<4 x i8> %shift = < #xfc (252, -4), #xfc (252, -4), #x00 (0), #xfc (252, -4) >\n<4 x i1> %c1 = < #x1 (1), #x1 (1), #x1 (1), #x1 (1) >\n<4 x i1> %c2 = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n<4 x i1> %and = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n\nTarget:\n<4 x i8> %norm = < #xfb (251, -5), #xfb (251, -5), #xff (255, -1), #xfb (251, -5) >\n<4 x i1> %c = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nSource value: < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_v4i8_const_minus7_eq_or_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %shift = add <4 x i8> %x, <i8 8, i8 8, i8 8, i8 8>\n  %c1 = icmp eq <4 x i8> %x, <i8 -7, i8 -7, i8 -7, i8 -7>\n  %c2 = icmp uge <4 x i8> %y, %shift\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %norm = add <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %c = icmp ugt <4 x i8> %y, %norm\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %shift = add <4 x i8> %x, { 8, 8, 8, 8 }\n  %c1 = icmp eq <4 x i8> %x, { 249, 249, 249, 249 }\n  %c2 = icmp uge <4 x i8> %y, %shift\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @vector_v4i8_const_minus7_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %norm = add <4 x i8> %x, { 7, 7, 7, 7 }\n  %c = icmp ugt <4 x i8> %y, %norm\n  ret <4 x i1> %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i8> %x = < #x00 (0), #x00 (0), #xf8 (248, -8), #x00 (0) >\n<4 x i8> %y = < #x00 (0), #x00 (0), #x00 (0), #x00 (0) >\n\nSource:\n<4 x i8> %shift = < #x08 (8), #x08 (8), #x00 (0), #x08 (8) >\n<4 x i1> %c1 = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n<4 x i1> %c2 = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n<4 x i1> %or = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n\nTarget:\n<4 x i8> %norm = < #x07 (7), #x07 (7), #xff (255, -1), #x07 (7) >\n<4 x i1> %c = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nSource value: < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_v2i16_ne_and_ule",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %add = add <2 x i16> %x, <i16 1, i16 1>\n  %c1 = icmp ne <2 x i16> %x, <i16 -1, i16 -1>\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n",
+          "tgt": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %add = add <2 x i16> %x, { 1, 1 }\n  %c1 = icmp ne <2 x i16> %x, { 65535, 65535 }\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n=>\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %add = add <2 x i16> %x, <i16 1, i16 1>\n  %c1 = icmp ne <2 x i16> %x, <i16 -1, i16 -1>\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n",
+          "tgt": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %add = add <2 x i16> %x, { 1, 1 }\n  %c1 = icmp ne <2 x i16> %x, { 65535, 65535 }\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n=>\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n  %add = add <2 x i16> %x, <i16 1, i16 1>\n  %c1 = icmp ne <2 x i16> %x, <i16 -1, i16 -1>\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %c = icmp ult <2 x i16> %x, %y\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_v2i16_ne_and_ule(<2 x i16> %x, <2 x i16> %y) {\n#0:\n  %add = add <2 x i16> %x, { 1, 1 }\n  %c1 = icmp ne <2 x i16> %x, { 65535, 65535 }\n  %c2 = icmp ule <2 x i16> %add, %y\n  %and = and <2 x i1> %c1, %c2\n  ret <2 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i8_undef_lane_constant_ne_and_ule",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 undef, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, undef, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 undef, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, undef, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp ne <4 x i8> %x, <i8 -1, i8 undef, i8 -1, i8 -1>\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ult <4 x i8> %x, %y\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_ne_and_ule(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp ne <4 x i8> %x, { 255, undef, 255, 255 }\n  %c2 = icmp ule <4 x i8> %add, %y\n  %and = and <4 x i1> %c1, %c2\n  ret <4 x i1> %and\n}\nTransformation doesn't verify!\n\nERROR: Target's return value is more undefined\n\nExample:\n<4 x i8> %x = < poison, #x00 (0), poison, poison >\n<4 x i8> %y = < poison, #x01 (1), poison, poison >\n\nSource:\n<4 x i1> %c = < poison, #x1 (1), poison, poison >\n\nTarget:\n<4 x i8> %add = < poison, #x01 (1), poison, poison >\n<4 x i1> %c1 = < poison, #x0 (0), poison, poison >\n<4 x i1> %c2 = < poison, #x1 (1), poison, poison >\n<4 x i1> %and = < poison, #x0 (0), poison, poison >\nSource value: < poison, #x1 (1), poison, poison >\nTarget value: < poison, #x0 (0), poison, poison >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i8_undef_lane_constant_eq_or_uge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %add = add <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  %c1 = icmp eq <4 x i8> %x, <i8 -1, i8 -1, i8 undef, i8 -1>\n  %c2 = icmp uge <4 x i8> %y, %add\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %add = add <4 x i8> %x, { 1, 1, 1, 1 }\n  %c1 = icmp eq <4 x i8> %x, { 255, 255, undef, 255 }\n  %c2 = icmp uge <4 x i8> %y, %add\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @vector_v4i8_undef_lane_constant_eq_or_uge(<4 x i8> %x, <4 x i8> %y) {\n#0:\n  %c = icmp ugt <4 x i8> %y, %x\n  ret <4 x i1> %c\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i8> %x = < #x00 (0), #x00 (0), #xff (255, -1), #x00 (0) >\n<4 x i8> %y = < #x00 (0), #x00 (0), #x00 (0), #x00 (0) >\n\nSource:\n<4 x i8> %add = < #x01 (1), #x01 (1), #x00 (0), #x01 (1) >\n<4 x i1> %c1 = < #x0 (0), #x0 (0), #x0 (0)\t[based on undef], #x0 (0) >\n<4 x i1> %c2 = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n<4 x i1> %or = < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\n\nTarget:\n<4 x i1> %c = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nSource value: < #x0 (0), #x0 (0), #x1 (1), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0091 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:16 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.4s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

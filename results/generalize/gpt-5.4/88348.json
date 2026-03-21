@@ -1,0 +1,698 @@
+{
+  "issue_id": "88348",
+  "dataset_file": "88348.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original test exposes a missed fold across a **`zext nneg` of an `add nsw` in a narrow type**, followed by adding a constant in a wider type:\n\n- narrow: `%t = add nsw i8 %v, 1`\n- widen: `%u = zext nneg i8 %t to i32`\n- wide const add: `%r = add nsw i32 %u, -1`\n\nBecause `%t` is known non-negative (`zext nneg`) and produced by an `nsw` narrow add, this is equivalent to moving the constant folding into the wide domain:\n`(zext/sext-like (X + NarrowC)) + C  ->  (sext X) + (sext NarrowC + C)` for this case.\n\nThe patch generalizes the existing `sext` fold by changing the matcher from `m_SExt(...)` to **`m_SExtLike(...)`** over **`m_NSWAddLike(...)`**. That means InstCombine now recognizes both:\n- `sext (X +nsw NarrowC)` and\n- `zext nneg (X +nsw NarrowC)`\n\nand rewrites them by:\n1. sign-extending the narrow constant into the wide type,\n2. combining it with the outer constant,\n3. extending `X` appropriately in the wide type,\n4. rebuilding the add in the wide type.\n\nThe dev tests broaden coverage beyond the motivating case by checking:\n- **positive case**: `zext nneg` + `add nsw` folds (`fold_zext_nneg_add_const`);\n- **missing `nneg`** must not fold (`fail1`);\n- **missing `nsw` on the narrow add** must not fold (`fail2`);\n- **non-add producer** (`or`) must not match (`fold_zext_addition_fail2`).\n\nSo the generalization is semantic, not just syntactic: the fold is allowed only when the narrow producer and extension together justify treating the value as sign-extend-like.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i32 @test(i8 %v) {\r\n  %switch.tableidx = add nsw i8 %v, 1\r\n  %switch.idx.cast = zext nneg i8 %switch.tableidx to i32\r\n  %switch.offset = add nsw i32 %switch.idx.cast, -1\r\n  ret i32 %switch.offset\r\n}\n\ndefine i32 @test(i8 %v) {\r\n  %ext = sext i8 %v to i32\r\n  ret i32 %ext\r\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Fold a wide add-of-constant through a sign-extend-like extension of a narrow add-with-constant when the narrow producer is provably sign-preserving in the sense required by the extension.\",\n    \"match\": {\n      \"shape\": \"%r = add [flags] WideTy %ext, WideC\\n%ext = sext NarrowTy %n to WideTy\\n   or\\n%ext = zext nneg NarrowTy %n to WideTy\\n%n = add nsw NarrowTy %x, NarrowC\",\n      \"constraints\": [\n        \"The extension must be sign-extend-like: either a real sext, or zext nneg.\",\n        \"The narrow producer must be add nsw with one operand a constant NarrowC.\",\n        \"WideC is a constant in the destination type.\",\n        \"The fold is valid only when the extension semantics justify interpreting the narrow result as sign-extended into the wide domain; zext requires nneg.\",\n        \"The source and destination integer types may be any legal widths with destination wider than source.\"\n      ],\n      \"notes\": [\n        \"Commuted forms of both adds should match.\",\n        \"The outer add may carry flags if preserved by the transform; at minimum the arithmetic value should simplify.\",\n        \"The motivating case is when WideC cancels the sign-extended NarrowC, reducing to a plain extension of %x.\"\n      ]\n    },\n    \"rewrite\": {\n      \"general_form\": \"(ExtLike (add nsw NarrowTy %x, NarrowC)) + WideC  ->  (ExtLike %x) + (ext_to_wide(NarrowC) + WideC)\",\n      \"where\": [\n        \"ExtLike is sext, or zext nneg treated as sign-extend-like.\",\n        \"ext_to_wide(NarrowC) is the sign-extension of the narrow constant into the wide type.\"\n      ],\n      \"special_case\": \"If ext_to_wide(NarrowC) + WideC == 0, the result becomes just ExtLike(%x). In the motivating zext nneg/add case, this may further canonicalize to sext %x when implied by the same reasoning.\",\n      \"example\": {\n        \"before\": \"%t = add nsw i8 %v, 1\\n%u = zext nneg i8 %t to i32\\n%r = add nsw i32 %u, -1\",\n        \"after\": \"%x = sext i8 %v to i32\\nret i32 %x\"\n      }\n    },\n    \"implementation_hint\": \"Generalize existing folds that match m_SExt(m_NSWAddLike(...)) to use m_SExtLike(m_NSWAddLike(...)), allowing zext nneg in addition to sext.\"\n  },\n  \"testcases\": [\n    {\n      \"name\": \"fold_zext_nneg_add_const_i8_to_i32_plus1_minus1\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\\n  %t = add nsw i8 %v, 1\\n  %u = zext nneg i8 %t to i32\\n  %r = add nsw i32 %u, -1\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  ret i32 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i8_to_i64_plus1_minus1\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\\n  %t = add nsw i8 %v, 1\\n  %u = zext nneg i8 %t to i64\\n  %r = add nsw i64 %u, -1\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\\n  %ext = sext i8 %v to i64\\n  ret i64 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i16_to_i32_plus1_minus1\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\\n  %t = add nsw i16 %v, 1\\n  %u = zext nneg i16 %t to i32\\n  %r = add nsw i32 %u, -1\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\\n  %ext = sext i16 %v to i32\\n  ret i32 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i16_to_i64_plus1_minus1\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\\n  %t = add nsw i16 %v, 1\\n  %u = zext nneg i16 %t to i64\\n  %r = add nsw i64 %u, -1\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\\n  %ext = sext i16 %v to i64\\n  ret i64 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i32_to_i64_plus1_minus1\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\\n  %t = add nsw i32 %v, 1\\n  %u = zext nneg i32 %t to i64\\n  %r = add nsw i64 %u, -1\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\\n  %ext = sext i32 %v to i64\\n  ret i64 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_commuted_outer_add\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\\n  %t = add nsw i8 %v, 1\\n  %u = zext nneg i8 %t to i32\\n  %r = add nsw i32 -1, %u\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  ret i32 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_commuted_inner_add\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\\n  %t = add nsw i8 1, %v\\n  %u = zext nneg i8 %t to i32\\n  %r = add nsw i32 %u, -1\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  ret i32 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_both_adds_commuted\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\\n  %t = add nsw i16 1, %v\\n  %u = zext nneg i16 %t to i64\\n  %r = add nsw i64 -1, %u\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\\n  %ext = sext i16 %v to i64\\n  ret i64 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_nonzero_residual_i8_to_i32\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\\n  %t = add nsw i8 %v, 5\\n  %u = zext nneg i8 %t to i32\\n  %r = add nsw i32 %u, -3\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  %r = add i32 %ext, 2\\n  ret i32 %r\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\\n  %t = add nsw i8 %v, -5\\n  %u = zext nneg i8 %t to i32\\n  %r = add nsw i32 %u, 8\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  %r = add i32 %ext, 3\\n  ret i32 %r\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_large_positive_residual_i16_to_i64\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\\n  %t = add nsw i16 %v, 123\\n  %u = zext nneg i16 %t to i64\\n  %r = add nsw i64 %u, 77\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\\n  %ext = sext i16 %v to i64\\n  %r = add i64 %ext, 200\\n  ret i64 %r\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_large_negative_residual_i16_to_i64\",\n      \"ir\": \"define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\\n  %t = add nsw i16 %v, -120\\n  %u = zext nneg i16 %t to i64\\n  %r = add nsw i64 %u, 20\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\\n  %ext = sext i16 %v to i64\\n  %r = add i64 %ext, -100\\n  ret i64 %r\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_zero_outer_constant\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\\n  %t = add nsw i8 %v, 9\\n  %u = zext nneg i8 %t to i32\\n  %r = add i32 %u, 0\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  %r = add i32 %ext, 9\\n  ret i32 %r\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_outer_no_nsw\",\n      \"ir\": \"define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\\n  %t = add nsw i8 %v, 1\\n  %u = zext nneg i8 %t to i32\\n  %r = add i32 %u, -1\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\\n  %ext = sext i8 %v to i32\\n  ret i32 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_widest_common_case_i8_to_i16\",\n      \"ir\": \"define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\\n  %t = add nsw i8 %v, 1\\n  %u = zext nneg i8 %t to i16\\n  %r = add nsw i16 %u, -1\\n  ret i16 %r\\n}\",\n      \"expected_optimized_ir\": \"define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\\n  %ext = sext i8 %v to i16\\n  ret i16 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i1_to_i8\",\n      \"ir\": \"define i8 @fold_zext_nneg_add_const_i1_to_i8(i1 %v) {\\n  %t = add nsw i1 %v, 0\\n  %u = zext nneg i1 %t to i8\\n  %r = add i8 %u, 0\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @fold_zext_nneg_add_const_i1_to_i8(i1 %v) {\\n  %ext = sext i1 %v to i8\\n  ret i8 %ext\\n}\"\n    },\n    {\n      \"name\": \"fold_zext_nneg_add_const_i8_to_i128\",\n      \"ir\": \"define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\\n  %t = add nsw i8 %v, 17\\n  %u = zext nneg i8 %t to i128\\n  %r = add i128 %u, -7\\n  ret i128 %r\\n}\",\n      \"expected_optimized_ir\": \"define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\\n  %ext = sext i8 %v to i128\\n  %r = add i128 %ext, 10\\n  ret i128 %r\\n}\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold a wide add-of-constant through a sign-extend-like extension of a narrow add-with-constant when the narrow producer is provably sign-preserving in the sense required by the extension.",
+      "match": {
+        "shape": "%r = add [flags] WideTy %ext, WideC\n%ext = sext NarrowTy %n to WideTy\n   or\n%ext = zext nneg NarrowTy %n to WideTy\n%n = add nsw NarrowTy %x, NarrowC",
+        "constraints": [
+          "The extension must be sign-extend-like: either a real sext, or zext nneg.",
+          "The narrow producer must be add nsw with one operand a constant NarrowC.",
+          "WideC is a constant in the destination type.",
+          "The fold is valid only when the extension semantics justify interpreting the narrow result as sign-extended into the wide domain; zext requires nneg.",
+          "The source and destination integer types may be any legal widths with destination wider than source."
+        ],
+        "notes": [
+          "Commuted forms of both adds should match.",
+          "The outer add may carry flags if preserved by the transform; at minimum the arithmetic value should simplify.",
+          "The motivating case is when WideC cancels the sign-extended NarrowC, reducing to a plain extension of %x."
+        ]
+      },
+      "rewrite": {
+        "general_form": "(ExtLike (add nsw NarrowTy %x, NarrowC)) + WideC  ->  (ExtLike %x) + (ext_to_wide(NarrowC) + WideC)",
+        "where": [
+          "ExtLike is sext, or zext nneg treated as sign-extend-like.",
+          "ext_to_wide(NarrowC) is the sign-extension of the narrow constant into the wide type."
+        ],
+        "special_case": "If ext_to_wide(NarrowC) + WideC == 0, the result becomes just ExtLike(%x). In the motivating zext nneg/add case, this may further canonicalize to sext %x when implied by the same reasoning.",
+        "example": {
+          "before": "%t = add nsw i8 %v, 1\n%u = zext nneg i8 %t to i32\n%r = add nsw i32 %u, -1",
+          "after": "%x = sext i8 %v to i32\nret i32 %x"
+        }
+      },
+      "implementation_hint": "Generalize existing folds that match m_SExt(m_NSWAddLike(...)) to use m_SExtLike(m_NSWAddLike(...)), allowing zext nneg in addition to sext."
+    },
+    "testcases": [
+      {
+        "name": "fold_zext_nneg_add_const_i8_to_i32_plus1_minus1",
+        "ir": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i8_to_i64_plus1_minus1",
+        "ir": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i16_to_i32_plus1_minus1",
+        "ir": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i16_to_i64_plus1_minus1",
+        "ir": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i32_to_i64_plus1_minus1",
+        "ir": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_commuted_outer_add",
+        "ir": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 -1, %u\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_commuted_inner_add",
+        "ir": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %t = add nsw i8 1, %v\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_both_adds_commuted",
+        "ir": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %t = add nsw i16 1, %v\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 -1, %u\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_nonzero_residual_i8_to_i32",
+        "ir": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -3\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32",
+        "ir": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, -5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 8\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_large_positive_residual_i16_to_i64",
+        "ir": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 77\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_large_negative_residual_i16_to_i64",
+        "ir": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, -120\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 20\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_zero_outer_constant",
+        "ir": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, 0\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_outer_no_nsw",
+        "ir": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, -1\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_widest_common_case_i8_to_i16",
+        "ir": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, -1\n  ret i16 %r\n}",
+        "expected_optimized_ir": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i1_to_i8",
+        "ir": "define i8 @fold_zext_nneg_add_const_i1_to_i8(i1 %v) {\n  %t = add nsw i1 %v, 0\n  %u = zext nneg i1 %t to i8\n  %r = add i8 %u, 0\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @fold_zext_nneg_add_const_i1_to_i8(i1 %v) {\n  %ext = sext i1 %v to i8\n  ret i8 %ext\n}"
+      },
+      {
+        "name": "fold_zext_nneg_add_const_i8_to_i128",
+        "ir": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add i128 %u, -7\n  ret i128 %r\n}",
+        "expected_optimized_ir": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "fold_zext_nneg_add_const_i8_to_i32_plus1_minus1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i8_to_i32_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni32 %ext = #x0000007f (127)\n\nTarget:\ni8 %t = poison\ni32 %u = poison\ni32 %r = poison\nSource value: #x0000007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i8_to_i64_plus1_minus1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %ext = sext i8 %v to i64\n  ret i64 %ext\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i8_to_i64_plus1_minus1(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni64 %ext = #x000000000000007f (127)\n\nTarget:\ni8 %t = poison\ni64 %u = poison\ni64 %r = poison\nSource value: #x000000000000007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i16_to_i32_plus1_minus1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i32\n  ret i32 %ext\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_i16_to_i32_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %v = #x7fff (32767)\n\nSource:\ni32 %ext = #x00007fff (32767)\n\nTarget:\ni16 %t = poison\ni32 %u = poison\ni32 %r = poison\nSource value: #x00007fff (32767)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i16_to_i64_plus1_minus1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i16_to_i64_plus1_minus1(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %v = #x7fff (32767)\n\nSource:\ni64 %ext = #x0000000000007fff (32767)\n\nTarget:\ni16 %t = poison\ni64 %u = poison\ni64 %r = poison\nSource value: #x0000000000007fff (32767)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i32_to_i64_plus1_minus1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %ext = sext i32 %v to i64\n  ret i64 %ext\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_i32_to_i64_plus1_minus1(i32 %v) {\n#0:\n  %t = add nsw i32 %v, 1\n  %u = zext nneg i32 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %v = #x7fffffff (2147483647)\n\nSource:\ni64 %ext = #x000000007fffffff (2147483647)\n\nTarget:\ni32 %t = poison\ni64 %u = poison\ni64 %r = poison\nSource value: #x000000007fffffff (2147483647)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_commuted_outer_add",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 -1, %u\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 4294967295, %u\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_outer_add(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni32 %ext = #x0000007f (127)\n\nTarget:\ni8 %t = poison\ni32 %u = poison\ni32 %r = poison\nSource value: #x0000007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_commuted_inner_add",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %t = add nsw i8 1, %v\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %t = add nsw i8 1, %v\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_commuted_inner_add(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni32 %ext = #x0000007f (127)\n\nTarget:\ni8 %t = poison\ni32 %u = poison\ni32 %r = poison\nSource value: #x0000007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_both_adds_commuted",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %t = add nsw i16 1, %v\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 -1, %u\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %t = add nsw i16 1, %v\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 -1, %u\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  ret i64 %ext\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_both_adds_commuted(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 1\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, -1\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %v = #x7fff (32767)\n\nSource:\ni64 %ext = #x0000000000007fff (32767)\n\nTarget:\ni16 %t = poison\ni64 %u = poison\ni64 %r = poison\nSource value: #x0000000000007fff (32767)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_nonzero_residual_i8_to_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -3\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967293\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -3\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967293\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 2\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_nonzero_residual_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967293\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x80 (128, -128)\n\nSource:\ni32 %ext = #xffffff80 (4294967168, -128)\ni32 %r = #xffffff82 (4294967170, -126)\n\nTarget:\ni8 %t = #x85 (133, -123)\ni32 %u = poison\ni32 %r = poison\nSource value: #xffffff82 (4294967170, -126)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, -5\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 8\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 251\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 8\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, -5\n  %u = zext nneg i8 %t to i32\n  %r = add nuw nsw i32 %u, 8\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 251\n  %u = zext nneg i8 %t to i32\n  %r = add nsw nuw i32 %u, 8\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n  %t = add nsw i8 %v, -5\n  %u = zext nneg i8 %t to i32\n  %r = add nuw nsw i32 %u, 8\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 3\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_negative_narrow_const_i8_to_i32(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 251\n  %u = zext nneg i8 %t to i32\n  %r = add nsw nuw i32 %u, 8\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x00 (0)\n\nSource:\ni32 %ext = #x00000000 (0)\ni32 %r = #x00000003 (3)\n\nTarget:\ni8 %t = #xfb (251, -5)\ni32 %u = poison\ni32 %r = poison\nSource value: #x00000003 (3)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_large_positive_residual_i16_to_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 77\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 77\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nuw nsw i64 %u, 77\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nsw nuw i64 %u, 77\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nuw nsw i64 %u, 77\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, 200\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_positive_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 123\n  %u = zext nneg i16 %t to i64\n  %r = add nsw nuw i64 %u, 77\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %v = #x8000 (32768, -32768)\n\nSource:\ni64 %ext = #xffffffffffff8000 (18446744073709518848, -32768)\ni64 %r = #xffffffffffff80c8 (18446744073709519048, -32568)\n\nTarget:\ni16 %t = #x807b (32891, -32645)\ni64 %u = poison\ni64 %r = poison\nSource value: #xffffffffffff80c8 (18446744073709519048, -32568)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_large_negative_residual_i16_to_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, -120\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 20\n  ret i64 %r\n}",
+          "tgt": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 65416\n  %u = zext nneg i16 %t to i64\n  %r = add nsw i64 %u, 20\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, -120\n  %u = zext nneg i16 %t to i64\n  %r = add nuw nsw i64 %u, 20\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 65416\n  %u = zext nneg i16 %t to i64\n  %r = add nsw nuw i64 %u, 20\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n  %t = add nsw i16 %v, -120\n  %u = zext nneg i16 %t to i64\n  %r = add nuw nsw i64 %u, 20\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %ext = sext i16 %v to i64\n  %r = add i64 %ext, -100\n  ret i64 %r\n}\n=>\ndefine i64 @fold_zext_nneg_add_const_large_negative_residual_i16_to_i64(i16 %v) {\n#0:\n  %t = add nsw i16 %v, 65416\n  %u = zext nneg i16 %t to i64\n  %r = add nsw nuw i64 %u, 20\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %v = #x0000 (0)\n\nSource:\ni64 %ext = #x0000000000000000 (0)\ni64 %r = #xffffffffffffff9c (18446744073709551516, -100)\n\nTarget:\ni16 %t = #xff88 (65416, -120)\ni64 %u = poison\ni64 %r = poison\nSource value: #xffffffffffffff9c (18446744073709551516, -100)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_zero_outer_constant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, 0\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, 0\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  ret i32 %u\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  ret i32 %u\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  ret i32 %u\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  %r = add i32 %ext, 9\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_zero_outer_constant(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 9\n  %u = zext nneg i8 %t to i32\n  ret i32 %u\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x80 (128, -128)\n\nSource:\ni32 %ext = #xffffff80 (4294967168, -128)\ni32 %r = #xffffff89 (4294967177, -119)\n\nTarget:\ni8 %t = #x89 (137, -119)\ni32 %u = poison\nSource value: #xffffff89 (4294967177, -119)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_outer_no_nsw",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, -1\n  ret i32 %r\n}",
+          "tgt": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, -1\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %ext = sext i8 %v to i32\n  ret i32 %ext\n}\n=>\ndefine i32 @fold_zext_nneg_add_const_outer_no_nsw(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i32\n  %r = add nsw i32 %u, 4294967295\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni32 %ext = #x0000007f (127)\n\nTarget:\ni8 %t = poison\ni32 %u = poison\ni32 %r = poison\nSource value: #x0000007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_widest_common_case_i8_to_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, -1\n  ret i16 %r\n}",
+          "tgt": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, 65535\n  ret i16 %r\n}\n=>\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, -1\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}",
+          "log": "\n----------------------------------------\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, 65535\n  ret i16 %r\n}\n=>\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, -1\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %ext = sext i8 %v to i16\n  ret i16 %ext\n}\n=>\ndefine i16 @fold_zext_nneg_add_const_widest_common_case_i8_to_i16(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 1\n  %u = zext nneg i8 %t to i16\n  %r = add nsw i16 %u, 65535\n  ret i16 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x7f (127)\n\nSource:\ni16 %ext = #x007f (127)\n\nTarget:\ni8 %t = poison\ni16 %u = poison\ni16 %r = poison\nSource value: #x007f (127)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i1_to_i8",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_zext_nneg_add_const_i8_to_i128",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add i128 %u, -7\n  ret i128 %r\n}",
+          "tgt": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}",
+          "log": "\n----------------------------------------\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add i128 %u, 340282366920938463463374607431768211449\n  ret i128 %r\n}\n=>\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add nsw i128 %u, -7\n  ret i128 %r\n}\n",
+          "tgt": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}",
+          "log": "\n----------------------------------------\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add nsw i128 %u, 340282366920938463463374607431768211449\n  ret i128 %r\n}\n=>\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add nsw i128 %u, -7\n  ret i128 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %ext = sext i8 %v to i128\n  %r = add i128 %ext, 10\n  ret i128 %r\n}\n=>\ndefine i128 @fold_zext_nneg_add_const_i8_to_i128(i8 %v) {\n#0:\n  %t = add nsw i8 %v, 17\n  %u = zext nneg i8 %t to i128\n  %r = add nsw i128 %u, 340282366920938463463374607431768211449\n  ret i128 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %v = #x80 (128, -128)\n\nSource:\ni128 %ext = #xffffffffffffffffffffffffffffff80 (340282366920938463463374607431768211328, -128)\ni128 %r = #xffffffffffffffffffffffffffffff8a (340282366920938463463374607431768211338, -118)\n\nTarget:\ni8 %t = #x91 (145, -111)\ni128 %u = poison\ni128 %r = poison\nSource value: #xffffffffffffffffffffffffffffff8a (340282366920938463463374607431768211338, -118)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

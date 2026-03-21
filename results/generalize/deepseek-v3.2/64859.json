@@ -1,0 +1,572 @@
+{
+  "issue_id": "64859",
+  "dataset_file": "64859.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\n## Elements Frequently Missed\n\n- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.\n- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.\n- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.\n- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.\n- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.\n- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.\n- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.\n- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.\n- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.\n- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.\n- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.\n- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Overly Specific Pattern Matching\n\nMany optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:\n\n- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)\n- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations\n- Parameterizing type constraints rather than hardcoding bit widths\n- Extracting core mathematical/algebraic properties rather than matching surface syntax\n\n### Pattern 2: Overly Restrictive Preconditions\n\nOptimizations frequently included unnecessary guards that blocked valid transformations:\n\n- Type restrictions (scalar-only, specific bit widths) that weren't semantically required\n- Single-use constraints that could be relaxed with profitability analysis\n- Declaration-specific guards that prevented optimizing calls to external functions\n- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases\n\n### Pattern 3: Incomplete Intrinsic Recognition\n\nTransformations involving intrinsics often missed:\n\n- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)\n- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)\n- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)\n- Flag propagation when creating or replacing intrinsics\n\n### Pattern 4: Comparison Predicate Handling\n\nOptimizations involving comparisons frequently missed:\n\n- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)\n- Signed-to-unsigned predicate conversion when operands have known signs\n- Predicate swapping when operands are commuted\n- The `samesign` attribute and its implications for predicate canonicalization\n\n### Pattern 5: Control Flow and PHI Node Transformations\n\nTransformations involving PHI nodes often failed to handle:\n\n- Loop backedges causing infinite combine loops\n- Multiple predecessors with different source values\n- Moving operations into predecessor blocks safely\n- Critical edges and dominance relationships\n\n### Pattern 6: Bitwise and Shift Operation Idioms\n\nComplex bit manipulation patterns were frequently missed:\n\n- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)\n- Mask decomposition for comparisons (`(X & Mask) == C` patterns)\n- Distributivity of operations over bitwise operations (`add` over `min/max`)\n- `disjoint` flag enabling xor distribution over or\n\n### Pattern 7: Select Instruction Folding\n\nSelect-based patterns often missed:\n\n- Folding operations into select arms when one arm simplifies\n- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)\n- Handling vector conditions in select-shuffle folding\n- Poison safety when condition could be poison\n\n### Pattern 8: Memory and Pointer Operations\n\nTransformations involving memory operations frequently missed:\n\n- Address space semantics and pointer validity\n- Null pointer undefined behavior across address spaces\n- Load sinking past calls with proper alias analysis\n- GEP canonicalization and constant offset folding\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %i = zext i1 %arg to i32\r\n  %i2 = zext i1 %arg1 to i32\r\n  %i3 = add nuw nsw i32 %i2, %i\r\n  %i4 = icmp eq i32 %i3, 1\r\n  ret i1 %i4\r\n}\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %xor = xor i1 %arg, %arg1\r\n  ret i1 %xor\r\n}\n",
+  "model_output": "```json\n{\n    \"pattern\": \"Recognize that `icmp eq (add nuw nsw (zext i1 X), (zext i1 Y)), 1` simplifies to `xor X, Y` when the add has `nuw nsw` flags. This pattern occurs because adding two zero-extended i1 values (0 or 1) with `nuw nsw` guarantees the result is 0, 1, or 2. The only way to get result=1 is when exactly one operand is 1, which matches XOR semantics.\",\n    \"testcases\": [\n        {\n            \"name\": \"basic_case_commuted_add\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %zb\\n  %cmp = icmp eq i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"vector_fixed_width\",\n            \"ir\": \"define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\\n  %za = zext <4 x i1> %a to <4 x i32>\\n  %zb = zext <4 x i1> %b to <4 x i32>\\n  %sum = add nuw nsw <4 x i32> %za, %zb\\n  %cmp = icmp eq <4 x i32> %sum, <i32 1, i32 1, i32 1, i32 1>\\n  ret <4 x i1> %cmp\\n}\",\n            \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\\n  %xor = xor <4 x i1> %a, %b\\n  ret <4 x i1> %xor\\n}\"\n        },\n        {\n            \"name\": \"vector_splat_constant\",\n            \"ir\": \"define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\\n  %za = zext <2 x i1> %a to <2 x i16>\\n  %zb = zext <2 x i1> %b to <2 x i16>\\n  %sum = add nuw nsw <2 x i16> %za, %zb\\n  %cmp = icmp eq <2 x i16> %sum, <i16 1, i16 1>\\n  ret <2 x i1> %cmp\\n}\",\n            \"expected_optimized_ir\": \"define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\\n  %xor = xor <2 x i1> %a, %b\\n  ret <2 x i1> %xor\\n}\"\n        },\n        {\n            \"name\": \"different_integer_types\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i64\\n  %zb = zext i1 %b to i64\\n  %sum = add nuw nsw i64 %za, %zb\\n  %cmp = icmp eq i64 %sum, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"commuted_icmp_operands\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %zb\\n  %cmp = icmp eq i32 1, %sum\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"multiple_uses_of_zext\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %zb\\n  %cmp1 = icmp eq i32 %sum, 1\\n  %cmp2 = icmp ult i32 %sum, 3\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  %cmp2 = icmp ult i32 0, 3\\n  %and = and i1 %xor, %cmp2\\n  ret i1 %and\\n}\"\n        },\n        {\n            \"name\": \"nuw_only\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw i32 %za, %zb\\n  %cmp = icmp eq i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"nsw_only\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nsw i32 %za, %zb\\n  %cmp = icmp eq i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"no_flags_still_valid\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add i32 %za, %zb\\n  %cmp = icmp eq i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"sext_instead_of_zext\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %sa = sext i1 %a to i32\\n  %sb = sext i1 %b to i32\\n  %sum = add nsw i32 %sa, %sb\\n  %cmp = icmp eq i32 %sum, 0\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"sext_with_nuw_nsw\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %sa = sext i1 %a to i32\\n  %sb = sext i1 %b to i32\\n  %sum = add nuw nsw i32 %sa, %sb\\n  %cmp = icmp eq i32 %sum, 0\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"different_cmp_predicate_ult\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %zb\\n  %cmp = icmp ult i32 %sum, 2\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"different_cmp_predicate_ugt\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %zb\\n  %cmp = icmp ugt i32 %sum, 0\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %or = or i1 %a, %b\\n  ret i1 %or\\n}\"\n        },\n        {\n            \"name\": \"chain_of_adds\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b, i1 %c) {\\n  %za = zext i1 %a to i32\\n  %zb = zext i1 %b to i32\\n  %zc = zext i1 %c to i32\\n  %sum1 = add nuw nsw i32 %za, %zb\\n  %sum2 = add nuw nsw i32 %sum1, %zc\\n  %cmp = icmp eq i32 %sum2, 1\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b, i1 %c) {\\n  %xor1 = xor i1 %a, %b\\n  %xor2 = xor i1 %xor1, %c\\n  ret i1 %xor2\\n}\"\n        },\n        {\n            \"name\": \"mixed_sext_zext\",\n            \"ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %za = zext i1 %a to i32\\n  %sb = sext i1 %b to i32\\n  %sum = add nuw nsw i32 %za, %sb\\n  %cmp = icmp eq i32 %sum, 0\\n  ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b) {\\n  %xor = xor i1 %a, %b\\n  ret i1 %xor\\n}\"\n        },\n        {\n            \"name\": \"scalable_vector_sve\",\n            \"ir\": \"define <vscale x 4 x i1> @test(<vscale x 4 x i1> %a, <vscale x 4 x i1> %b) {\\n  %za = zext <vscale x 4 x i1> %a to <vscale x 4 x i32>\\n  %zb = zext <vscale x 4 x i1> %b to <vscale x 4 x i32>\\n  %sum = add nuw nsw <vscale x 4 x i32> %za, %zb\\n  %cmp = icmp eq <vscale x 4 x i32> %sum, splat (i32 1)\\n  ret <vscale x 4 x i1> %cmp\\n}\",\n            \"expected_optimized_ir\": \"define <vscale x 4 x i1> @test(<vscale x 4 x i1> %a, <vscale x 4 x i1> %b) {\\n  %xor = xor <vscale x 4 x i1> %a, %b\\n  ret <vscale x 4 x i1> %xor\\n}\"\n        }\n    ]\n}\n```",
+  "parsed": {
+    "pattern": "Recognize that `icmp eq (add nuw nsw (zext i1 X), (zext i1 Y)), 1` simplifies to `xor X, Y` when the add has `nuw nsw` flags. This pattern occurs because adding two zero-extended i1 values (0 or 1) with `nuw nsw` guarantees the result is 0, 1, or 2. The only way to get result=1 is when exactly one operand is 1, which matches XOR semantics.",
+    "testcases": [
+      {
+        "name": "basic_case_commuted_add",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "vector_fixed_width",
+        "ir": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nuw nsw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}"
+      },
+      {
+        "name": "vector_splat_constant",
+        "ir": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nuw nsw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, <i16 1, i16 1>\n  ret <2 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}"
+      },
+      {
+        "name": "different_integer_types",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nuw nsw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "commuted_icmp_operands",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 1, %sum\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "multiple_uses_of_zext",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  %cmp2 = icmp ult i32 %sum, 3\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}"
+      },
+      {
+        "name": "nuw_only",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "nsw_only",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "no_flags_still_valid",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "sext_instead_of_zext",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nsw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "sext_with_nuw_nsw",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nuw nsw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "different_cmp_predicate_ult",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp ult i32 %sum, 2\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "different_cmp_predicate_ugt",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp ugt i32 %sum, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %or = or i1 %a, %b\n  ret i1 %or\n}"
+      },
+      {
+        "name": "chain_of_adds",
+        "ir": "define i1 @test(i1 %a, i1 %b, i1 %c) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %zc = zext i1 %c to i32\n  %sum1 = add nuw nsw i32 %za, %zb\n  %sum2 = add nuw nsw i32 %sum1, %zc\n  %cmp = icmp eq i32 %sum2, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b, i1 %c) {\n  %xor1 = xor i1 %a, %b\n  %xor2 = xor i1 %xor1, %c\n  ret i1 %xor2\n}"
+      },
+      {
+        "name": "mixed_sext_zext",
+        "ir": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}"
+      },
+      {
+        "name": "scalable_vector_sve",
+        "ir": "define <vscale x 4 x i1> @test(<vscale x 4 x i1> %a, <vscale x 4 x i1> %b) {\n  %za = zext <vscale x 4 x i1> %a to <vscale x 4 x i32>\n  %zb = zext <vscale x 4 x i1> %b to <vscale x 4 x i32>\n  %sum = add nuw nsw <vscale x 4 x i32> %za, %zb\n  %cmp = icmp eq <vscale x 4 x i32> %sum, splat (i32 1)\n  ret <vscale x 4 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <vscale x 4 x i1> @test(<vscale x 4 x i1> %a, <vscale x 4 x i1> %b) {\n  %xor = xor <vscale x 4 x i1> %a, %b\n  ret <vscale x 4 x i1> %xor\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_case_commuted_add",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_fixed_width",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nuw nsw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i1> %cmp\n}",
+          "tgt": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nsw nuw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, { 1, 1, 1, 1 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nuw nsw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i1> %cmp\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nsw nuw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, { 1, 1, 1, 1 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nuw nsw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i1> %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %xor = xor <4 x i1> %a, %b\n  ret <4 x i1> %xor\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %a, <4 x i1> %b) {\n#0:\n  %za = zext <4 x i1> %a to <4 x i32>\n  %zb = zext <4 x i1> %b to <4 x i32>\n  %sum = add nsw nuw <4 x i32> %za, %zb\n  %cmp = icmp eq <4 x i32> %sum, { 1, 1, 1, 1 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_splat_constant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nuw nsw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, <i16 1, i16 1>\n  ret <2 x i1> %cmp\n}",
+          "tgt": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nsw nuw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, { 1, 1 }\n  ret <2 x i1> %cmp\n}\n=>\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nuw nsw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, <i16 1, i16 1>\n  ret <2 x i1> %cmp\n}\n",
+          "tgt": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nsw nuw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, { 1, 1 }\n  ret <2 x i1> %cmp\n}\n=>\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nuw nsw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, <i16 1, i16 1>\n  ret <2 x i1> %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %xor = xor <2 x i1> %a, %b\n  ret <2 x i1> %xor\n}\n=>\ndefine <2 x i1> @test(<2 x i1> %a, <2 x i1> %b) {\n#0:\n  %za = zext <2 x i1> %a to <2 x i16>\n  %zb = zext <2 x i1> %b to <2 x i16>\n  %sum = add nsw nuw <2 x i16> %za, %zb\n  %cmp = icmp eq <2 x i16> %sum, { 1, 1 }\n  ret <2 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_integer_types",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nuw nsw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nsw nuw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nuw nsw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nsw nuw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nuw nsw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i64\n  %zb = zext i1 %b to i64\n  %sum = add nsw nuw i64 %za, %zb\n  %cmp = icmp eq i64 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_icmp_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 1, %sum\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 1, %sum\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multiple_uses_of_zext",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  %cmp2 = icmp ult i32 %sum, 3\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  %cmp2 = icmp ult i32 %sum, 3\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  ret i1 %cmp1\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  ret i1 %cmp1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  %cmp2 = icmp ult i32 0, 3\n  %and = and i1 %xor, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp1 = icmp eq i32 %sum, 1\n  ret i1 %cmp1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_only",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nsw_only",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_flags_still_valid",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sext_instead_of_zext",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nsw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nsw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x0 (0)\n\nSource:\ni32 %sa = #x00000000 (0)\ni32 %sb = #x00000000 (0)\ni32 %sum = #x00000000 (0)\ni1 %cmp = #x1 (1)\n\nTarget:\ni1 %xor = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "sext_with_nuw_nsw",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nuw nsw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %sa = sext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nsw nuw i32 %sa, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x0 (0)\n\nSource:\ni32 %sa = #x00000000 (0)\ni32 %sb = #x00000000 (0)\ni32 %sum = #x00000000 (0)\ni1 %cmp = #x1 (1)\n\nTarget:\ni1 %xor = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_cmp_predicate_ult",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp ult i32 %sum, 2\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp ult i32 %sum, 2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x0 (0)\n\nSource:\ni32 %za = #x00000000 (0)\ni32 %zb = #x00000000 (0)\ni32 %sum = #x00000000 (0)\ni1 %cmp = #x1 (1)\n\nTarget:\ni1 %xor = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_cmp_predicate_ugt",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %zb\n  %cmp = icmp ugt i32 %sum, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %or = or i1 %a, %b\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %zb\n  %cmp = icmp ugt i32 %sum, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %or = or i1 %a, %b\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %1 = or i1 %a, %b\n  ret i1 %1\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %or = or i1 %a, %b\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %#1 = or i1 %a, %b\n  ret i1 %#1\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %or = or i1 %a, %b\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %or = or i1 %a, %b\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b) {\n  %1 = or i1 %a, %b\n  ret i1 %1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %or = or i1 %a, %b\n  ret i1 %or\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %#1 = or i1 %a, %b\n  ret i1 %#1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "chain_of_adds",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 3,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b, i1 %c) {\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %zc = zext i1 %c to i32\n  %sum1 = add nuw nsw i32 %za, %zb\n  %sum2 = add nuw nsw i32 %sum1, %zc\n  %cmp = icmp eq i32 %sum2, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b, i1 %c) {\n  %xor1 = xor i1 %a, %b\n  %xor2 = xor i1 %xor1, %c\n  ret i1 %xor2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\n#0:\n  %za = zext i1 %a to i32\n  %zb = zext i1 %b to i32\n  %zc = zext i1 %c to i32\n  %sum1 = add nsw nuw i32 %za, %zb\n  %sum2 = add nsw nuw i32 %sum1, %zc\n  %cmp = icmp eq i32 %sum2, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\n#0:\n  %xor1 = xor i1 %a, %b\n  %xor2 = xor i1 %xor1, %c\n  ret i1 %xor2\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %a = #x1 (1)\ni1 %b = #x1 (1)\ni1 %c = #x1 (1)\n\nSource:\ni32 %za = #x00000001 (1)\ni32 %zb = #x00000001 (1)\ni32 %zc = #x00000001 (1)\ni32 %sum1 = #x00000002 (2)\ni32 %sum2 = #x00000003 (3)\ni1 %cmp = #x0 (0)\n\nTarget:\ni1 %xor1 = #x0 (0)\ni1 %xor2 = #x1 (1)\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "mixed_sext_zext",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b) {\n  %za = zext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nuw nsw i32 %za, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b) {\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %za = zext i1 %a to i32\n  %sb = sext i1 %b to i32\n  %sum = add nsw nuw i32 %za, %sb\n  %cmp = icmp eq i32 %sum, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b) {\n#0:\n  %xor = xor i1 %a, %b\n  ret i1 %xor\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x0 (0)\n\nSource:\ni32 %za = #x00000000 (0)\ni32 %sb = #x00000000 (0)\ni32 %sum = #x00000000 (0)\ni1 %cmp = #x1 (1)\n\nTarget:\ni1 %xor = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalable_vector_sve",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.7s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,379 @@
+{
+  "issue_id": "122388-orig",
+  "dataset_file": "122388-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine noundef i64 @test(i64 noundef %x) {\n  %x2 = shl nuw i64 %x, 1\n  %x1 = add i64 %x, 1\n  %max = tail call noundef i64 @llvm.umax.i64(i64 %x2, i64 %x1)\n  ret i64 %max\n}\n\ndefine noundef range(i64 1, 0) i64 @test(i64 noundef %x) {\n  %eq = icmp eq i64 %x, 0\n  %x2 = shl nuw i64 %x, 1\n  %max = select i1 %eq, i64 1, i64 %x2\n  ret i64 %max\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"The missed optimization involves folding the pattern `umax(X << 1, X + 1)` (with `nuw` on the shift) into a conditional select. Because `X << 1` is greater than or equal to `X + 1` for all unsigned integers `X` except `X=0` (where `X+1` wins), the result is equivalent to `select(X == 0, 1, X << 1)`. InstCombine currently misses this specific canonicalization.\",\n  \"before_after\": \"Input: `umax(shl nuw %x, 1), add(%x, 1))`\\nOutput: `select(eq(%x, 0), 1, shl nuw(%x, 1))`\",\n  \"preconditions\": [\n    \"The shift/multiply must have the `nuw` (No Unsigned Wrap) flag. This guarantees that `X << 1` does not wrap to 0 for large values of X, ensuring the inequality `2X >= X + 1` holds for `X >= 1`.\",\n    \"The operation must be an unsigned max (`umax`) or an equivalent `select` with `uge` (Unsigned Greater or Equal).\",\n    \"The shift amount must be 1 (equivalent to multiplying by 2).\",\n    \"The addend must be 1.\",\n    \"The operands being compared must be the same value `X` (modulo commutativity).\"\n  ],\n  \"pattern\": \"Canonicalize `umax(shl nuw X, 1), add(X, 1)` -> `select(X == 0, 1, shl nuw X, 1)`.\\n\\nLogic:\\n1. For unsigned X: `2X >= X + 1` simplifies to `X >= 1`.\\n2. If `X == 0`: `2X == 0`, `X + 1 == 1`. Max is 1.\\n3. If `X >= 1`: `2X >= X + 1` (due to `nuw` preventing wrap). Max is `2X`.\\n4. Result is `2X` masked by `X != 0`, else `1`.\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_i64\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %cmp = icmp eq i64 %x, 0\\n  %res = select i1 %cmp, i64 1, i64 %x\\n  %shl = shl nuw i64 %res, 1\\n  ret i64 %shl\\n}\\n; Note: InstCombine might simplify further to `select (x==0) ? 1 : (x<<1)`\",\n      \"why\": \"Standard case from the prompt, verifying the core fold.\"\n    },\n    {\n      \"name\": \"basic_i32\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %shl = shl nuw i32 %x, 1\\n  %add = add i32 %x, 1\\n  %max = call i32 @llvm.umax.i32(i32 %shl, i32 %add)\\n  ret i32 %max\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %cmp = icmp eq i32 %x, 0\\n  %max = select i1 %cmp, i32 1, i32 %shl\\n  %shl = shl nuw i32 %x, 1\\n  ret i32 %max\\n}\",\n      \"why\": \"Verifies the pattern works for different bitwidths (i32).\"\n    },\n    {\n      \"name\": \"vector_form\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %max = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %shl, <4 x i32> %add)\\n  ret <4 x i32> %max\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %sel = select <4 x i1> %cmp, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> %shl\\n  ret <4 x i32> %sel\\n}\",\n      \"why\": \"Verifies vectorization support.\"\n    },\n    {\n      \"name\": \"select_uge_form\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %cmp = icmp uge i64 %shl, %add\\n  %sel = select i1 %cmp, i64 %shl, i64 %add\\n  ret i64 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %cmp = icmp eq i64 %x, 0\\n  %shl = shl nuw i64 %x, 1\\n  %sel = select i1 %cmp, i64 1, i64 %shl\\n  ret i64 %sel\\n}\",\n      \"why\": \"Verifies the fold works when `umax` is represented as `select` + `icmp uge`.\"\n    },\n    {\n      \"name\": \"mul_form\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %mul = mul nuw i64 %x, 2\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %mul, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %cmp = icmp eq i64 %x, 0\\n  %mul = mul nuw i64 %x, 2\\n  %max = select i1 %cmp, i64 1, i64 %mul\\n  ret i64 %max\\n}\",\n      \"why\": \"Verifies that `mul nuw X, 2` is treated identically to `shl nuw X, 1`.\"\n    },\n    {\n      \"name\": \"no_nuw_negative\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %shl = shl i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %shl = shl i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"why\": \"Verifies that the `nuw` flag is strictly required. Without it, if X is large (e.g. 0x8...0), `shl` wraps to 0, making `add` the max, whereas the fold would incorrectly output 0.\"\n    },\n    {\n      \"name\": \"commutative_add_first\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %add, i64 %shl)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %cmp = icmp eq i64 %x, 0\\n  %shl = shl nuw i64 %x, 1\\n  %max = select i1 %cmp, i64 1, i64 %shl\\n  ret i64 %max\\n}\",\n      \"why\": \"Verifies matching is commutative (umax(add, shl)).\"\n    },\n    {\n      \"name\": \"complex_operand\",\n      \"ir\": \"define i64 @test(i64 %a, i64 %b) {\\n  %x = add i64 %a, %b\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %a, i64 %b) {\\n  %x = add i64 %a, %b\\n  %cmp = icmp eq i64 %x, 0\\n  %shl = shl nuw i64 %x, 1\\n  %max = select i1 %cmp, i64 1, i64 %shl\\n  ret i64 %max\\n}\",\n      \"why\": \"Verifies that `X` can be a complex expression, not just a function argument.\"\n    },\n    {\n      \"name\": \"boundary_check_x1\",\n      \"ir\": \"define i64 @test() {\\n  %x = add i64 0, 1\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test() {\\n  ret i64 2\\n}\",\n      \"why\": \"Constant folding check: X=1. 2*1=2, 1+1=2. Max is 2.\"\n    },\n    {\n      \"name\": \"boundary_check_x0\",\n      \"ir\": \"define i64 @test() {\\n  %x = add i64 0, 0\\n  %shl = shl nuw i64 %x, 1\\n  %add = add i64 %x, 1\\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\\n  ret i64 %max\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test() {\\n  ret i64 1\\n}\",\n      \"why\": \"Constant folding check: X=0. 2*0=0, 0+1=1. Max is 1.\"\n    }\n  ],\n  \"implementation_notes\": \"The implementation should reside in `InstCombine` or the `IntrinsicInst` folder. It should match the pattern of `umax` (or `select uge`) where the two operands are `shl nuw X, 1` and `add X, 1`.\\n\\n1. Match `UMax(P0, P1)` or `Select(ICmp UGE P0, P1, P0, P1)`.\\n2. Check if one operand is `Shl NUW X, C1` and the other is `Add X, C2`.\\n3. Check if `C1 == 1` and `C2 == 1`.\\n4. If so, the condition `Shl >= Add` simplifies to `X >= 1` (for unsigned X).\\n5. Replace with `Select(X == 0, Add, Shl)`.\\n\\nNote: `Add` can be folded to constant 1 in the true arm if X is known to be 0.\",\n  \"regression_test_notes\": \"Create a file `llvm/test/Transforms/InstCombine/umax-shift-add.ll`. Add `RUN: opt -passes=instcombine -S < %s | FileCheck %s`. Use the test cases above to verify correct folding and correct preservation of the `nuw` flag.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "The missed optimization involves folding the pattern `umax(X << 1, X + 1)` (with `nuw` on the shift) into a conditional select. Because `X << 1` is greater than or equal to `X + 1` for all unsigned integers `X` except `X=0` (where `X+1` wins), the result is equivalent to `select(X == 0, 1, X << 1)`. InstCombine currently misses this specific canonicalization.",
+    "before_after": "Input: `umax(shl nuw %x, 1), add(%x, 1))`\nOutput: `select(eq(%x, 0), 1, shl nuw(%x, 1))`",
+    "preconditions": [
+      "The shift/multiply must have the `nuw` (No Unsigned Wrap) flag. This guarantees that `X << 1` does not wrap to 0 for large values of X, ensuring the inequality `2X >= X + 1` holds for `X >= 1`.",
+      "The operation must be an unsigned max (`umax`) or an equivalent `select` with `uge` (Unsigned Greater or Equal).",
+      "The shift amount must be 1 (equivalent to multiplying by 2).",
+      "The addend must be 1.",
+      "The operands being compared must be the same value `X` (modulo commutativity)."
+    ],
+    "pattern": "Canonicalize `umax(shl nuw X, 1), add(X, 1)` -> `select(X == 0, 1, shl nuw X, 1)`.\n\nLogic:\n1. For unsigned X: `2X >= X + 1` simplifies to `X >= 1`.\n2. If `X == 0`: `2X == 0`, `X + 1 == 1`. Max is 1.\n3. If `X >= 1`: `2X >= X + 1` (due to `nuw` preventing wrap). Max is `2X`.\n4. Result is `2X` masked by `X != 0`, else `1`.",
+    "testcases": [
+      {
+        "name": "basic_i64",
+        "ir": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %res = select i1 %cmp, i64 1, i64 %x\n  %shl = shl nuw i64 %res, 1\n  ret i64 %shl\n}\n; Note: InstCombine might simplify further to `select (x==0) ? 1 : (x<<1)`",
+        "why": "Standard case from the prompt, verifying the core fold."
+      },
+      {
+        "name": "basic_i32",
+        "ir": "define i32 @test(i32 %x) {\n  %shl = shl nuw i32 %x, 1\n  %add = add i32 %x, 1\n  %max = call i32 @llvm.umax.i32(i32 %shl, i32 %add)\n  ret i32 %max\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %cmp = icmp eq i32 %x, 0\n  %max = select i1 %cmp, i32 1, i32 %shl\n  %shl = shl nuw i32 %x, 1\n  ret i32 %max\n}",
+        "why": "Verifies the pattern works for different bitwidths (i32)."
+      },
+      {
+        "name": "vector_form",
+        "ir": "define <4 x i32> @test(<4 x i32> %x) {\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %max = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %shl, <4 x i32> %add)\n  ret <4 x i32> %max\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x) {\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %sel = select <4 x i1> %cmp, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> %shl\n  ret <4 x i32> %sel\n}",
+        "why": "Verifies vectorization support."
+      },
+      {
+        "name": "select_uge_form",
+        "ir": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %cmp = icmp uge i64 %shl, %add\n  %sel = select i1 %cmp, i64 %shl, i64 %add\n  ret i64 %sel\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}",
+        "why": "Verifies the fold works when `umax` is represented as `select` + `icmp uge`."
+      },
+      {
+        "name": "mul_form",
+        "ir": "define i64 @test(i64 %x) {\n  %mul = mul nuw i64 %x, 2\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %mul, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}",
+        "why": "Verifies that `mul nuw X, 2` is treated identically to `shl nuw X, 1`."
+      },
+      {
+        "name": "no_nuw_negative",
+        "ir": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "why": "Verifies that the `nuw` flag is strictly required. Without it, if X is large (e.g. 0x8...0), `shl` wraps to 0, making `add` the max, whereas the fold would incorrectly output 0."
+      },
+      {
+        "name": "commutative_add_first",
+        "ir": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %add, i64 %shl)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+        "why": "Verifies matching is commutative (umax(add, shl))."
+      },
+      {
+        "name": "complex_operand",
+        "ir": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+        "why": "Verifies that `X` can be a complex expression, not just a function argument."
+      },
+      {
+        "name": "boundary_check_x1",
+        "ir": "define i64 @test() {\n  %x = add i64 0, 1\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test() {\n  ret i64 2\n}",
+        "why": "Constant folding check: X=1. 2*1=2, 1+1=2. Max is 2."
+      },
+      {
+        "name": "boundary_check_x0",
+        "ir": "define i64 @test() {\n  %x = add i64 0, 0\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+        "expected_optimized_ir": "define i64 @test() {\n  ret i64 1\n}",
+        "why": "Constant folding check: X=0. 2*0=0, 0+1=1. Max is 1."
+      }
+    ],
+    "implementation_notes": "The implementation should reside in `InstCombine` or the `IntrinsicInst` folder. It should match the pattern of `umax` (or `select uge`) where the two operands are `shl nuw X, 1` and `add X, 1`.\n\n1. Match `UMax(P0, P1)` or `Select(ICmp UGE P0, P1, P0, P1)`.\n2. Check if one operand is `Shl NUW X, C1` and the other is `Add X, C2`.\n3. Check if `C1 == 1` and `C2 == 1`.\n4. If so, the condition `Shl >= Add` simplifies to `X >= 1` (for unsigned X).\n5. Replace with `Select(X == 0, Add, Shl)`.\n\nNote: `Add` can be folded to constant 1 in the true arm if X is known to be 0.",
+    "regression_test_notes": "Create a file `llvm/test/Transforms/InstCombine/umax-shift-add.ll`. Add `RUN: opt -passes=instcombine -S < %s | FileCheck %s`. Use the test cases above to verify correct folding and correct preservation of the `nuw` flag.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "basic_i64",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %res = select i1 %cmp, i64 1, i64 %x\n  %shl = shl nuw i64 %res, 1\n  ret i64 %shl\n}\n; Note: InstCombine might simplify further to `select (x==0) ? 1 : (x<<1)`",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %res = select i1 %cmp, i64 1, i64 %x\n  %shl = shl nuw i64 %res, 1\n  ret i64 %shl\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni64 %x = #x0000000000000000 (0)\n\nSource:\ni64 %shl = #x0000000000000000 (0)\ni64 %add = #x0000000000000001 (1)\ni64 %max = #x0000000000000001 (1)\n\nTarget:\ni1 %cmp = #x1 (1)\ni64 %res = #x0000000000000001 (1)\ni64 %shl = #x0000000000000002 (2)\nSource value: #x0000000000000001 (1)\nTarget value: #x0000000000000002 (2)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "basic_i32",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": "Command '['/data/btguan/auto-opt/utils/alive2/build/alive-tv', '--disable-undef-input', '/tmp/tmpq8nknnp8', '/tmp/tmp_3aqat14', '-src-unroll=8', '-tgt-unroll=8']' returned non-zero exit status 255.\nInstruction does not dominate all uses!\n  %shl = shl nuw i32 %x, 1\n  %max = select i1 %cmp, i32 1, i32 %shl\nTarget file is broken\n",
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_form",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x) {\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %max = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %shl, <4 x i32> %add)\n  ret <4 x i32> %max\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x) {\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %sel = select <4 x i1> %cmp, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> %shl\n  ret <4 x i32> %sel\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %max = umax <4 x i32> %shl, %add\n  ret <4 x i32> %max\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %sel = select <4 x i1> %cmp, <4 x i32> { 1, 1, 1, 1 }, <4 x i32> %shl\n  ret <4 x i32> %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x) {\n  %shl = shl nuw <4 x i32> %x, splat (i32 1)\n  %add = add <4 x i32> %x, splat (i32 1)\n  %max = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %shl, <4 x i32> %add)\n  ret <4 x i32> %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.umax.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x) {\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %sel = select <4 x i1> %cmp, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> %shl\n  ret <4 x i32> %sel\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %max = umax <4 x i32> %shl, %add\n  ret <4 x i32> %max\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %sel = select <4 x i1> %cmp, <4 x i32> { 1, 1, 1, 1 }, <4 x i32> %shl\n  ret <4 x i32> %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x) {\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %shl = shl nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %sel = select <4 x i1> %cmp, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> %shl\n  ret <4 x i32> %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x) {\n  %shl = shl nuw <4 x i32> %x, splat (i32 1)\n  %add = add <4 x i32> %x, splat (i32 1)\n  %max = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %shl, <4 x i32> %add)\n  ret <4 x i32> %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.umax.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %sel = select <4 x i1> %cmp, <4 x i32> { 1, 1, 1, 1 }, <4 x i32> %shl\n  ret <4 x i32> %sel\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %shl = shl nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %max = umax <4 x i32> %shl, %add\n  ret <4 x i32> %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "select_uge_form",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %cmp = icmp uge i64 %shl, %add\n  %sel = select i1 %cmp, i64 %shl, i64 %add\n  ret i64 %sel\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %cmp = icmp uge i64 %shl, %add\n  %sel = select i1 %cmp, i64 %shl, i64 %add\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %sel = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %sel\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %sel = umax i64 %shl, %add\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %sel = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %sel\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %sel = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %sel = umax i64 %shl, %add\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mul_form",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %mul = mul nuw i64 %x, 2\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %mul, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %mul = mul nuw i64 %x, 2\n  %add = add i64 %x, 1\n  %max = umax i64 %mul, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %mul = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %mul, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %mul = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %mul, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %mul = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %mul, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %mul = mul nuw i64 %x, 2\n  %max = select i1 %cmp, i64 1, i64 %mul\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %mul = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %mul, %add\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_nuw_negative",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commutative_add_first",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %add, i64 %shl)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %add, %shl\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %add, i64 %shl)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %add, %shl\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %add, i64 %shl)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %add, %shl\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "complex_operand",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %a, i64 %b) {\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %cmp = icmp eq i64 %x, 0\n  %shl = shl nuw i64 %x, 1\n  %max = select i1 %cmp, i64 1, i64 %shl\n  ret i64 %max\n}\n=>\ndefine i64 @test(i64 %a, i64 %b) {\n#0:\n  %x = add i64 %a, %b\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "boundary_check_x1",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test() {\n  %x = add i64 0, 1\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test() {\n  ret i64 2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  %x = add i64 0, 1\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test() {\n  ret i64 2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test() {\n  ret i64 2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  ret i64 2\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test() {\n  ret i64 2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test() {\n  ret i64 2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  ret i64 2\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "boundary_check_x0",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test() {\n  %x = add i64 0, 0\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = call i64 @llvm.umax.i64(i64 %shl, i64 %add)\n  ret i64 %max\n}",
+          "tgt": "define i64 @test() {\n  ret i64 1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  %x = add i64 0, 0\n  %shl = shl nuw i64 %x, 1\n  %add = add i64 %x, 1\n  %max = umax i64 %shl, %add\n  ret i64 %max\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test() {\n  ret i64 1\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test() {\n  ret i64 1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  ret i64 1\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test() {\n  ret i64 1\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test() {\n  ret i64 1\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test() {\n#0:\n  ret i64 1\n}\n=>\ndefine i64 @test() {\n#0:\n  ret i64 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

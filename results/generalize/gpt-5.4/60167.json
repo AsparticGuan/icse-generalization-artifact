@@ -1,0 +1,831 @@
+{
+  "issue_id": "60167",
+  "dataset_file": "60167.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue is a boolean-`select` canonicalization opportunity:  \n`%a = select %x, %y, false` computes `%x && %y`, and `%r = select %a, true, %y` computes `(%x && %y) || %y`, which simplifies to just `%y` by absorption. So the motivating bug was that LLVM recognized the single nested-select form poorly, even though it is just `or(and(X,Y),Y)`.\n\nThe patch generalizes this in `simplifySelectInst` for safe boolean `select` forms when `TrueVal == 1` (logical OR shape: `select Cond, true, FalseVal`):  \n- If `Cond` matches `logical_and(FalseVal, anything)` in either operand order, return `FalseVal`. This captures `(X && Y) || Y -> Y`.  \n- If `FalseVal` matches `logical_and(Cond, anything)` in either operand order, return `Cond`. This captures `Y || (X && Y) -> Y`.  \nUse of `m_c_LogicalAnd` is the key abstraction: it handles commuted operands and works over canonical boolean/logical forms rather than just one exact select nest.\n\n`dev_tests` broaden coverage well beyond the motivating case:  \n- both nesting/operand orders (`land_lor_left1/2`, `or_and_common_op_commute*`),  \n- scalar and `<N x i1>` vector forms,  \n- direct logical ops (`and`) and compare-produced booleans (`or_cmps`),  \n- poison-sensitive lanes/constants (`*_poison`, `inseltpoison`),  \n- degenerate identities like `select %x, false, %x -> false`,  \n- and non-matching near-misses (`or_and_not_common_op`) to show the transform requires a shared operand.  \n\nThis is a good template: lift a single select-of-select case into a logical matcher, then test all commutations, type widths, and poison cases.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"name\": \"bool_select_absorption_logical_or_with_and\",\n    \"summary\": \"Fold boolean select patterns that form an OR with an AND sharing a common operand, using absorption: (A && B) || B -> B and B || (A && B) -> B.\",\n    \"instcombine_form\": {\n      \"root_shape\": \"select i1/vector<... x i1> Cond, true, FalseVal\",\n      \"folds\": [\n        {\n          \"match\": \"Cond matches logical_and(FalseVal, X) or logical_and(X, FalseVal)\",\n          \"result\": \"FalseVal\",\n          \"logic\": \"(FalseVal && X) || FalseVal -> FalseVal\"\n        },\n        {\n          \"match\": \"FalseVal matches logical_and(Cond, X) or logical_and(X, Cond)\",\n          \"result\": \"Cond\",\n          \"logic\": \"Cond || (Cond && X) -> Cond\"\n        }\n      ],\n      \"matcher_notes\": [\n        \"Use a logical boolean matcher such as m_c_LogicalAnd rather than matching one exact nested select shape.\",\n        \"Applies to scalar i1 and vector-of-i1 forms lane-wise.\",\n        \"The logical_and operand may itself be represented as 'and i1', 'select i1 C, i1 V, i1 false', compare-produced i1, or equivalent canonical boolean forms accepted by logical matchers.\",\n        \"Commuted operand orders of the AND must be handled.\",\n        \"Commuted placement of the shared operand between Cond and FalseVal must be handled.\"\n      ],\n      \"safety_notes\": [\n        \"Restrict to boolean semantics: i1 or vector of i1.\",\n        \"Preserve poison semantics by relying on logical boolean matching already considered safe by InstCombine.\",\n        \"Do not apply to near-misses without a shared operand.\"\n      ]\n    },\n    \"from_example\": {\n      \"source_logic\": \"%a = select %x, %y, false   => %x && %y; %r = select %a, true, %y => (%x && %y) || %y\",\n      \"simplifies_to\": \"%y\"\n    }\n  },\n  \"testcases\": [\n    {\n      \"name\": \"nested_select_and_or_basic\",\n      \"ir\": \"define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"nested_select_and_or_commuted_inner\",\n      \"ir\": \"define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\\n  %a = select i1 %y, i1 %x, i1 false\\n  %r = select i1 %a, i1 true, i1 %x\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\\n  ret i1 %x\\n}\\n\"\n    },\n    {\n      \"name\": \"direct_and_in_cond\",\n      \"ir\": \"define i1 @direct_and_in_cond(i1 %x, i1 %y) {\\n  %a = and i1 %x, %y\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @direct_and_in_cond(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"direct_and_in_cond_commuted\",\n      \"ir\": \"define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\\n  %a = and i1 %y, %x\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"and_on_false_arm\",\n      \"ir\": \"define i1 @and_on_false_arm(i1 %x, i1 %y) {\\n  %a = and i1 %x, %y\\n  %r = select i1 %y, i1 true, i1 %a\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @and_on_false_arm(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"and_on_false_arm_commuted\",\n      \"ir\": \"define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\\n  %a = and i1 %y, %x\\n  %r = select i1 %y, i1 true, i1 %a\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"cmp_and_select\",\n      \"ir\": \"define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\\n  %p = icmp eq i32 %a, %b\\n  %q = icmp slt i32 %c, %d\\n  %t = and i1 %p, %q\\n  %r = select i1 %t, i1 true, i1 %q\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\\n  %q = icmp slt i32 %c, %d\\n  ret i1 %q\\n}\\n\"\n    },\n    {\n      \"name\": \"cmp_nested_select\",\n      \"ir\": \"define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\\n  %p = icmp eq i32 %a, %b\\n  %q = icmp slt i32 %c, %d\\n  %t = select i1 %p, i1 %q, i1 false\\n  %r = select i1 %t, i1 true, i1 %q\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\\n  %q = icmp slt i32 %c, %d\\n  ret i1 %q\\n}\\n\"\n    },\n    {\n      \"name\": \"triple_operand_common_rhs\",\n      \"ir\": \"define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\\n  %t = and i1 %a, %c\\n  %r = select i1 %t, i1 true, i1 %c\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"triple_operand_common_lhs\",\n      \"ir\": \"define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\\n  %t = and i1 %c, %a\\n  %r = select i1 %c, i1 true, i1 %t\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_and_in_cond_v2\",\n      \"ir\": \"define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\\n  %a = and <2 x i1> %x, %y\\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\\n  ret <2 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\\n  ret <2 x i1> %y\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_and_in_cond_v4_commuted\",\n      \"ir\": \"define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\\n  %a = and <4 x i1> %y, %x\\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\\n  ret <4 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\\n  ret <4 x i1> %y\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_nested_select_v2\",\n      \"ir\": \"define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> zeroinitializer\\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\\n  ret <2 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\\n  ret <2 x i1> %y\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_and_on_false_arm_v4\",\n      \"ir\": \"define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\\n  %a = and <4 x i1> %x, %y\\n  %r = select <4 x i1> %y, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %a\\n  ret <4 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\\n  ret <4 x i1> %y\\n}\\n\"\n    },\n    {\n      \"name\": \"poison_true_arm_scalar\",\n      \"ir\": \"define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\\n  %a = and i1 %x, %y\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"poison_false_arm_scalar\",\n      \"ir\": \"define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\\n  %a = and i1 %x, %y\\n  %r = select i1 %y, i1 true, i1 %a\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"constant_true_common_operand\",\n      \"ir\": \"define i1 @constant_true_common_operand(i1 %x) {\\n  %a = and i1 %x, true\\n  %r = select i1 %a, i1 true, i1 true\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @constant_true_common_operand(i1 %x) {\\n  ret i1 true\\n}\\n\"\n    },\n    {\n      \"name\": \"constant_false_common_operand\",\n      \"ir\": \"define i1 @constant_false_common_operand(i1 %x) {\\n  %a = and i1 %x, false\\n  %r = select i1 %a, i1 true, i1 false\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @constant_false_common_operand(i1 %x) {\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"shared_operand_is_select_result\",\n      \"ir\": \"define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\\n  %y = select i1 %a, i1 %b, i1 false\\n  %t = and i1 %c, %y\\n  %r = select i1 %t, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\\n  %y = select i1 %a, i1 %b, i1 false\\n  ret i1 %y\\n}\\n\"\n    },\n    {\n      \"name\": \"shared_operand_is_cmp_result\",\n      \"ir\": \"define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\\n  %y = icmp ult i32 %a, %b\\n  %x = icmp ne i32 %c, 0\\n  %t = and i1 %y, %x\\n  %r = select i1 %t, i1 true, i1 %y\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\\n  %y = icmp ult i32 %a, %b\\n  ret i1 %y\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "name": "bool_select_absorption_logical_or_with_and",
+      "summary": "Fold boolean select patterns that form an OR with an AND sharing a common operand, using absorption: (A && B) || B -> B and B || (A && B) -> B.",
+      "instcombine_form": {
+        "root_shape": "select i1/vector<... x i1> Cond, true, FalseVal",
+        "folds": [
+          {
+            "match": "Cond matches logical_and(FalseVal, X) or logical_and(X, FalseVal)",
+            "result": "FalseVal",
+            "logic": "(FalseVal && X) || FalseVal -> FalseVal"
+          },
+          {
+            "match": "FalseVal matches logical_and(Cond, X) or logical_and(X, Cond)",
+            "result": "Cond",
+            "logic": "Cond || (Cond && X) -> Cond"
+          }
+        ],
+        "matcher_notes": [
+          "Use a logical boolean matcher such as m_c_LogicalAnd rather than matching one exact nested select shape.",
+          "Applies to scalar i1 and vector-of-i1 forms lane-wise.",
+          "The logical_and operand may itself be represented as 'and i1', 'select i1 C, i1 V, i1 false', compare-produced i1, or equivalent canonical boolean forms accepted by logical matchers.",
+          "Commuted operand orders of the AND must be handled.",
+          "Commuted placement of the shared operand between Cond and FalseVal must be handled."
+        ],
+        "safety_notes": [
+          "Restrict to boolean semantics: i1 or vector of i1.",
+          "Preserve poison semantics by relying on logical boolean matching already considered safe by InstCombine.",
+          "Do not apply to near-misses without a shared operand."
+        ]
+      },
+      "from_example": {
+        "source_logic": "%a = select %x, %y, false   => %x && %y; %r = select %a, true, %y => (%x && %y) || %y",
+        "simplifies_to": "%y"
+      }
+    },
+    "testcases": [
+      {
+        "name": "nested_select_and_or_basic",
+        "ir": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "nested_select_and_or_commuted_inner",
+        "ir": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  %a = select i1 %y, i1 %x, i1 false\n  %r = select i1 %a, i1 true, i1 %x\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  ret i1 %x\n}\n"
+      },
+      {
+        "name": "direct_and_in_cond",
+        "ir": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "direct_and_in_cond_commuted",
+        "ir": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  %a = and i1 %y, %x\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "and_on_false_arm",
+        "ir": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "and_on_false_arm_commuted",
+        "ir": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  %a = and i1 %y, %x\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "cmp_and_select",
+        "ir": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = and i1 %p, %q\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n"
+      },
+      {
+        "name": "cmp_nested_select",
+        "ir": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 false\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n"
+      },
+      {
+        "name": "triple_operand_common_rhs",
+        "ir": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  %t = and i1 %a, %c\n  %r = select i1 %t, i1 true, i1 %c\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "triple_operand_common_lhs",
+        "ir": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  %t = and i1 %c, %a\n  %r = select i1 %c, i1 true, i1 %t\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "vector_and_in_cond_v2",
+        "ir": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = and <2 x i1> %x, %y\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n"
+      },
+      {
+        "name": "vector_and_in_cond_v4_commuted",
+        "ir": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  %a = and <4 x i1> %y, %x\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n"
+      },
+      {
+        "name": "vector_nested_select_v2",
+        "ir": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> zeroinitializer\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n"
+      },
+      {
+        "name": "vector_and_on_false_arm_v4",
+        "ir": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  %a = and <4 x i1> %x, %y\n  %r = select <4 x i1> %y, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %a\n  ret <4 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n"
+      },
+      {
+        "name": "poison_true_arm_scalar",
+        "ir": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "poison_false_arm_scalar",
+        "ir": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "constant_true_common_operand",
+        "ir": "define i1 @constant_true_common_operand(i1 %x) {\n  %a = and i1 %x, true\n  %r = select i1 %a, i1 true, i1 true\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n"
+      },
+      {
+        "name": "constant_false_common_operand",
+        "ir": "define i1 @constant_false_common_operand(i1 %x) {\n  %a = and i1 %x, false\n  %r = select i1 %a, i1 true, i1 false\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "shared_operand_is_select_result",
+        "ir": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  %t = and i1 %c, %y\n  %r = select i1 %t, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n"
+      },
+      {
+        "name": "shared_operand_is_cmp_result",
+        "ir": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  %x = icmp ne i32 %c, 0\n  %t = and i1 %y, %x\n  %r = select i1 %t, i1 true, i1 %y\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "nested_select_and_or_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @nested_select_and_or_basic(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = poison\ni1 %y = #x1 (1)\n\nSource:\n\nTarget:\ni1 %a = poison\ni1 %r = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nested_select_and_or_commuted_inner",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  %a = select i1 %y, i1 %x, i1 false\n  %r = select i1 %a, i1 true, i1 %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  ret i1 %x\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %y, i1 %x, i1 0\n  %r = select i1 %a, i1 1, i1 %x\n  ret i1 %r\n}\n=>\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  ret i1 %x\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  %a = select i1 %y, i1 %x, i1 false\n  %r = select i1 %a, i1 true, i1 %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  ret i1 %x\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %y, i1 %x, i1 0\n  %r = select i1 %a, i1 1, i1 %x\n  ret i1 %r\n}\n=>\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  ret i1 %x\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  ret i1 %x\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n  %a = select i1 %y, i1 %x, i1 false\n  %r = select i1 %a, i1 true, i1 %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  ret i1 %x\n}\n=>\ndefine i1 @nested_select_and_or_commuted_inner(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %y, i1 %x, i1 0\n  %r = select i1 %a, i1 1, i1 %x\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = #x1 (1)\ni1 %y = poison\n\nSource:\n\nTarget:\ni1 %a = poison\ni1 %r = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "direct_and_in_cond",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @direct_and_in_cond(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "direct_and_in_cond_commuted",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  %a = and i1 %y, %x\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %y, %x\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @direct_and_in_cond_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_on_false_arm",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 1, i1 %a\n  ret i1 %r\n}\n=>\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @and_on_false_arm(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_on_false_arm_commuted",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  %a = and i1 %y, %x\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %y, %x\n  %r = select i1 %y, i1 1, i1 %a\n  ret i1 %r\n}\n=>\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @and_on_false_arm_commuted(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "cmp_and_select",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = and i1 %p, %q\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = and i1 %p, %q\n  %r = select i1 %t, i1 1, i1 %q\n  ret i1 %r\n}\n=>\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "tgt": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n=>\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n=>\ndefine i1 @cmp_and_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "cmp_nested_select",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 false\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 0\n  %r = select i1 %t, i1 1, i1 %q\n  ret i1 %r\n}\n=>\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 false\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 0\n  %r = select i1 %t, i1 1, i1 %q\n  ret i1 %r\n}\n=>\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 false\n  %r = select i1 %t, i1 true, i1 %q\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %q = icmp slt i32 %c, %d\n  ret i1 %q\n}\n=>\ndefine i1 @cmp_nested_select(i32 %a, i32 %b, i32 %c, i32 %d) {\n#0:\n  %p = icmp eq i32 %a, %b\n  %q = icmp slt i32 %c, %d\n  %t = select i1 %p, i1 %q, i1 0\n  %r = select i1 %t, i1 1, i1 %q\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %a = #x00000003 (3)\ni32 %b = poison\ni32 %c = #x00000003 (3)\ni32 %d = #x00000003 (3)\n\nSource:\ni1 %q = #x0 (0)\n\nTarget:\ni1 %p = poison\ni1 %q = #x0 (0)\ni1 %t = poison\ni1 %r = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "triple_operand_common_rhs",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  %t = and i1 %a, %c\n  %r = select i1 %t, i1 true, i1 %c\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  %t = and i1 %a, %c\n  %r = select i1 %t, i1 1, i1 %c\n  ret i1 %r\n}\n=>\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\n=>\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\n=>\ndefine i1 @triple_operand_common_rhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "triple_operand_common_lhs",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  %t = and i1 %c, %a\n  %r = select i1 %c, i1 true, i1 %t\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  %t = and i1 %c, %a\n  %r = select i1 %c, i1 1, i1 %t\n  ret i1 %r\n}\n=>\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\n=>\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\n=>\ndefine i1 @triple_operand_common_lhs(i1 %a, i1 %b, i1 %c) {\n#0:\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_and_in_cond_v2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = and <2 x i1> %x, %y\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+          "tgt": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  %a = and <2 x i1> %x, %y\n  %r = select <2 x i1> %a, <2 x i1> { 1, 1 }, <2 x i1> %y\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "tgt": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\n=>\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\n=>\ndefine <2 x i1> @vector_and_in_cond_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_and_in_cond_v4_commuted",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  %a = and <4 x i1> %y, %x\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = and <4 x i1> %y, %x\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "tgt": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @vector_and_in_cond_v4_commuted(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_nested_select_v2",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> zeroinitializer\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+          "tgt": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> { 0, 0 }\n  %r = select <2 x i1> %a, <2 x i1> { 1, 1 }, <2 x i1> %y\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> zeroinitializer\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+          "tgt": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> { 0, 0 }\n  %r = select <2 x i1> %a, <2 x i1> { 1, 1 }, <2 x i1> %y\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  ret <2 x i1> %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> zeroinitializer\n  %r = select <2 x i1> %a, <2 x i1> <i1 true, i1 true>, <2 x i1> %y\n  ret <2 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  ret <2 x i1> %y\n}\n=>\ndefine <2 x i1> @vector_nested_select_v2(<2 x i1> %x, <2 x i1> %y) {\n#0:\n  %a = select <2 x i1> %x, <2 x i1> %y, <2 x i1> { 0, 0 }\n  %r = select <2 x i1> %a, <2 x i1> { 1, 1 }, <2 x i1> %y\n  ret <2 x i1> %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<2 x i1> %x = < poison, #x0 (0) >\n<2 x i1> %y = < #x0 (0), #x0 (0) >\n\nSource:\n\nTarget:\n<2 x i1> %a = < poison, #x0 (0) >\n<2 x i1> %r = < poison, #x0 (0) >\nSource value: < #x0 (0), #x0 (0) >\nTarget value: < poison, #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_and_on_false_arm_v4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  %a = and <4 x i1> %x, %y\n  %r = select <4 x i1> %y, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %a\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = and <4 x i1> %x, %y\n  %r = select <4 x i1> %y, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %a\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "tgt": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @vector_and_on_false_arm_v4(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "poison_true_arm_scalar",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @poison_true_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "poison_false_arm_scalar",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 true, i1 %a\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %x, %y\n  %r = select i1 %y, i1 1, i1 %a\n  ret i1 %r\n}\n=>\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @poison_false_arm_scalar(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_true_common_operand",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @constant_true_common_operand(i1 %x) {\n  %a = and i1 %x, true\n  %r = select i1 %a, i1 true, i1 true\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  %a = and i1 %x, 1\n  %r = select i1 %a, i1 1, i1 1\n  ret i1 %r\n}\n=>\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n",
+          "tgt": "define i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @constant_true_common_operand(i1 %x) {\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @constant_true_common_operand(i1 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_false_common_operand",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @constant_false_common_operand(i1 %x) {\n  %a = and i1 %x, false\n  %r = select i1 %a, i1 true, i1 false\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  %a = and i1 %x, 0\n  %r = select i1 %a, i1 1, i1 0\n  ret i1 %r\n}\n=>\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n",
+          "tgt": "define i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @constant_false_common_operand(i1 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @constant_false_common_operand(i1 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "shared_operand_is_select_result",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  %t = and i1 %c, %y\n  %r = select i1 %t, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  %t = and i1 %c, %y\n  %r = select i1 %t, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  ret i1 %y\n}\n=>\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n  %y = select i1 %a, i1 %b, i1 false\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  ret i1 %y\n}\n=>\ndefine i1 @shared_operand_is_select_result(i1 %a, i1 %b, i1 %c) {\n#0:\n  %y = select i1 %a, i1 %b, i1 0\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "shared_operand_is_cmp_result",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  %x = icmp ne i32 %c, 0\n  %t = and i1 %y, %x\n  %r = select i1 %t, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  %x = icmp ne i32 %c, 0\n  %t = and i1 %y, %x\n  %r = select i1 %t, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n=>\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\n=>\ndefine i1 @shared_operand_is_cmp_result(i32 %a, i32 %b, i32 %c) {\n#0:\n  %y = icmp ult i32 %a, %b\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.6s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,718 @@
+{
+  "issue_id": "157524",
+  "dataset_file": "157524.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue exposed a very specific algebraic shape:\n\n- `min(X+1, Y) - min(X, Y)`\n\nwith the motivating instance using `smin`, `add nuw nsw`, and a loaded `Y`. Semantically, this difference is `1` exactly when `X < Y`, otherwise `0`, so the whole expression is equivalent to `zext (X < Y)`.\n\nThe patch lifts that one-off case into a reusable InstCombine rule in `visitSub()` by matching two generic forms:\n\n- signed: `smin(add-like-with-nsw X, 1, Y) - smin(X, Y)` → `zext (icmp slt X, Y)`\n- unsigned: `umin(add-like-with-nuw X, 1, Y) - umin(X, Y)` → `zext (icmp ult X, Y)`\n\nKey generalizations:\n- uses `m_c_SMin` / `m_c_UMin`, so min operands may be commuted;\n- uses `m_NSWAddLike` / `m_NUWAddLike`, so it accepts not just literal `add`, but add-like forms such as `or disjoint ... , 1`;\n- requires the no-wrap flag needed to prove monotonicity;\n- blocks `i1`, because the result should already be boolean-like and zext is not applicable;\n- only fires if at least one matched min has one use, avoiding regressions when replacing shared mins with an `icmp+zext`.\n\nThe dev tests broaden coverage accordingly: signed and unsigned forms, `i1` exclusion, missing `nsw`/`nuw` negative tests, mismatched min operands negative test, commuted/add-like (`or disjoint`) acceptance, and one-use / multi-use profitability checks (`use_operand` / `use_operands`).\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i64 @test(i64 %arg0, ptr %arg1) {\n  %v0 = load i64, ptr %arg1, align 8\n  %v1 = tail call i64 @llvm.smin.i64(i64 %arg0, i64 %v0)\n  %v2 = add nuw nsw i64 %arg0, 1\n  %v3 = tail call i64 @llvm.smin.i64(i64 %v2, i64 %v0)\n  %v4 = sub i64 %v3, %v1\n  ret i64 %v4\n}\n\ndefine i64 @test(i64 %arg0, ptr %arg1) {\n  %v0 = load i64, ptr %arg1, align 8\n  %v1 = icmp slt i64 %arg0, %v0\n  %v3 = select i1 %v1, i64 1, i64 0\n  ret i64 %v3\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Fold a difference of two mins that differ by an increment of one into a boolean-as-integer comparison result.\",\n    \"generalized_forms\": [\n      {\n        \"kind\": \"signed\",\n        \"source\": \"sub (smin (add-like-with-nsw X, 1), Y), (smin X, Y)\",\n        \"commuted_source\": \"sub (smin Y, (add-like-with-nsw X, 1)), (smin X, Y)\",\n        \"result\": \"zext/sext-compatible integer boolean of (icmp slt X, Y)\",\n        \"canonical_result\": \"zext (icmp slt X, Y) to ty\"\n      },\n      {\n        \"kind\": \"unsigned\",\n        \"source\": \"sub (umin (add-like-with-nuw X, 1), Y), (umin X, Y)\",\n        \"commuted_source\": \"sub (umin Y, (add-like-with-nuw X, 1)), (umin X, Y)\",\n        \"result\": \"zext/sext-compatible integer boolean of (icmp ult X, Y)\",\n        \"canonical_result\": \"zext (icmp ult X, Y) to ty\"\n      }\n    ],\n    \"semantic_reasoning\": \"For signed min, smin(X + 1, Y) - smin(X, Y) equals 1 iff X < Y, else 0, provided X+1 is the mathematical increment of X in the same signed domain (hence NSW). The unsigned form is analogous with umin and ULT, requiring NUW. The mins may be commuted because min is symmetric. The increment producer should be matched generically as an add-like form adding 1, not only a literal add, as long as the no-wrap property needed for the proof is present.\",\n    \"matcher_requirements\": [\n      \"Both mins must use the same non-increment operand pair X and Y, modulo commutation.\",\n      \"The incremented operand must be an add-like form equivalent to X + 1.\",\n      \"Require NSW for signed form, NUW for unsigned form.\",\n      \"Do not apply to i1 type.\",\n      \"Prefer to apply only when profitable, e.g. at least one matched min has one use.\"\n    ],\n    \"accepted_add_like_examples\": [\n      \"add nsw X, 1\",\n      \"add nuw X, 1\",\n      \"add nuw nsw X, 1\",\n      \"or disjoint X, 1\"\n    ],\n    \"notes\": [\n      \"The result should usually be formed as icmp + zext to the original integer type.\",\n      \"The canonical compare is X < Y, not X+1 <= Y, to avoid dependence on the add-like instruction after folding.\",\n      \"Loads, constants, arguments, and other arbitrary values may serve as Y.\",\n      \"Commuted min operands on either or both min calls should still match.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"signed_basic_args_i32\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\\nentry:\\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %xp1 = add nsw i32 %x, 1\\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @signed_basic_args_i32(i32 %x, i32 %y) {\\nentry:\\n  %cmp = icmp slt i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_basic_loaded_y_i64\",\n      \"ir\": \"declare i64 @llvm.smin.i64(i64, i64)\\n\\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\\nentry:\\n  %y = load i64, ptr %p, align 8\\n  %m0 = call i64 @llvm.smin.i64(i64 %x, i64 %y)\\n  %xp1 = add nuw nsw i64 %x, 1\\n  %m1 = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\\n  %r = sub i64 %m1, %m0\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\\nentry:\\n  %y = load i64, ptr %p, align 8\\n  %cmp = icmp slt i64 %x, %y\\n  %r = zext i1 %cmp to i64\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_commuted_first_min_i16\",\n      \"ir\": \"declare i16 @llvm.smin.i16(i16, i16)\\n\\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\\nentry:\\n  %xp1 = add nsw i16 %x, 1\\n  %m1 = call i16 @llvm.smin.i16(i16 %y, i16 %xp1)\\n  %m0 = call i16 @llvm.smin.i16(i16 %x, i16 %y)\\n  %r = sub i16 %m1, %m0\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\\nentry:\\n  %cmp = icmp slt i16 %x, %y\\n  %r = zext i1 %cmp to i16\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_commuted_both_mins_i8\",\n      \"ir\": \"declare i8 @llvm.smin.i8(i8, i8)\\n\\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\\nentry:\\n  %xp1 = add nsw i8 %x, 1\\n  %m1 = call i8 @llvm.smin.i8(i8 %y, i8 %xp1)\\n  %m0 = call i8 @llvm.smin.i8(i8 %y, i8 %x)\\n  %r = sub i8 %m1, %m0\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\\nentry:\\n  %cmp = icmp slt i8 %x, %y\\n  %r = zext i1 %cmp to i8\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_constant_y_i32\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i32 @signed_constant_y_i32(i32 %x) {\\nentry:\\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 42)\\n  %xp1 = add nsw i32 %x, 1\\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 42)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @signed_constant_y_i32(i32 %x) {\\nentry:\\n  %cmp = icmp slt i32 %x, 42\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_or_disjoint_addlike_i32\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\\nentry:\\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %xp1 = or disjoint i32 %x, 1\\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\\nentry:\\n  %cmp = icmp slt i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_reverse_sub_operands_shape_i64\",\n      \"ir\": \"declare i64 @llvm.smin.i64(i64, i64)\\n\\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\\nentry:\\n  %xp1 = add nsw i64 %x, 1\\n  %a = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\\n  %b = call i64 @llvm.smin.i64(i64 %y, i64 %x)\\n  %r = sub i64 %a, %b\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\\nentry:\\n  %cmp = icmp slt i64 %x, %y\\n  %r = zext i1 %cmp to i64\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_pointer_loaded_x_and_y_i32\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\\nentry:\\n  %x = load i32, ptr %px, align 4\\n  %y = load i32, ptr %py, align 4\\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %xp1 = add nsw i32 %x, 1\\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\\nentry:\\n  %x = load i32, ptr %px, align 4\\n  %y = load i32, ptr %py, align 4\\n  %cmp = icmp slt i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_basic_args_i32\",\n      \"ir\": \"declare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\\nentry:\\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %xp1 = add nuw i32 %x, 1\\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\\nentry:\\n  %cmp = icmp ult i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_loaded_y_i64\",\n      \"ir\": \"declare i64 @llvm.umin.i64(i64, i64)\\n\\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\\nentry:\\n  %y = load i64, ptr %p, align 8\\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\\n  %xp1 = add nuw nsw i64 %x, 1\\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\\n  %r = sub i64 %m1, %m0\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\\nentry:\\n  %y = load i64, ptr %p, align 8\\n  %cmp = icmp ult i64 %x, %y\\n  %r = zext i1 %cmp to i64\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_commuted_mins_i16\",\n      \"ir\": \"declare i16 @llvm.umin.i16(i16, i16)\\n\\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\\nentry:\\n  %xp1 = add nuw i16 %x, 1\\n  %m1 = call i16 @llvm.umin.i16(i16 %y, i16 %xp1)\\n  %m0 = call i16 @llvm.umin.i16(i16 %y, i16 %x)\\n  %r = sub i16 %m1, %m0\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\\nentry:\\n  %cmp = icmp ult i16 %x, %y\\n  %r = zext i1 %cmp to i16\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_constant_y_i8\",\n      \"ir\": \"declare i8 @llvm.umin.i8(i8, i8)\\n\\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\\nentry:\\n  %m0 = call i8 @llvm.umin.i8(i8 %x, i8 200)\\n  %xp1 = add nuw i8 %x, 1\\n  %m1 = call i8 @llvm.umin.i8(i8 %xp1, i8 200)\\n  %r = sub i8 %m1, %m0\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i8 @unsigned_constant_y_i8(i8 %x) {\\nentry:\\n  %cmp = icmp ult i8 %x, 200\\n  %r = zext i1 %cmp to i8\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_or_disjoint_addlike_i32\",\n      \"ir\": \"declare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\\nentry:\\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %xp1 = or disjoint i32 %x, 1\\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\\nentry:\\n  %cmp = icmp ult i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_large_type_i128\",\n      \"ir\": \"declare i128 @llvm.umin.i128(i128, i128)\\n\\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\\nentry:\\n  %m0 = call i128 @llvm.umin.i128(i128 %x, i128 %y)\\n  %xp1 = add nuw i128 %x, 1\\n  %m1 = call i128 @llvm.umin.i128(i128 %xp1, i128 %y)\\n  %r = sub i128 %m1, %m0\\n  ret i128 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\\nentry:\\n  %cmp = icmp ult i128 %x, %y\\n  %r = zext i1 %cmp to i128\\n  ret i128 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_large_type_i128\",\n      \"ir\": \"declare i128 @llvm.smin.i128(i128, i128)\\n\\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\\nentry:\\n  %m0 = call i128 @llvm.smin.i128(i128 %x, i128 %y)\\n  %xp1 = add nsw i128 %x, 1\\n  %m1 = call i128 @llvm.smin.i128(i128 %xp1, i128 %y)\\n  %r = sub i128 %m1, %m0\\n  ret i128 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i128 @signed_large_type_i128(i128 %x, i128 %y) {\\nentry:\\n  %cmp = icmp slt i128 %x, %y\\n  %r = zext i1 %cmp to i128\\n  ret i128 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"signed_with_extra_dead_uses_ok_one_min_one_use\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\\nentry:\\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %xp1 = add nsw i32 %x, 1\\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\\n  %u = add i32 %m0, 7\\n  %r = sub i32 %m1, %m0\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\\nentry:\\n  %cmp = icmp slt i32 %x, %y\\n  %r = zext i1 %cmp to i32\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"unsigned_with_extra_dead_uses_ok_one_min_one_use\",\n      \"ir\": \"declare i64 @llvm.umin.i64(i64, i64)\\n\\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\\nentry:\\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\\n  %xp1 = add nuw i64 %x, 1\\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\\n  %u = xor i64 %m1, 123\\n  %r = sub i64 %m1, %m0\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\\nentry:\\n  %cmp = icmp ult i64 %x, %y\\n  %r = zext i1 %cmp to i64\\n  ret i64 %r\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold a difference of two mins that differ by an increment of one into a boolean-as-integer comparison result.",
+      "generalized_forms": [
+        {
+          "kind": "signed",
+          "source": "sub (smin (add-like-with-nsw X, 1), Y), (smin X, Y)",
+          "commuted_source": "sub (smin Y, (add-like-with-nsw X, 1)), (smin X, Y)",
+          "result": "zext/sext-compatible integer boolean of (icmp slt X, Y)",
+          "canonical_result": "zext (icmp slt X, Y) to ty"
+        },
+        {
+          "kind": "unsigned",
+          "source": "sub (umin (add-like-with-nuw X, 1), Y), (umin X, Y)",
+          "commuted_source": "sub (umin Y, (add-like-with-nuw X, 1)), (umin X, Y)",
+          "result": "zext/sext-compatible integer boolean of (icmp ult X, Y)",
+          "canonical_result": "zext (icmp ult X, Y) to ty"
+        }
+      ],
+      "semantic_reasoning": "For signed min, smin(X + 1, Y) - smin(X, Y) equals 1 iff X < Y, else 0, provided X+1 is the mathematical increment of X in the same signed domain (hence NSW). The unsigned form is analogous with umin and ULT, requiring NUW. The mins may be commuted because min is symmetric. The increment producer should be matched generically as an add-like form adding 1, not only a literal add, as long as the no-wrap property needed for the proof is present.",
+      "matcher_requirements": [
+        "Both mins must use the same non-increment operand pair X and Y, modulo commutation.",
+        "The incremented operand must be an add-like form equivalent to X + 1.",
+        "Require NSW for signed form, NUW for unsigned form.",
+        "Do not apply to i1 type.",
+        "Prefer to apply only when profitable, e.g. at least one matched min has one use."
+      ],
+      "accepted_add_like_examples": [
+        "add nsw X, 1",
+        "add nuw X, 1",
+        "add nuw nsw X, 1",
+        "or disjoint X, 1"
+      ],
+      "notes": [
+        "The result should usually be formed as icmp + zext to the original integer type.",
+        "The canonical compare is X < Y, not X+1 <= Y, to avoid dependence on the add-like instruction after folding.",
+        "Loads, constants, arguments, and other arbitrary values may serve as Y.",
+        "Commuted min operands on either or both min calls should still match."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "signed_basic_args_i32",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "signed_basic_loaded_y_i64",
+        "ir": "declare i64 @llvm.smin.i64(i64, i64)\n\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.smin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "signed_commuted_first_min_i16",
+        "ir": "declare i16 @llvm.smin.i16(i16, i16)\n\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = call i16 @llvm.smin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.smin.i16(i16 %x, i16 %y)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "define i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "signed_commuted_both_mins_i8",
+        "ir": "declare i8 @llvm.smin.i8(i8, i8)\n\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = call i8 @llvm.smin.i8(i8 %y, i8 %xp1)\n  %m0 = call i8 @llvm.smin.i8(i8 %y, i8 %x)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "define i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "signed_constant_y_i32",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 42)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 42)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "signed_or_disjoint_addlike_i32",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "signed_reverse_sub_operands_shape_i64",
+        "ir": "declare i64 @llvm.smin.i64(i64, i64)\n\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %b = call i64 @llvm.smin.i64(i64 %y, i64 %x)\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "signed_pointer_loaded_x_and_y_i32",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "unsigned_basic_args_i32",
+        "ir": "declare i32 @llvm.umin.i32(i32, i32)\n\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = add nuw i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "unsigned_loaded_y_i64",
+        "ir": "declare i64 @llvm.umin.i64(i64, i64)\n\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "unsigned_commuted_mins_i16",
+        "ir": "declare i16 @llvm.umin.i16(i16, i16)\n\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = call i16 @llvm.umin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.umin.i16(i16 %y, i16 %x)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "define i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "unsigned_constant_y_i8",
+        "ir": "declare i8 @llvm.umin.i8(i8, i8)\n\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = call i8 @llvm.umin.i8(i8 %x, i8 200)\n  %xp1 = add nuw i8 %x, 1\n  %m1 = call i8 @llvm.umin.i8(i8 %xp1, i8 200)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "define i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "unsigned_or_disjoint_addlike_i32",
+        "ir": "declare i32 @llvm.umin.i32(i32, i32)\n\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "unsigned_large_type_i128",
+        "ir": "declare i128 @llvm.umin.i128(i128, i128)\n\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.umin.i128(i128 %x, i128 %y)\n  %xp1 = add nuw i128 %x, 1\n  %m1 = call i128 @llvm.umin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n",
+        "expected_optimized_ir": "define i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n"
+      },
+      {
+        "name": "signed_large_type_i128",
+        "ir": "declare i128 @llvm.smin.i128(i128, i128)\n\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.smin.i128(i128 %x, i128 %y)\n  %xp1 = add nsw i128 %x, 1\n  %m1 = call i128 @llvm.smin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n",
+        "expected_optimized_ir": "define i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n"
+      },
+      {
+        "name": "signed_with_extra_dead_uses_ok_one_min_one_use",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %u = add i32 %m0, 7\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "unsigned_with_extra_dead_uses_ok_one_min_one_use",
+        "ir": "declare i64 @llvm.umin.i64(i64, i64)\n\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %u = xor i64 %m1, 123\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "signed_basic_args_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @signed_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x7fffffff (2147483647)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %r = #x00000000 (0)\n\nTarget:\ni32 %m0 = #x00000003 (3)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_basic_loaded_y_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 9,
+        "expected": 7,
+        "current_opt": 9,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 9\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndeclare i64 @llvm.smin.i64(i64, i64)\n\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.smin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = smin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = smin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.smin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = smin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = smin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.smin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n=>\ndefine i64 @signed_basic_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = smin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = smin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #xffffffffffffffff (18446744073709551615, -1)\nptr %p = pointer(non-local, block_id=1, offset=0) / Address=#x08\n\nSource:\ni64 %y = #x0000000000000000 (0)\ni1 %cmp = #x1 (1)\ni64 %r = #x0000000000000001 (1)\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 8\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 8\talign: 1\talloc type: 0\talive: true\taddress: #x08\nContents:\n*: #x0000000000000000\n\n\nTarget:\ni64 %y = #x0000000000000000 (0)\ni64 %m0 = #xffffffffffffffff (18446744073709551615, -1)\ni64 %xp1 = poison\ni64 %m1 = poison\ni64 %r = poison\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 8\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 8\talign: 1\talloc type: 0\talive: true\taddress: #x08\nContents:\n*: #x0000000000000000\n\nSource value: #x0000000000000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_commuted_first_min_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i16 @llvm.smin.i16(i16, i16)\n\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = call i16 @llvm.smin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.smin.i16(i16 %x, i16 %y)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = smin i16 %y, %xp1\n  %m0 = smin i16 %x, %y\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n=>\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = call i16 @llvm.smin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.smin.i16(i16 %x, i16 %y)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = smin i16 %y, %xp1\n  %m0 = smin i16 %x, %y\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n=>\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = call i16 @llvm.smin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.smin.i16(i16 %x, i16 %y)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp slt i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n=>\ndefine i16 @signed_commuted_first_min_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nsw i16 %x, 1\n  %m1 = smin i16 %y, %xp1\n  %m0 = smin i16 %x, %y\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni16 %x = #x7fff (32767)\ni16 %y = #x0003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni16 %r = #x0000 (0)\n\nTarget:\ni16 %xp1 = poison\ni16 %m1 = poison\ni16 %m0 = #x0003 (3)\ni16 %r = poison\nSource value: #x0000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_commuted_both_mins_i8",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.smin.i8(i8, i8)\n\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = call i8 @llvm.smin.i8(i8 %y, i8 %xp1)\n  %m0 = call i8 @llvm.smin.i8(i8 %y, i8 %x)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = smin i8 %y, %xp1\n  %m0 = smin i8 %y, %x\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n=>\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = call i8 @llvm.smin.i8(i8 %y, i8 %xp1)\n  %m0 = call i8 @llvm.smin.i8(i8 %y, i8 %x)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = smin i8 %y, %xp1\n  %m0 = smin i8 %y, %x\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n=>\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = call i8 @llvm.smin.i8(i8 %y, i8 %xp1)\n  %m0 = call i8 @llvm.smin.i8(i8 %y, i8 %x)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %cmp = icmp slt i8 %x, %y\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n=>\ndefine i8 @signed_commuted_both_mins_i8(i8 %x, i8 %y) {\nentry:\n  %xp1 = add nsw i8 %x, 1\n  %m1 = smin i8 %y, %xp1\n  %m0 = smin i8 %y, %x\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni8 %x = #x7f (127)\ni8 %y = #x03 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni8 %r = #x00 (0)\n\nTarget:\ni8 %xp1 = poison\ni8 %m1 = poison\ni8 %m0 = #x03 (3)\ni8 %r = poison\nSource value: #x00 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_constant_y_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 42)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 42)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = smin i32 %x, 42\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, 42\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 42)\n  %0 = call i32 @llvm.smin.i32(i32 %x, i32 41)\n  %m1 = add nsw i32 %0, 1\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = smin i32 %x, 42\n  %#0 = smin i32 %x, 41\n  %m1 = add nsw i32 %#0, 1\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 42)\n  %0 = call i32 @llvm.smin.i32(i32 %x, i32 41)\n  %m1 = add nsw i32 %0, 1\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %cmp = icmp slt i32 %x, 42\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @signed_constant_y_i32(i32 %x) {\nentry:\n  %m0 = smin i32 %x, 42\n  %#0 = smin i32 %x, 41\n  %m1 = add nsw i32 %#0, 1\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_or_disjoint_addlike_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @signed_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000001 (1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %r = #x00000001 (1)\n\nTarget:\ni32 %m0 = #x00000001 (1)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\nSource value: #x00000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_reverse_sub_operands_shape_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i64 @llvm.smin.i64(i64, i64)\n\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %b = call i64 @llvm.smin.i64(i64 %y, i64 %x)\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = smin i64 %xp1, %y\n  %b = smin i64 %y, %x\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n=>\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %b = call i64 @llvm.smin.i64(i64 %y, i64 %x)\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = smin i64 %xp1, %y\n  %b = smin i64 %y, %x\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n=>\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = call i64 @llvm.smin.i64(i64 %xp1, i64 %y)\n  %b = call i64 @llvm.smin.i64(i64 %y, i64 %x)\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp slt i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n=>\ndefine i64 @signed_reverse_sub_operands_shape_i64(i64 %x, i64 %y) {\nentry:\n  %xp1 = add nsw i64 %x, 1\n  %a = smin i64 %xp1, %y\n  %b = smin i64 %y, %x\n  %r = sub i64 %a, %b\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni64 %x = #x7fffffffffffffff (9223372036854775807)\ni64 %y = #x0000000000000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni64 %r = #x0000000000000000 (0)\n\nTarget:\ni64 %xp1 = poison\ni64 %a = poison\ni64 %b = #x0000000000000003 (3)\ni64 %r = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_pointer_loaded_x_and_y_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 13,
+        "expected": 11,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 13\n",
+        "expected_log": "Cost: 11\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @signed_pointer_loaded_x_and_y_i32(ptr %px, ptr %py) {\nentry:\n  %x = load i32, ptr %px, align 4\n  %y = load i32, ptr %py, align 4\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\nptr %px = pointer(non-local, block_id=1, offset=0) / Address=#x08\nptr %py = pointer(non-local, block_id=1, offset=0) / Address=#x08\n\nSource:\ni32 %x = #x7fffffff (2147483647)\ni32 %y = #x7fffffff (2147483647)\ni1 %cmp = #x0 (0)\ni32 %r = #x00000000 (0)\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 4\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 4\talign: 1\talloc type: 4\talive: true\taddress: #x08\nContents:\n(_ as-array k!371)\n\nBlock 2 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x08\n\nTarget:\ni32 %x = #x7fffffff (2147483647)\ni32 %y = #x7fffffff (2147483647)\ni32 %m0 = #x7fffffff (2147483647)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 4\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 4\talign: 1\talloc type: 4\talive: true\taddress: #x08\nContents:\n(_ as-array k!371)\n\nBlock 2 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x08\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_basic_args_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umin.i32(i32, i32)\n\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = add nuw i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = add nuw i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = add nuw i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = add nuw i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = add nuw i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_basic_args_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = add nuw i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %r = #x00000000 (0)\n\nTarget:\ni32 %m0 = #x00000003 (3)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_loaded_y_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 9,
+        "expected": 7,
+        "current_opt": 9,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 9\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndeclare i64 @llvm.umin.i64(i64, i64)\n\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = umin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = umin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw nsw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_loaded_y_i64(i64 %x, ptr %p) {\nentry:\n  %y = load i64, ptr %p, align 8\n  %m0 = umin i64 %x, %y\n  %xp1 = add nsw nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #xffffffffffffffff (18446744073709551615, -1)\nptr %p = pointer(non-local, block_id=1, offset=0) / Address=#x08\n\nSource:\ni64 %y = #x0000000000000000 (0)\ni1 %cmp = #x0 (0)\ni64 %r = #x0000000000000000 (0)\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 8\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 8\talign: 1\talloc type: 0\talive: true\taddress: #x08\nContents:\n*: #x0000000000000000\n\n\nTarget:\ni64 %y = #x0000000000000000 (0)\ni64 %m0 = #x0000000000000000 (0)\ni64 %xp1 = poison\ni64 %m1 = poison\ni64 %r = poison\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 8\talloc type: 0\talive: false\taddress: #x00\nBlock 1 >\tsize: 8\talign: 1\talloc type: 0\talive: true\taddress: #x08\nContents:\n*: #x0000000000000000\n\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_commuted_mins_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i16 @llvm.umin.i16(i16, i16)\n\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = call i16 @llvm.umin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.umin.i16(i16 %y, i16 %x)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = umin i16 %y, %xp1\n  %m0 = umin i16 %y, %x\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n=>\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umin.i16(i16, i16) #0\n\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = call i16 @llvm.umin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.umin.i16(i16 %y, i16 %x)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = umin i16 %y, %xp1\n  %m0 = umin i16 %y, %x\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n=>\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umin.i16(i16, i16) #0\n\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = call i16 @llvm.umin.i16(i16 %y, i16 %xp1)\n  %m0 = call i16 @llvm.umin.i16(i16 %y, i16 %x)\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %cmp = icmp ult i16 %x, %y\n  %r = zext i1 %cmp to i16\n  ret i16 %r\n}\n=>\ndefine i16 @unsigned_commuted_mins_i16(i16 %x, i16 %y) {\nentry:\n  %xp1 = add nuw i16 %x, 1\n  %m1 = umin i16 %y, %xp1\n  %m0 = umin i16 %y, %x\n  %r = sub i16 %m1, %m0\n  ret i16 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni16 %x = #xffff (65535, -1)\ni16 %y = #x0003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni16 %r = #x0000 (0)\n\nTarget:\ni16 %xp1 = poison\ni16 %m1 = poison\ni16 %m0 = #x0003 (3)\ni16 %r = poison\nSource value: #x0000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_constant_y_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umin.i8(i8, i8)\n\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = call i8 @llvm.umin.i8(i8 %x, i8 200)\n  %xp1 = add nuw i8 %x, 1\n  %m1 = call i8 @llvm.umin.i8(i8 %xp1, i8 200)\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = umin i8 %x, 200\n  %xp1 = add nuw i8 %x, 1\n  %m1 = umin i8 %xp1, 200\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n=>\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = call i8 @llvm.umin.i8(i8 %x, i8 -56)\n  %0 = call i8 @llvm.umin.i8(i8 %x, i8 -57)\n  %m1 = add nuw i8 %0, 1\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = umin i8 %x, 200\n  %#0 = umin i8 %x, 199\n  %m1 = add nuw i8 %#0, 1\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n=>\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = call i8 @llvm.umin.i8(i8 %x, i8 -56)\n  %0 = call i8 @llvm.umin.i8(i8 %x, i8 -57)\n  %m1 = add nuw i8 %0, 1\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %cmp = icmp ult i8 %x, 200\n  %r = zext i1 %cmp to i8\n  ret i8 %r\n}\n=>\ndefine i8 @unsigned_constant_y_i8(i8 %x) {\nentry:\n  %m0 = umin i8 %x, 200\n  %#0 = umin i8 %x, 199\n  %m1 = add nuw i8 %#0, 1\n  %r = sub i8 %m1, %m0\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_or_disjoint_addlike_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umin.i32(i32, i32)\n\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = call i32 @llvm.umin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp ult i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @unsigned_or_disjoint_addlike_i32(i32 %x, i32 %y) {\nentry:\n  %m0 = umin i32 %x, %y\n  %xp1 = or disjoint i32 %x, 1\n  %m1 = umin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000001 (1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %r = #x00000001 (1)\n\nTarget:\ni32 %m0 = #x00000001 (1)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\nSource value: #x00000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_large_type_i128",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i128 @llvm.umin.i128(i128, i128)\n\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.umin.i128(i128 %x, i128 %y)\n  %xp1 = add nuw i128 %x, 1\n  %m1 = call i128 @llvm.umin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n",
+          "tgt": "define i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = umin i128 %x, %y\n  %xp1 = add nuw i128 %x, 1\n  %m1 = umin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n=>\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i128 @llvm.umin.i128(i128, i128) #0\n\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.umin.i128(i128 %x, i128 %y)\n  %xp1 = add nuw i128 %x, 1\n  %m1 = call i128 @llvm.umin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = umin i128 %x, %y\n  %xp1 = add nuw i128 %x, 1\n  %m1 = umin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n=>\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i128 @llvm.umin.i128(i128, i128) #0\n\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.umin.i128(i128 %x, i128 %y)\n  %xp1 = add nuw i128 %x, 1\n  %m1 = call i128 @llvm.umin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp ult i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n=>\ndefine i128 @unsigned_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = umin i128 %x, %y\n  %xp1 = add nuw i128 %x, 1\n  %m1 = umin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni128 %x = #xffffffffffffffffffffffffffffffff (340282366920938463463374607431768211455, -1)\ni128 %y = #x00000000000000000000000000000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni128 %r = #x00000000000000000000000000000000 (0)\n\nTarget:\ni128 %m0 = #x00000000000000000000000000000003 (3)\ni128 %xp1 = poison\ni128 %m1 = poison\ni128 %r = poison\nSource value: #x00000000000000000000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_large_type_i128",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i128 @llvm.smin.i128(i128, i128)\n\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.smin.i128(i128 %x, i128 %y)\n  %xp1 = add nsw i128 %x, 1\n  %m1 = call i128 @llvm.smin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n",
+          "tgt": "define i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = smin i128 %x, %y\n  %xp1 = add nsw i128 %x, 1\n  %m1 = smin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n=>\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i128 @llvm.smin.i128(i128, i128) #0\n\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.smin.i128(i128 %x, i128 %y)\n  %xp1 = add nsw i128 %x, 1\n  %m1 = call i128 @llvm.smin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = smin i128 %x, %y\n  %xp1 = add nsw i128 %x, 1\n  %m1 = smin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n=>\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i128 @llvm.smin.i128(i128, i128) #0\n\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = call i128 @llvm.smin.i128(i128 %x, i128 %y)\n  %xp1 = add nsw i128 %x, 1\n  %m1 = call i128 @llvm.smin.i128(i128 %xp1, i128 %y)\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %cmp = icmp slt i128 %x, %y\n  %r = zext i1 %cmp to i128\n  ret i128 %r\n}\n=>\ndefine i128 @signed_large_type_i128(i128 %x, i128 %y) {\nentry:\n  %m0 = smin i128 %x, %y\n  %xp1 = add nsw i128 %x, 1\n  %m1 = smin i128 %xp1, %y\n  %r = sub i128 %m1, %m0\n  ret i128 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni128 %x = #x7fffffffffffffffffffffffffffffff (170141183460469231731687303715884105727)\ni128 %y = #x00000000000000000000000000000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni128 %r = #x00000000000000000000000000000000 (0)\n\nTarget:\ni128 %m0 = #x00000000000000000000000000000003 (3)\ni128 %xp1 = poison\ni128 %m1 = poison\ni128 %r = poison\nSource value: #x00000000000000000000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_with_extra_dead_uses_ok_one_min_one_use",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smin.i32(i32, i32)\n\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %u = add i32 %m0, 7\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n=>\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %xp1 = add nsw i32 %x, 1\n  %m1 = call i32 @llvm.smin.i32(i32 %xp1, i32 %y)\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %cmp = icmp slt i32 %x, %y\n  %r = zext i1 %cmp to i32\n  ret i32 %r\n}\n=>\ndefine i32 @signed_with_extra_dead_uses_ok_one_min_one_use(i32 %x, i32 %y) {\nentry:\n  %m0 = smin i32 %x, %y\n  %xp1 = add nsw i32 %x, 1\n  %m1 = smin i32 %xp1, %y\n  %r = sub i32 %m1, %m0\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x7fffffff (2147483647)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %r = #x00000000 (0)\n\nTarget:\ni32 %m0 = #x00000003 (3)\ni32 %xp1 = poison\ni32 %m1 = poison\ni32 %r = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_with_extra_dead_uses_ok_one_min_one_use",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i64 @llvm.umin.i64(i64, i64)\n\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %u = xor i64 %m1, 123\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = umin i64 %x, %y\n  %xp1 = add nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = umin i64 %x, %y\n  %xp1 = add nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %xp1 = add nuw i64 %x, 1\n  %m1 = call i64 @llvm.umin.i64(i64 %xp1, i64 %y)\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %cmp = icmp ult i64 %x, %y\n  %r = zext i1 %cmp to i64\n  ret i64 %r\n}\n=>\ndefine i64 @unsigned_with_extra_dead_uses_ok_one_min_one_use(i64 %x, i64 %y) {\nentry:\n  %m0 = umin i64 %x, %y\n  %xp1 = add nuw i64 %x, 1\n  %m1 = umin i64 %xp1, %y\n  %r = sub i64 %m1, %m0\n  ret i64 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni64 %x = #xffffffffffffffff (18446744073709551615, -1)\ni64 %y = #x0000000000000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni64 %r = #x0000000000000000 (0)\n\nTarget:\ni64 %m0 = #x0000000000000003 (3)\ni64 %xp1 = poison\ni64 %m1 = poison\ni64 %r = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

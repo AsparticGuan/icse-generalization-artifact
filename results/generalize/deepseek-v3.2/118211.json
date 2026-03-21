@@ -1,0 +1,640 @@
+{
+  "issue_id": "118211",
+  "dataset_file": "118211.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\n## Elements Frequently Missed\n\n- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.\n- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.\n- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.\n- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.\n- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.\n- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.\n- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.\n- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.\n- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.\n- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.\n- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.\n- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Overly Specific Pattern Matching\n\nMany optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:\n\n- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)\n- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations\n- Parameterizing type constraints rather than hardcoding bit widths\n- Extracting core mathematical/algebraic properties rather than matching surface syntax\n\n### Pattern 2: Overly Restrictive Preconditions\n\nOptimizations frequently included unnecessary guards that blocked valid transformations:\n\n- Type restrictions (scalar-only, specific bit widths) that weren't semantically required\n- Single-use constraints that could be relaxed with profitability analysis\n- Declaration-specific guards that prevented optimizing calls to external functions\n- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases\n\n### Pattern 3: Incomplete Intrinsic Recognition\n\nTransformations involving intrinsics often missed:\n\n- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)\n- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)\n- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)\n- Flag propagation when creating or replacing intrinsics\n\n### Pattern 4: Comparison Predicate Handling\n\nOptimizations involving comparisons frequently missed:\n\n- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)\n- Signed-to-unsigned predicate conversion when operands have known signs\n- Predicate swapping when operands are commuted\n- The `samesign` attribute and its implications for predicate canonicalization\n\n### Pattern 5: Control Flow and PHI Node Transformations\n\nTransformations involving PHI nodes often failed to handle:\n\n- Loop backedges causing infinite combine loops\n- Multiple predecessors with different source values\n- Moving operations into predecessor blocks safely\n- Critical edges and dominance relationships\n\n### Pattern 6: Bitwise and Shift Operation Idioms\n\nComplex bit manipulation patterns were frequently missed:\n\n- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)\n- Mask decomposition for comparisons (`(X & Mask) == C` patterns)\n- Distributivity of operations over bitwise operations (`add` over `min/max`)\n- `disjoint` flag enabling xor distribution over or\n\n### Pattern 7: Select Instruction Folding\n\nSelect-based patterns often missed:\n\n- Folding operations into select arms when one arm simplifies\n- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)\n- Handling vector conditions in select-shuffle folding\n- Poison safety when condition could be poison\n\n### Pattern 8: Memory and Pointer Operations\n\nTransformations involving memory operations frequently missed:\n\n- Address space semantics and pointer validity\n- Null pointer undefined behavior across address spaces\n- Load sinking past calls with proper alias analysis\n- GEP canonicalization and constant offset folding\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i32 %x, i32 %y, i32 range(i32 0, -2147483648) %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  call void @llvm.assume(i1 %cond)\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n\ndefine i1 @test(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 true\n}\n",
+  "model_output": "```json\n{\n    \"pattern\": \"When we have `icmp slt X, Y` where we know from an assumption that `(Y - X) sgt Z` with `Z >= 0`, we can fold the comparison to true. More generally: Given `icmp slt X, Y` and an assumption guaranteeing `(Y - X) sgt C` where C is known non-negative, we can fold `icmp slt X, Y` to true. The key insight: `(Y - X) sgt C` implies `Y - X > C >= 0`, so `Y > X`, making `X slt Y` true.\",\n    \"testcases\": [\n        {\n            \"name\": \"original_example\",\n            \"ir\": \"define i1 @test(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"commuted_subtraction\",\n            \"ir\": \"define i1 @test2(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %z, %sub\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp sgt i32 %y, %x\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test2(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_icmp_predicate_sge\",\n            \"ir\": \"define i1 @test3(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sge i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test3(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_icmp_predicate_slt_on_sub\",\n            \"ir\": \"define i1 @test4(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp slt i32 %z, %sub\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test4(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"constant_zero\",\n            \"ir\": \"define i1 @test5(i32 %x, i32 %y) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, 0\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test5(i32 %x, i32 %y) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"constant_nonnegative\",\n            \"ir\": \"define i1 @test6(i32 %x, i32 %y) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, 5\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test6(i32 %x, i32 %y) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"vector_type\",\n            \"ir\": \"define <2 x i1> @test7(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z) {\\n  entry:\\n    %sub = sub nsw <2 x i32> %y, %x\\n    %cond = icmp sgt <2 x i32> %sub, %z\\n    call void @llvm.assume(<2 x i1> %cond)\\n    %ret = icmp slt <2 x i32> %x, %y\\n    ret <2 x i1> %ret\\n}\\ndeclare void @llvm.assume(<2 x i1>)\",\n            \"expected_optimized_ir\": \"define <2 x i1> @test7(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z) {\\n  entry:\\n    ret <2 x i1> <i1 true, i1 true>\\n}\"\n        },\n        {\n            \"name\": \"different_integer_width\",\n            \"ir\": \"define i1 @test8(i64 %x, i64 %y, i64 %z) {\\n  entry:\\n    %sub = sub nsw i64 %y, %x\\n    %cond = icmp sgt i64 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i64 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test8(i64 %x, i64 %y, i64 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"no_signed_wrap_on_sub\",\n            \"ir\": \"define i1 @test9(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test9(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"multiple_assumptions\",\n            \"ir\": \"define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond1 = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond1)\\n    %cond2 = icmp sgt i32 %sub, %w\\n    call void @llvm.assume(i1 %cond2)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"assume_on_constant_true\",\n            \"ir\": \"define i1 @test11(i32 %x, i32 %y) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, 0\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test11(i32 %x, i32 %y) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_signed_comparison_sle\",\n            \"ir\": \"define i1 @test12(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp sle i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test12(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_signed_comparison_sge\",\n            \"ir\": \"define i1 @test13(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp sge i32 %y, %x\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test13(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_signed_comparison_sgt\",\n            \"ir\": \"define i1 @test14(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp sgt i32 %y, %x\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test14(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"commuted_comparison_operands\",\n            \"ir\": \"define i1 @test15(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp sgt i32 %y, %x\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test15(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"negative_constant_with_known_nonnegative_z\",\n            \"ir\": \"define i1 @test16(i32 %x, i32 %y) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sgt i32 %sub, -5\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test16(i32 %x, i32 %y) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"assume_on_icmp_ne\",\n            \"ir\": \"define i1 @test17(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp ne i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test17(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"assume_on_icmp_eq\",\n            \"ir\": \"define i1 @test18(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp eq i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test18(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"assume_on_icmp_sle\",\n            \"ir\": \"define i1 @test19(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sle i32 %z, %sub\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test19(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"assume_on_icmp_sge\",\n            \"ir\": \"define i1 @test20(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    %sub = sub nsw i32 %y, %x\\n    %cond = icmp sge i32 %sub, %z\\n    call void @llvm.assume(i1 %cond)\\n    %ret = icmp slt i32 %x, %y\\n    ret i1 %ret\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i1 @test20(i32 %x, i32 %y, i32 %z) {\\n  entry:\\n    ret i1 true\\n}\"\n        }\n    ]\n}\n```",
+  "parsed": {
+    "pattern": "When we have `icmp slt X, Y` where we know from an assumption that `(Y - X) sgt Z` with `Z >= 0`, we can fold the comparison to true. More generally: Given `icmp slt X, Y` and an assumption guaranteeing `(Y - X) sgt C` where C is known non-negative, we can fold `icmp slt X, Y` to true. The key insight: `(Y - X) sgt C` implies `Y - X > C >= 0`, so `Y > X`, making `X slt Y` true.",
+    "testcases": [
+      {
+        "name": "original_example",
+        "ir": "define i1 @test(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "commuted_subtraction",
+        "ir": "define i1 @test2(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test2(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_icmp_predicate_sge",
+        "ir": "define i1 @test3(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sge i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test3(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_icmp_predicate_slt_on_sub",
+        "ir": "define i1 @test4(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp slt i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test4(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "constant_zero",
+        "ir": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 0\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "constant_nonnegative",
+        "ir": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 5\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "vector_type",
+        "ir": "define <2 x i1> @test7(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z) {\n  entry:\n    %sub = sub nsw <2 x i32> %y, %x\n    %cond = icmp sgt <2 x i32> %sub, %z\n    call void @llvm.assume(<2 x i1> %cond)\n    %ret = icmp slt <2 x i32> %x, %y\n    ret <2 x i1> %ret\n}\ndeclare void @llvm.assume(<2 x i1>)",
+        "expected_optimized_ir": "define <2 x i1> @test7(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z) {\n  entry:\n    ret <2 x i1> <i1 true, i1 true>\n}"
+      },
+      {
+        "name": "different_integer_width",
+        "ir": "define i1 @test8(i64 %x, i64 %y, i64 %z) {\n  entry:\n    %sub = sub nsw i64 %y, %x\n    %cond = icmp sgt i64 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i64 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test8(i64 %x, i64 %y, i64 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "no_signed_wrap_on_sub",
+        "ir": "define i1 @test9(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test9(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "multiple_assumptions",
+        "ir": "define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond1 = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp sgt i32 %sub, %w\n    call void @llvm.assume(i1 %cond2)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "assume_on_constant_true",
+        "ir": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 0\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_signed_comparison_sle",
+        "ir": "define i1 @test12(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sle i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test12(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_signed_comparison_sge",
+        "ir": "define i1 @test13(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sge i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test13(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_signed_comparison_sgt",
+        "ir": "define i1 @test14(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test14(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "commuted_comparison_operands",
+        "ir": "define i1 @test15(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test15(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "negative_constant_with_known_nonnegative_z",
+        "ir": "define i1 @test16(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, -5\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test16(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "assume_on_icmp_ne",
+        "ir": "define i1 @test17(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp ne i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test17(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "assume_on_icmp_eq",
+        "ir": "define i1 @test18(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp eq i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test18(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "assume_on_icmp_sle",
+        "ir": "define i1 @test19(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sle i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test19(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      },
+      {
+        "name": "assume_on_icmp_sge",
+        "ir": "define i1 @test20(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sge i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i1 @test20(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #xffffffff (4294967295, -1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "commuted_subtraction",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test2(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test2(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test2(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %z, %sub\n  assume i1 %cond\n  %ret = icmp sgt i32 %y, %x\n  ret i1 %ret\n}\n=>\ndefine i1 @test2(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000001 (1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_icmp_predicate_sge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test3(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sge i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test3(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test3(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sge i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test3(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000000 (0)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_icmp_predicate_slt_on_sub",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test4(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp slt i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test4(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test4(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp slt i32 %z, %sub\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test4(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #xffffffff (4294967295, -1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "constant_zero",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 0\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 0\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  call void @llvm.assume(i1 %cond)\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  assume i1 %cond\n  ret i1 1\n}\n=>\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test5(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  call void @llvm.assume(i1 %cond)\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\n=>\ndefine i1 @test5(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  assume i1 %cond\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\n\nTarget:\ni1 %cond = #x0 (0)\nvoid = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_nonnegative",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 5\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 5\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 5\n  call void @llvm.assume(i1 %cond)\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 5\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test6(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 5\n  call void @llvm.assume(i1 %cond)\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\n=>\ndefine i1 @test6(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 5\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\n\nTarget:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x0 (0)\nvoid = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_type",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "different_integer_width",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test8(i64 %x, i64 %y, i64 %z) {\n  entry:\n    %sub = sub nsw i64 %y, %x\n    %cond = icmp sgt i64 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i64 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test8(i64 %x, i64 %y, i64 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test8(i64 %x, i64 %y, i64 %z) {\nentry:\n  %sub = sub nsw i64 %y, %x\n  %cond = icmp sgt i64 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i64 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test8(i64 %x, i64 %y, i64 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni64 %x = #x0000000000000000 (0)\ni64 %y = #x0000000000000000 (0)\ni64 %z = #xffffffffffffffff (18446744073709551615, -1)\n\nSource:\ni64 %sub = #x0000000000000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "no_signed_wrap_on_sub",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test9(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test9(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test9(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test9(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000006 (6)\ni32 %y = #x80000004 (2147483652, -2147483644)\ni32 %z = #x00000000 (0)\n\nSource:\ni32 %sub = #x7ffffffe (2147483646)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "multiple_assumptions",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond1 = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp sgt i32 %sub, %w\n    call void @llvm.assume(i1 %cond2)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond1 = icmp sgt i32 %sub, %z\n  assume i1 %cond1\n  %cond2 = icmp sgt i32 %sub, %w\n  assume i1 %cond2\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test10(i32 %x, i32 %y, i32 %z, i32 %w) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #xffffffff (4294967295, -1)\ni32 %w = #xffffffff (4294967295, -1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond1 = #x1 (1)\ni1 %cond2 = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "assume_on_constant_true",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, 0\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 0\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  call void @llvm.assume(i1 %cond)\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  assume i1 %cond\n  ret i1 1\n}\n=>\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test11(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  call void @llvm.assume(i1 %cond)\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\n=>\ndefine i1 @test11(i32 %x, i32 %y) {\nentry:\n  %cond = icmp sgt i32 %y, %x\n  assume i1 %cond\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\n\nTarget:\ni1 %cond = #x0 (0)\nvoid = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_signed_comparison_sle",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test12(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sle i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test12(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test12(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp sle i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test12(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000008 (8)\ni32 %y = #x00000000 (0)\ni32 %z = #xfffffff7 (4294967287, -9)\n\nSource:\ni32 %sub = #xfffffff8 (4294967288, -8)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_signed_comparison_sge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test13(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sge i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test13(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test13(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp sge i32 %y, %x\n  ret i1 %ret\n}\n=>\ndefine i1 @test13(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000008 (8)\ni32 %y = #x00000000 (0)\ni32 %z = #xfffffff7 (4294967287, -9)\n\nSource:\ni32 %sub = #xfffffff8 (4294967288, -8)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_signed_comparison_sgt",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test14(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test14(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test14(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp sgt i32 %y, %x\n  ret i1 %ret\n}\n=>\ndefine i1 @test14(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #xffffffff (4294967295, -1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "commuted_comparison_operands",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test15(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp sgt i32 %y, %x\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test15(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test15(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp sgt i32 %y, %x\n  ret i1 %ret\n}\n=>\ndefine i1 @test15(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #xffffffff (4294967295, -1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "negative_constant_with_known_nonnegative_z",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test16(i32 %x, i32 %y) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sgt i32 %sub, -5\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test16(i32 %x, i32 %y) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test16(i32 %x, i32 %y) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sgt i32 %sub, 4294967291\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test16(i32 %x, i32 %y) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "assume_on_icmp_ne",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test17(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp ne i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test17(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test17(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp ne i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test17(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000001 (1)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "assume_on_icmp_eq",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test18(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp eq i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test18(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test18(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp eq i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test18(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000000 (0)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "assume_on_icmp_sle",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test19(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sle i32 %z, %sub\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test19(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test19(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sle i32 %z, %sub\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test19(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000000 (0)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "assume_on_icmp_sge",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test20(i32 %x, i32 %y, i32 %z) {\n  entry:\n    %sub = sub nsw i32 %y, %x\n    %cond = icmp sge i32 %sub, %z\n    call void @llvm.assume(i1 %cond)\n    %ret = icmp slt i32 %x, %y\n    ret i1 %ret\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i1 @test20(i32 %x, i32 %y, i32 %z) {\n  entry:\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test20(i32 %x, i32 %y, i32 %z) {\nentry:\n  %sub = sub nsw i32 %y, %x\n  %cond = icmp sge i32 %sub, %z\n  assume i1 %cond\n  %ret = icmp slt i32 %x, %y\n  ret i1 %ret\n}\n=>\ndefine i1 @test20(i32 %x, i32 %y, i32 %z) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\ni32 %z = #x00000000 (0)\n\nSource:\ni32 %sub = #x00000000 (0)\ni1 %cond = #x1 (1)\ni1 %ret = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

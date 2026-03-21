@@ -1,0 +1,383 @@
+{
+  "issue_id": "64859",
+  "dataset_file": "64859.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test_sext_sext_cvt_2_slt_icmp(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\n\ndefine i1 @test_sext_sext_cvt_2_slt_icmp(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses a constant folding opportunity involving the summation of sign-extended booleans (i1 to iN) compared against a constant. Since `sext i1` produces only {0, -1}, the sum of N such values is bounded by [-N, 0]. Comparisons entirely outside this range can be folded to true or false.\",\n  \"before_after\": \"Fold `icmp (add (sext i1 X), (sext i1 Y), ...), C` to `true` or `false` based on the known range of the sum.\",\n  \"preconditions\": [\n    \"The operands of the `add` instruction (or tree of adds) are primarily `sext` from `i1`.\",\n    \"The destination type of the `sext` matches the type of the `add`.\",\n    \"The `add` chain may include constant integers, which act as an offset to the range.\",\n    \"The comparison is against a constant.\",\n    \"The comparison predicate is signed (slt, sle, sgt, sge, eq, ne).\",\n    \"No `nuw`/`nsw` flags that would invalidate the range analysis (e.g., `nuw` on an add of two -1s is UB/poison, so we must ensure the logic handles poison constraints correctly or assumes non-poison inputs for the fold).\",\n    \"Vectors: The operation must be valid on vectors (element-wise).\"\n  ],\n  \"pattern\": \"Pattern: `icmp P (Add (SExt(i1 %a), SExt(i1 %b), ..., Offset)), C`\\nLogic:\\n1. Let N be the count of `SExt(i1)` operands.\\n2. The range of the sum of sexts is `[-N, 0]`.\\n3. Adjust range by `Offset`: `[Min, Max] = [-N + Offset, 0 + Offset]`.\\n4. Check if `[Min, Max]` satisfies predicate `P` for all values relative to constant `C`.\\n   - If `Max < C` (for `slt`), fold to `true`.\\n   - If `Min >= C` (for `slt`), fold to `false`.\\n   - (Similar logic for `sgt`, `eq`, etc.)\",\n  \"testcases\": [\n    {\n      \"name\": \"original_case\",\n      \"ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %i3 = add i32 %i2, %i\\n  %i4 = icmp slt i32 %i3, 2\\n  ret i1 %i4\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n      \"why\": \"Range is [-2, 0]. 0 < 2 is always true.\"\n    },\n    {\n      \"name\": \"always_false_negative_bound\",\n      \"ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %i3 = add i32 %i2, %i\\n  %i4 = icmp slt i32 %i3, -3\\n  ret i1 %i4\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 false\\n}\",\n      \"why\": \"Range is [-2, 0]. -2 is not < -3. Always false.\"\n    },\n    {\n      \"name\": \"indeterminate_range_overlap\",\n      \"ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %i3 = add i32 %i2, %i\\n  %i4 = icmp slt i32 %i3, -1\\n  ret i1 %i4\\n}\",\n      \"expected_optimized_ir\": \"; No change expected (or minimal simplification)\\ndefine i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %i3 = add i32 %i2, %i\\n  %i4 = icmp slt i32 %i3, -1\\n  ret i1 %i4\\n}\",\n      \"why\": \"Range is [-2, 0]. -2 < -1 (true), but 0 < -1 (false). Cannot fold.\"\n    },\n    {\n      \"name\": \"three_operands_sgt\",\n      \"ir\": \"define i1 @test(i1 %a, i1 %b, i1 %c) {\\nbb:\\n  %s1 = sext i1 %a to i16\\n  %s2 = sext i1 %b to i16\\n  %s3 = sext i1 %c to i16\\n  %sum = add i16 %s1, %s2\\n  %sum2 = add i16 %sum, %s3\\n  %cmp = icmp sgt i16 %sum2, -4\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %a, i1 %b, i1 %c) {\\nbb:\\n  ret i1 true\\n}\",\n      \"why\": \"Range is [-3, 0]. Min -3 > -4 is always true.\"\n    },\n    {\n      \"name\": \"with_constant_offset\",\n      \"ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %sum = add i32 %i, %i2\\n  %offset = add i32 %sum, 5\\n  %i4 = icmp slt i32 %offset, 4\\n  ret i1 %i4\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 false\\n}\",\n      \"why\": \"Sext range [-2, 0]. Offset range [-2+5, 0+5] = [3, 5]. 3 < 4 is not always true (5 < 4 is false). Wait, [3, 5] < 4 is NOT always true. It is sometimes true (3). \\nCorrection: Expected result is NOT foldable to true. \\nLet's adjust constant to make it always true: < 6.\",\n      \"correction\": {\n        \"ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %sum = add i32 %i, %i2\\n  %offset = add i32 %sum, 5\\n  %i4 = icmp slt i32 %offset, 6\\n  ret i1 %i4\\n}\",\n        \"expected_optimized_ir\": \"define i1 @test(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n        \"why\": \"Range [3, 5]. Max 5 < 6 is always true.\"\n      }\n    },\n    {\n      \"name\": \"vector_case\",\n      \"ir\": \"define <2 x i1> @test(<2 x i1> %arg, <2 x i1> %arg1) {\\nbb:\\n  %i = sext <2 x i1> %arg to <2 x i32>\\n  %i2 = sext <2 x i1> %arg1 to <2 x i32>\\n  %i3 = add <2 x i32> %i2, %i\\n  %i4 = icmp slt <2 x i32> %i3, <i32 2, i32 2>\\n  ret <2 x i1> %i4\\n}\",\n      \"expected_optimized_ir\": \"define <2 x i1> @test(<2 x i1> %arg, <2 x i1> %arg1) {\\nbb:\\n  ret <2 x i1> <true, true>\\n}\",\n      \"why\": \"Vector version of original case. Element-wise logic.\"\n    },\n    {\n      \"name\": \"zext_variant\",\n      \"ir\": \"define i1 @test_zext(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = zext i1 %arg to i32\\n  %i2 = zext i1 %arg1 to i32\\n  %i3 = add i32 %i2, %i\\n  %i4 = icmp ult i32 %i3, 3\\n  ret i1 %i4\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_zext(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n      \"why\": \"Zext i1 is {0, 1}. Sum range [0, 2]. 2 < 3 is always true.\"\n    },\n    {\n      \"name\": \"subtraction_case\",\n      \"ir\": \"define i1 @test_sub(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %diff = sub i32 %i, %i2\\n  %cmp = icmp slt i32 %diff, 2\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_sub(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n      \"why\": \"Sext A in [-1, 0], Sext B in [-1, 0]. A - B is [-1 - 0, 0 - (-1)] = [-1, 1]. Max 1 < 2 is always true.\"\n    },\n    {\n      \"name\": \"eq_ne_case\",\n      \"ir\": \"define i1 @test_eq(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %sum = add i32 %i, %i2\\n  %cmp = icmp eq i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_eq(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 false\\n}\",\n      \"why\": \"Sum range [-2, 0]. 1 is not in range. Always false.\"\n    },\n    {\n      \"name\": \"nuw_flag_constraining_range\",\n      \"ir\": \"define i1 @test_nuw(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %sum = add nuw i32 %i, %i2\\n  %cmp = icmp slt i32 %sum, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_nuw(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n      \"why\": \"nuw implies result is non-negative. Wait, if inputs are -1 and -1, sum is -2, which violates nuw. So valid inputs cannot be (-1, -1). Range becomes [-1, 0]. Max 0 < 0 is False. Min -1 < 0 is True. Indeterminate.\\nLet's flip the logic: check < 1. Range [-1, 0]. Max 0 < 1 is True.\",\n      \"correction\": {\n        \"ir\": \"define i1 @test_nuw(i1 %arg, i1 %arg1) {\\nbb:\\n  %i = sext i1 %arg to i32\\n  %i2 = sext i1 %arg1 to i32\\n  %sum = add nuw i32 %i, %i2\\n  %cmp = icmp slt i32 %sum, 1\\n  ret i1 %cmp\\n}\",\n        \"expected_optimized_ir\": \"define i1 @test_nuw(i1 %arg, i1 %arg1) {\\nbb:\\n  ret i1 true\\n}\",\n        \"why\": \"nuw forbids (-1 + -1). Valid range is [-1, 0]. Max 0 < 1 is always true.\"\n      }\n    }\n  ],\n  \"implementation_notes\": \"1. Matching: Look for `ICmpInst` where one operand is `ConstantInt` and the other is a binary operator (likely `Add`, `Sub`).\\n2. Decomposition: Recursively walk the add/sub tree to count `SExt` (from i1) nodes and accumulate constant offsets.\\n3. Range Calculation:\\n   - For `SExt i1`: Range = [-1, 0].\\n   - For `ZExt i1`: Range = [0, 1].\\n   - For `Sub`: Treat as `Add` of LHS and negative RHS (requires negating the range of RHS).\\n4. Optimization: Compare the accumulated range `[Min, Max]` against `C` using the predicate.\\n5. Flags: Check `nuw`/`nsw` on adds. If `nuw` is present, `(-1) + (-1)` is undefined, effectively narrowing the minimum range from -N to -(N-1).\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on these snippets. Verify that `icmp` instructions are eliminated or replaced by constants where expected. Pay special attention to the vector cases and the nuw cases.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses a constant folding opportunity involving the summation of sign-extended booleans (i1 to iN) compared against a constant. Since `sext i1` produces only {0, -1}, the sum of N such values is bounded by [-N, 0]. Comparisons entirely outside this range can be folded to true or false.",
+    "before_after": "Fold `icmp (add (sext i1 X), (sext i1 Y), ...), C` to `true` or `false` based on the known range of the sum.",
+    "preconditions": [
+      "The operands of the `add` instruction (or tree of adds) are primarily `sext` from `i1`.",
+      "The destination type of the `sext` matches the type of the `add`.",
+      "The `add` chain may include constant integers, which act as an offset to the range.",
+      "The comparison is against a constant.",
+      "The comparison predicate is signed (slt, sle, sgt, sge, eq, ne).",
+      "No `nuw`/`nsw` flags that would invalidate the range analysis (e.g., `nuw` on an add of two -1s is UB/poison, so we must ensure the logic handles poison constraints correctly or assumes non-poison inputs for the fold).",
+      "Vectors: The operation must be valid on vectors (element-wise)."
+    ],
+    "pattern": "Pattern: `icmp P (Add (SExt(i1 %a), SExt(i1 %b), ..., Offset)), C`\nLogic:\n1. Let N be the count of `SExt(i1)` operands.\n2. The range of the sum of sexts is `[-N, 0]`.\n3. Adjust range by `Offset`: `[Min, Max] = [-N + Offset, 0 + Offset]`.\n4. Check if `[Min, Max]` satisfies predicate `P` for all values relative to constant `C`.\n   - If `Max < C` (for `slt`), fold to `true`.\n   - If `Min >= C` (for `slt`), fold to `false`.\n   - (Similar logic for `sgt`, `eq`, etc.)",
+    "testcases": [
+      {
+        "name": "original_case",
+        "ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+        "why": "Range is [-2, 0]. 0 < 2 is always true."
+      },
+      {
+        "name": "always_false_negative_bound",
+        "ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -3\n  ret i1 %i4\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+        "why": "Range is [-2, 0]. -2 is not < -3. Always false."
+      },
+      {
+        "name": "indeterminate_range_overlap",
+        "ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+        "expected_optimized_ir": "; No change expected (or minimal simplification)\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+        "why": "Range is [-2, 0]. -2 < -1 (true), but 0 < -1 (false). Cannot fold."
+      },
+      {
+        "name": "three_operands_sgt",
+        "ir": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add i16 %s1, %s2\n  %sum2 = add i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, -4\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 true\n}",
+        "why": "Range is [-3, 0]. Min -3 > -4 is always true."
+      },
+      {
+        "name": "with_constant_offset",
+        "ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %offset = add i32 %sum, 5\n  %i4 = icmp slt i32 %offset, 4\n  ret i1 %i4\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+        "why": "Sext range [-2, 0]. Offset range [-2+5, 0+5] = [3, 5]. 3 < 4 is not always true (5 < 4 is false). Wait, [3, 5] < 4 is NOT always true. It is sometimes true (3). \nCorrection: Expected result is NOT foldable to true. \nLet's adjust constant to make it always true: < 6.",
+        "correction": {
+          "ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %offset = add i32 %sum, 5\n  %i4 = icmp slt i32 %offset, 6\n  ret i1 %i4\n}",
+          "expected_optimized_ir": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "why": "Range [3, 5]. Max 5 < 6 is always true."
+        }
+      },
+      {
+        "name": "vector_case",
+        "ir": "define <2 x i1> @test(<2 x i1> %arg, <2 x i1> %arg1) {\nbb:\n  %i = sext <2 x i1> %arg to <2 x i32>\n  %i2 = sext <2 x i1> %arg1 to <2 x i32>\n  %i3 = add <2 x i32> %i2, %i\n  %i4 = icmp slt <2 x i32> %i3, <i32 2, i32 2>\n  ret <2 x i1> %i4\n}",
+        "expected_optimized_ir": "define <2 x i1> @test(<2 x i1> %arg, <2 x i1> %arg1) {\nbb:\n  ret <2 x i1> <true, true>\n}",
+        "why": "Vector version of original case. Element-wise logic."
+      },
+      {
+        "name": "zext_variant",
+        "ir": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp ult i32 %i3, 3\n  ret i1 %i4\n}",
+        "expected_optimized_ir": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+        "why": "Zext i1 is {0, 1}. Sum range [0, 2]. 2 < 3 is always true."
+      },
+      {
+        "name": "subtraction_case",
+        "ir": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %diff = sub i32 %i, %i2\n  %cmp = icmp slt i32 %diff, 2\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+        "why": "Sext A in [-1, 0], Sext B in [-1, 0]. A - B is [-1 - 0, 0 - (-1)] = [-1, 1]. Max 1 < 2 is always true."
+      },
+      {
+        "name": "eq_ne_case",
+        "ir": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+        "why": "Sum range [-2, 0]. 1 is not in range. Always false."
+      },
+      {
+        "name": "nuw_flag_constraining_range",
+        "ir": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nuw i32 %i, %i2\n  %cmp = icmp slt i32 %sum, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+        "why": "nuw implies result is non-negative. Wait, if inputs are -1 and -1, sum is -2, which violates nuw. So valid inputs cannot be (-1, -1). Range becomes [-1, 0]. Max 0 < 0 is False. Min -1 < 0 is True. Indeterminate.\nLet's flip the logic: check < 1. Range [-1, 0]. Max 0 < 1 is True.",
+        "correction": {
+          "ir": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nuw i32 %i, %i2\n  %cmp = icmp slt i32 %sum, 1\n  ret i1 %cmp\n}",
+          "expected_optimized_ir": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "why": "nuw forbids (-1 + -1). Valid range is [-1, 0]. Max 0 < 1 is always true."
+        }
+      }
+    ],
+    "implementation_notes": "1. Matching: Look for `ICmpInst` where one operand is `ConstantInt` and the other is a binary operator (likely `Add`, `Sub`).\n2. Decomposition: Recursively walk the add/sub tree to count `SExt` (from i1) nodes and accumulate constant offsets.\n3. Range Calculation:\n   - For `SExt i1`: Range = [-1, 0].\n   - For `ZExt i1`: Range = [0, 1].\n   - For `Sub`: Treat as `Add` of LHS and negative RHS (requires negating the range of RHS).\n4. Optimization: Compare the accumulated range `[Min, Max]` against `C` using the predicate.\n5. Flags: Check `nuw`/`nsw` on adds. If `nuw` is present, `(-1) + (-1)` is undefined, effectively narrowing the minimum range from -N to -(N-1).",
+    "regression_test_notes": "Use `opt -instcombine -S` on these snippets. Verify that `icmp` instructions are eliminated or replaced by constants where expected. Pay special attention to the vector cases and the nuw cases.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "original_case",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}",
+          "tgt": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\n",
+          "tgt": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 2\n  ret i1 %i4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %arg = #x0 (0)\ni1 %arg1 = poison\n\nSource:\n\nTarget:\ni32 %i = #x00000000 (0)\ni32 %i2 = poison\ni32 %i3 = poison\ni1 %i4 = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "always_false_negative_bound",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -3\n  ret i1 %i4\n}",
+          "tgt": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967293\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -3\n  ret i1 %i4\n}\n",
+          "tgt": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967293\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -3\n  ret i1 %i4\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967293\n  ret i1 %i4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %arg = #x0 (0)\ni1 %arg1 = poison\n\nSource:\n\nTarget:\ni32 %i = #x00000000 (0)\ni32 %i2 = poison\ni32 %i3 = poison\ni1 %i4 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "indeterminate_range_overlap",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+          "tgt": "; No change expected (or minimal simplification)\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}\n",
+          "tgt": "; No change expected (or minimal simplification)\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "; No change expected (or minimal simplification)\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, -1\n  ret i1 %i4\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %i3 = add nsw i32 %i2, %i\n  %i4 = icmp slt i32 %i3, 4294967295\n  ret i1 %i4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "three_operands_sgt",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add i16 %s1, %s2\n  %sum2 = add i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, -4\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add i16 %s1, %s2\n  %sum2 = add i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, 65532\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add nsw i16 %s1, %s2\n  %sum2 = add nsw i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, -4\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add nsw i16 %s1, %s2\n  %sum2 = add nsw i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, 65532\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add nsw i16 %s1, %s2\n  %sum2 = add nsw i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, -4\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  ret i1 1\n}\n=>\ndefine i1 @test(i1 %a, i1 %b, i1 %c) {\nbb:\n  %s1 = sext i1 %a to i16\n  %s2 = sext i1 %b to i16\n  %s3 = sext i1 %c to i16\n  %sum = add nsw i16 %s1, %s2\n  %sum2 = add nsw i16 %sum, %s3\n  %cmp = icmp sgt i16 %sum2, 65532\n  ret i1 %cmp\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %a = poison\ni1 %b = #x0 (0)\ni1 %c = #x0 (0)\n\nSource:\n\nTarget:\ni16 %s1 = poison\ni16 %s2 = #x0000 (0)\ni16 %s3 = #x0000 (0)\ni16 %sum = poison\ni16 %sum2 = poison\ni1 %cmp = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_constant_offset",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %offset = add i32 %sum, 5\n  %i4 = icmp slt i32 %offset, 4\n  ret i1 %i4\n}",
+          "tgt": "define i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %offset = add i32 %sum, 5\n  %i4 = icmp slt i32 %offset, 4\n  ret i1 %i4\n}\n=>\ndefine i1 @test(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %arg = #x1 (1)\ni1 %arg1 = #x1 (1)\n\nSource:\ni32 %i = #xffffffff (4294967295, -1)\ni32 %i2 = #xffffffff (4294967295, -1)\ni32 %sum = #xfffffffe (4294967294, -2)\ni32 %offset = #x00000003 (3)\ni1 %i4 = #x1 (1)\n\nTarget:\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_case",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 5,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmpoohziemr.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmpoohziemr.ll:3:17: error: expected type\n  ret <2 x i1> <true, true>\n                ^\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "zext_variant",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp ult i32 %i3, 3\n  ret i1 %i4\n}",
+          "tgt": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add i32 %i2, %i\n  %i4 = icmp ult i32 %i3, 3\n  ret i1 %i4\n}\n=>\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add nuw nsw i32 %i2, %i\n  %i4 = icmp ne i32 %i3, 3\n  ret i1 %i4\n}\n",
+          "tgt": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add nsw nuw i32 %i2, %i\n  %i4 = icmp ne i32 %i3, 3\n  ret i1 %i4\n}\n=>\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add nuw nsw i32 %i2, %i\n  %i4 = icmp ne i32 %i3, 3\n  ret i1 %i4\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\n=>\ndefine i1 @test_zext(i1 %arg, i1 %arg1) {\nbb:\n  %i = zext i1 %arg to i32\n  %i2 = zext i1 %arg1 to i32\n  %i3 = add nsw nuw i32 %i2, %i\n  %i4 = icmp ne i32 %i3, 3\n  ret i1 %i4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %arg = poison\ni1 %arg1 = #x1 (1)\n\nSource:\n\nTarget:\ni32 %i = poison\ni32 %i2 = #x00000001 (1)\ni32 %i3 = poison\ni1 %i4 = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "subtraction_case",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %diff = sub i32 %i, %i2\n  %cmp = icmp slt i32 %diff, 2\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %diff = sub i32 %i, %i2\n  %cmp = icmp slt i32 %diff, 2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}\n",
+          "tgt": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\n=>\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\n=>\ndefine i1 @test_sub(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "eq_ne_case",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nsw i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nsw i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nsw i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 0\n}\n=>\ndefine i1 @test_eq(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nsw i32 %i, %i2\n  %cmp = icmp eq i32 %sum, 1\n  ret i1 %cmp\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %arg = #x0 (0)\ni1 %arg1 = poison\n\nSource:\n\nTarget:\ni32 %i = #x00000000 (0)\ni32 %i2 = poison\ni32 %sum = poison\ni1 %cmp = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_flag_constraining_range",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nuw i32 %i, %i2\n  %cmp = icmp slt i32 %sum, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  %i = sext i1 %arg to i32\n  %i2 = sext i1 %arg1 to i32\n  %sum = add nuw i32 %i, %i2\n  %cmp = icmp slt i32 %sum, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_nuw(i1 %arg, i1 %arg1) {\nbb:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %arg = #x0 (0)\ni1 %arg1 = #x0 (0)\n\nSource:\ni32 %i = #x00000000 (0)\ni32 %i2 = #x00000000 (0)\ni32 %sum = #x00000000 (0)\ni1 %cmp = #x0 (0)\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.4s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

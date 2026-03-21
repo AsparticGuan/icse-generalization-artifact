@@ -1,0 +1,282 @@
+{
+  "issue_id": "88231",
+  "dataset_file": "88231.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ntarget datalayout = \"e-p:64:64:64-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\n@dummy_global1 = external global ptr\n\ndefine i64 @test60(ptr %foo, i64 %i, i64 %j) {\n  %gep1 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 %j, i64 %i\n  %gep2 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 42, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  store ptr %gep1, ptr @dummy_global1, align 8\n  ret i64 %sub\n}\n\ntarget datalayout = \"e-p:64:64:64-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\n@dummy_global1 = external global ptr\n\ndefine i64 @test60(ptr %foo, i64 %i, i64 %j) {\n  %gep1.idx = mul nsw i64 %j, 100\n  %gep1.offs = add nsw i64 %gep1.idx, %i\n  %gep1 = getelementptr inbounds i8, ptr %foo, i64 %gep1.offs\n  %gepdiff = add nsw i64 %gep1.offs, -4200\n  store ptr %gep1, ptr @dummy_global1, align 8\n  ret i64 %gepdiff\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses the optimization to fold the difference of two pointers (derived from the same base via GEP) into the difference of their integer offsets. This involves eliminating `ptrtoint` and `getelementptr` instructions in favor of integer arithmetic.\",\n  \"before_after\": \"Transforms `sub (ptrtoint (gep inbounds %P, %Idxs1)), (ptrtoint (gep inbounds %P, %Idxs2))` into `Offset1 - Offset2`, where `Offset1` and `Offset2` are the computed byte offsets of the GEPs relative to `%P`. The subtraction is typically canonicalized to an `add` with a negative constant.\",\n  \"preconditions\": \"1. Both operands of the `sub` must be `ptrtoint` instructions. 2. The operands of the `ptrtoint` must be `getelementptr` instructions. 3. The base pointers of the GEPs must be identical (modulo bitcasts). 4. The GEPs must be inbounds to guarantee the subtraction does not overflow signed integer bounds (allowing `nsw` propagation), though the arithmetic fold itself is valid for valid pointers even without `inbounds` assuming a flat memory model.\",\n  \"pattern\": \"Match: `%sub = sub (ptrtoint (gep %base, %idxs1)), (ptrtoint (gep %base, %idxs2))`. Fold: `%sub = (Offset(%idxs1) - Offset(%idxs2))`. If GEPs are `inbounds`, the resulting arithmetic carries `nsw`.\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_2d_array\",\n      \"ir\": \"define i64 @test(ptr %foo, i64 %i, i64 %j) {\\n  %gep1 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 %j, i64 %i\\n  %gep2 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 42, i64 0\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(ptr %foo, i64 %i, i64 %j) {\\n  %mul = mul nsw i64 %j, 100\\n  %add = add nsw i64 %mul, %i\\n  %sub = add nsw i64 %add, -4200\\n  ret i64 %sub\\n}\",\n      \"why\": \"Standard case: difference of two GEPs into a 2D array with one constant index.\"\n    },\n    {\n      \"name\": \"struct_access\",\n      \"ir\": \"%S = type { i32, i64, i8 }\\n\\ndefine i64 @test_struct(ptr %foo) {\\n  %gep1 = getelementptr inbounds %S, ptr %foo, i64 0, i32 2\\n  %gep2 = getelementptr inbounds %S, ptr %foo, i64 0, i32 1\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"%S = type { i32, i64, i8 }\\n\\ndefine i64 @test_struct(ptr %foo) {\\n  ret i64 8\\n}\",\n      \"why\": \"Struct GEPs with constant indices: the result is a constant equal to the size of the field offset difference.\"\n    },\n    {\n      \"name\": \"variable_index_array\",\n      \"ir\": \"define i64 @test_var(ptr %foo, i64 %i) {\\n  %gep1 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 %i\\n  %gep2 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 5\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test_var(ptr %foo, i64 %i) {\\n  %mul = mul nsw i64 %i, 4\\n  %sub = add nsw i64 %mul, -20\\n  ret i64 %sub\\n}\",\n      \"why\": \"GEPs into an array of i32 (4-byte size) with one variable and one constant index.\"\n    },\n    {\n      \"name\": \"reversed_operands\",\n      \"ir\": \"define i64 @test_rev(ptr %foo, i64 %i) {\\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 10\\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test_rev(ptr %foo, i64 %i) {\\n  %sub = sub nsw i64 10, %i\\n  ret i64 %sub\\n}\",\n      \"why\": \"Tests if the matcher handles (Const - Var) correctly, resulting in negation logic.\"\n    },\n    {\n      \"name\": \"no_inbounds\",\n      \"ir\": \"define i64 @test_no_inbounds(ptr %foo, i64 %i) {\\n  %gep1 = getelementptr [100 x i8], ptr %foo, i64 0, i64 %i\\n  %gep2 = getelementptr [100 x i8], ptr %foo, i64 0, i64 0\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test_no_inbounds(ptr %foo, i64 %i) {\\n  %sub = sub i64 %i, 0\\n  ret i64 %sub\\n}\",\n      \"why\": \"Without `inbounds`, the fold is still valid arithmetically but `nsw` flags cannot be propagated.\"\n    },\n    {\n      \"name\": \"different_bases_negative\",\n      \"ir\": \"define i64 @test_diff_base(ptr %foo, ptr %bar, i64 %i) {\\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\\n  %gep2 = getelementptr inbounds [100 x i8], ptr %bar, i64 0, i64 0\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test_diff_base(ptr %foo, ptr %bar, i64 %i) {\\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\\n  %gep2 = getelementptr inbounds [100 x i8], ptr %bar, i64 0, i64 0\\n  %cast1 = ptrtoint ptr %gep1 to i64\\n  %cast2 = ptrtoint ptr %gep2 to i64\\n  %sub = sub i64 %cast1, %cast2\\n  ret i64 %sub\\n}\",\n      \"why\": \"Negative test: Bases are different, so the offset subtraction is not equivalent to the pointer subtraction.\"\n    },\n    {\n      \"name\": \"vector_g_indices\",\n      \"ir\": \"define <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> %i\\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> <i64 5, i64 6>\\n  %cast1 = ptrtoint <2 x ptr> %gep1 to <2 x i64>\\n  %cast2 = ptrtoint <2 x ptr> %gep2 to <2 x i64>\\n  %sub = sub <2 x i64> %cast1, %cast2\\n  ret <2 x i64> %sub\\n}\",\n      \"expected_optimized_ir\": \"define <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\\n  %sub = sub <2 x i64> %i, <i64 5, i64 6>\\n  ret <2 x i64> %sub\\n}\",\n      \"why\": \"Vector GEPs should fold similarly to scalar GEPs, producing vector arithmetic.\"\n    }\n  ],\n  \"implementation_notes\": \"1. In `InstCombine::visitSub`, check if both operands are `ptrtoint`. 2. Check if the operands of `ptrtoint` are GEPs. 3. Use `getUnderlyingObject` or similar to verify the base pointers are identical. 4. Use `DataLayout` to compute the offset of each GEP. `GEPOperator::accumulateConstantOffset` is useful here. 5. Subtract the computed offsets. 6. If both GEPs are `inbounds`, mark the resulting `sub` (or canonicalized `add`) with `nsw`.\",\n  \"regression_test_notes\": \"Test with `opt -instcombine -S`. Verify that `ptrtoint` and `gep` instructions disappear and are replaced by `mul`, `add`, or `sub` instructions with appropriate `nsw` flags when `inbounds` is present. Ensure `opt` does not crash on vector types.\",\n  \"clarifying_questions\": [\n    \"Should this transformation attempt to fold cases where one GEP is `inbounds` and the other is not?\",\n    \"How aggressive should we be with handling `bitcast` of the base pointer? (e.g. `gep (bitcast %p), ...` vs `gep %p, ...`)\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses the optimization to fold the difference of two pointers (derived from the same base via GEP) into the difference of their integer offsets. This involves eliminating `ptrtoint` and `getelementptr` instructions in favor of integer arithmetic.",
+    "before_after": "Transforms `sub (ptrtoint (gep inbounds %P, %Idxs1)), (ptrtoint (gep inbounds %P, %Idxs2))` into `Offset1 - Offset2`, where `Offset1` and `Offset2` are the computed byte offsets of the GEPs relative to `%P`. The subtraction is typically canonicalized to an `add` with a negative constant.",
+    "preconditions": "1. Both operands of the `sub` must be `ptrtoint` instructions. 2. The operands of the `ptrtoint` must be `getelementptr` instructions. 3. The base pointers of the GEPs must be identical (modulo bitcasts). 4. The GEPs must be inbounds to guarantee the subtraction does not overflow signed integer bounds (allowing `nsw` propagation), though the arithmetic fold itself is valid for valid pointers even without `inbounds` assuming a flat memory model.",
+    "pattern": "Match: `%sub = sub (ptrtoint (gep %base, %idxs1)), (ptrtoint (gep %base, %idxs2))`. Fold: `%sub = (Offset(%idxs1) - Offset(%idxs2))`. If GEPs are `inbounds`, the resulting arithmetic carries `nsw`.",
+    "testcases": [
+      {
+        "name": "basic_2d_array",
+        "ir": "define i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %gep1 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 %j, i64 %i\n  %gep2 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 42, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "define i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}",
+        "why": "Standard case: difference of two GEPs into a 2D array with one constant index."
+      },
+      {
+        "name": "struct_access",
+        "ir": "%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  %gep1 = getelementptr inbounds %S, ptr %foo, i64 0, i32 2\n  %gep2 = getelementptr inbounds %S, ptr %foo, i64 0, i32 1\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}",
+        "why": "Struct GEPs with constant indices: the result is a constant equal to the size of the field offset difference."
+      },
+      {
+        "name": "variable_index_array",
+        "ir": "define i64 @test_var(ptr %foo, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 %i\n  %gep2 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 5\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "define i64 @test_var(ptr %foo, i64 %i) {\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}",
+        "why": "GEPs into an array of i32 (4-byte size) with one variable and one constant index."
+      },
+      {
+        "name": "reversed_operands",
+        "ir": "define i64 @test_rev(ptr %foo, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 10\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "define i64 @test_rev(ptr %foo, i64 %i) {\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}",
+        "why": "Tests if the matcher handles (Const - Var) correctly, resulting in negation logic."
+      },
+      {
+        "name": "no_inbounds",
+        "ir": "define i64 @test_no_inbounds(ptr %foo, i64 %i) {\n  %gep1 = getelementptr [100 x i8], ptr %foo, i64 0, i64 %i\n  %gep2 = getelementptr [100 x i8], ptr %foo, i64 0, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "define i64 @test_no_inbounds(ptr %foo, i64 %i) {\n  %sub = sub i64 %i, 0\n  ret i64 %sub\n}",
+        "why": "Without `inbounds`, the fold is still valid arithmetically but `nsw` flags cannot be propagated."
+      },
+      {
+        "name": "different_bases_negative",
+        "ir": "define i64 @test_diff_base(ptr %foo, ptr %bar, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\n  %gep2 = getelementptr inbounds [100 x i8], ptr %bar, i64 0, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "expected_optimized_ir": "define i64 @test_diff_base(ptr %foo, ptr %bar, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\n  %gep2 = getelementptr inbounds [100 x i8], ptr %bar, i64 0, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+        "why": "Negative test: Bases are different, so the offset subtraction is not equivalent to the pointer subtraction."
+      },
+      {
+        "name": "vector_g_indices",
+        "ir": "define <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> %i\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> <i64 5, i64 6>\n  %cast1 = ptrtoint <2 x ptr> %gep1 to <2 x i64>\n  %cast2 = ptrtoint <2 x ptr> %gep2 to <2 x i64>\n  %sub = sub <2 x i64> %cast1, %cast2\n  ret <2 x i64> %sub\n}",
+        "expected_optimized_ir": "define <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %sub = sub <2 x i64> %i, <i64 5, i64 6>\n  ret <2 x i64> %sub\n}",
+        "why": "Vector GEPs should fold similarly to scalar GEPs, producing vector arithmetic."
+      }
+    ],
+    "implementation_notes": "1. In `InstCombine::visitSub`, check if both operands are `ptrtoint`. 2. Check if the operands of `ptrtoint` are GEPs. 3. Use `getUnderlyingObject` or similar to verify the base pointers are identical. 4. Use `DataLayout` to compute the offset of each GEP. `GEPOperator::accumulateConstantOffset` is useful here. 5. Subtract the computed offsets. 6. If both GEPs are `inbounds`, mark the resulting `sub` (or canonicalized `add`) with `nsw`.",
+    "regression_test_notes": "Test with `opt -instcombine -S`. Verify that `ptrtoint` and `gep` instructions disappear and are replaced by `mul`, `add`, or `sub` instructions with appropriate `nsw` flags when `inbounds` is present. Ensure `opt` does not crash on vector types.",
+    "clarifying_questions": [
+      "Should this transformation attempt to fold cases where one GEP is `inbounds` and the other is not?",
+      "How aggressive should we be with handling `bitcast` of the base pointer? (e.g. `gep (bitcast %p), ...` vs `gep %p, ...`)"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_2d_array",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %gep1 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 %j, i64 %i\n  %gep2 = getelementptr inbounds [100 x [100 x i8]], ptr %foo, i64 0, i64 42, i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %gep1 = gep inbounds ptr %foo, 10000 x i64 0, 100 x i64 %j, 1 x i64 %i\n  %gep2 = gep inbounds ptr %foo, 10000 x i64 0, 100 x i64 42, 1 x i64 0\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}\n=>\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %gep1.idx = mul nsw i64 %j, 100\n  %gep1.offs = add nsw i64 %gep1.idx, %i\n  %gepdiff = add nsw i64 %gep1.offs, -4200\n  ret i64 %gepdiff\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %gep1.idx = mul nsw i64 %j, 100\n  %gep1.offs = add nsw i64 %gep1.idx, %i\n  %gepdiff = add nsw i64 %gep1.offs, -4200\n  ret i64 %gepdiff\n}\n=>\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n  %gep1.idx = mul nsw i64 %j, 100\n  %gep1.offs = add nsw i64 %gep1.idx, %i\n  %gepdiff = add nsw i64 %gep1.offs, -4200\n  ret i64 %gepdiff\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %mul = mul nsw i64 %j, 100\n  %add = add nsw i64 %mul, %i\n  %sub = add nsw i64 %add, -4200\n  ret i64 %sub\n}\n=>\ndefine i64 @test(ptr %foo, i64 %i, i64 %j) {\n#0:\n  %gep1.idx = mul nsw i64 %j, 100\n  %gep1.offs = add nsw i64 %gep1.idx, %i\n  %gepdiff = add nsw i64 %gep1.offs, -4200\n  ret i64 %gepdiff\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "struct_access",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  %gep1 = getelementptr inbounds %S, ptr %foo, i64 0, i32 2\n  %gep2 = getelementptr inbounds %S, ptr %foo, i64 0, i32 1\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  %gep1 = gep inbounds ptr %foo, 16 x i64 0, 1 x i64 12\n  %gep2 = gep inbounds ptr %foo, 16 x i64 0, 1 x i64 4\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}\n=>\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  ret i64 8\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\n%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  ret i64 8\n}\n=>\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  ret i64 8\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\n%S = type { i32, i64, i8 }\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_struct(ptr %foo) {\n  ret i64 8\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  ret i64 8\n}\n=>\ndefine i64 @test_struct(ptr %foo) {\n#0:\n  ret i64 8\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variable_index_array",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 %i\n  %gep2 = getelementptr inbounds [100 x i32], ptr %foo, i64 0, i64 5\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %gep1 = gep inbounds ptr %foo, 400 x i64 0, 4 x i64 %i\n  %gep2 = gep inbounds ptr %foo, 400 x i64 0, 4 x i64 5\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}\n=>\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %gep1.idx = shl nsw i64 %i, 2\n  %gepdiff = add nsw i64 %gep1.idx, -20\n  ret i64 %gepdiff\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %gep1.idx = shl nsw i64 %i, 2\n  %gepdiff = add nsw i64 %gep1.idx, -20\n  ret i64 %gepdiff\n}\n=>\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_var(ptr %foo, i64 %i) {\n  %gep1.idx = shl nsw i64 %i, 2\n  %gepdiff = add nsw i64 %gep1.idx, -20\n  ret i64 %gepdiff\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %mul = mul nsw i64 %i, 4\n  %sub = add nsw i64 %mul, -20\n  ret i64 %sub\n}\n=>\ndefine i64 @test_var(ptr %foo, i64 %i) {\n#0:\n  %gep1.idx = shl nsw i64 %i, 2\n  %gepdiff = add nsw i64 %gep1.idx, -20\n  ret i64 %gepdiff\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "reversed_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 10\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, i64 0, i64 %i\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %gep1 = gep inbounds ptr %foo, 100 x i64 0, 1 x i64 10\n  %gep2 = gep inbounds ptr %foo, 100 x i64 0, 1 x i64 %i\n  %cast1 = ptrtoint ptr %gep1 to i64\n  %cast2 = ptrtoint ptr %gep2 to i64\n  %sub = sub i64 %cast1, %cast2\n  ret i64 %sub\n}\n=>\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %gepdiff = sub nsw i64 10, %i\n  ret i64 %gepdiff\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %gepdiff = sub nsw i64 10, %i\n  ret i64 %gepdiff\n}\n=>\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n  %gepdiff = sub nsw i64 10, %i\n  ret i64 %gepdiff\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %sub = sub nsw i64 10, %i\n  ret i64 %sub\n}\n=>\ndefine i64 @test_rev(ptr %foo, i64 %i) {\n#0:\n  %gepdiff = sub nsw i64 10, %i\n  ret i64 %gepdiff\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_inbounds",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_bases_negative",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 6,
+        "current_opt": 5,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_g_indices",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %gep1 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> %i\n  %gep2 = getelementptr inbounds [100 x i8], ptr %foo, <2 x i64> zeroinitializer, <2 x i64> <i64 5, i64 6>\n  %cast1 = ptrtoint <2 x ptr> %gep1 to <2 x i64>\n  %cast2 = ptrtoint <2 x ptr> %gep2 to <2 x i64>\n  %sub = sub <2 x i64> %cast1, %cast2\n  ret <2 x i64> %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %sub = sub <2 x i64> %i, <i64 5, i64 6>\n  ret <2 x i64> %sub\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %gep1 = gep inbounds ptr %foo, 100 x <2 x i64> { 0, 0 }, 1 x <2 x i64> %i\n  %gep2 = gep inbounds ptr %foo, 100 x <2 x i64> { 0, 0 }, 1 x <2 x i64> { 5, 6 }\n  %cast1 = ptrtoint <2 x ptr> %gep1 to <2 x i64>\n  %cast2 = ptrtoint <2 x ptr> %gep2 to <2 x i64>\n  %sub = sub <2 x i64> %cast1, %cast2\n  ret <2 x i64> %sub\n}\n=>\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %sub = sub <2 x i64> %i, { 5, 6 }\n  ret <2 x i64> %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %gepdiff = add nsw <2 x i64> %i, <i64 -5, i64 -6>\n  ret <2 x i64> %gepdiff\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %sub = sub <2 x i64> %i, <i64 5, i64 6>\n  ret <2 x i64> %sub\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %gepdiff = add nsw <2 x i64> %i, { -5, -6 }\n  ret <2 x i64> %gepdiff\n}\n=>\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %sub = sub <2 x i64> %i, { 5, 6 }\n  ret <2 x i64> %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %sub = sub <2 x i64> %i, <i64 5, i64 6>\n  ret <2 x i64> %sub\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n  %gepdiff = add nsw <2 x i64> %i, <i64 -5, i64 -6>\n  ret <2 x i64> %gepdiff\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %sub = sub <2 x i64> %i, { 5, 6 }\n  ret <2 x i64> %sub\n}\n=>\ndefine <2 x i64> @test_vec(ptr %foo, <2 x i64> %i) {\n#0:\n  %gepdiff = add nsw <2 x i64> %i, { -5, -6 }\n  ret <2 x i64> %gepdiff\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\nptr %foo = poison\n<2 x i64> %i = < #x8000000000000004 (9223372036854775812, -9223372036854775804), #x0000000000000000 (0) >\n\nSource:\n<2 x i64> %sub = < #x7fffffffffffffff (9223372036854775807), #xfffffffffffffffa (18446744073709551610, -6) >\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x2\n\nTarget:\n<2 x i64> %gepdiff = < poison, #xfffffffffffffffa (18446744073709551610, -6) >\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x2\nSource value: < #x7fffffffffffffff (9223372036854775807), #xfffffffffffffffa (18446744073709551610, -6) >\nTarget value: < poison, #xfffffffffffffffa (18446744073709551610, -6) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

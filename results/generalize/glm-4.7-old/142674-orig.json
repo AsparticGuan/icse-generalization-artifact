@@ -1,0 +1,440 @@
+{
+  "issue_id": "142674-orig",
+  "dataset_file": "142674-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\ndefine i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize `or(umul_overflow(X, C), (umul_result(X, C) > K))` to `X > K / C`. This pattern effectively checks if the mathematical product `X * C` exceeds a threshold `K`, handling the overflow bit explicitly to create a precise range check on the input `X`.\",\n  \"before_after\": \"Input: `or(extract_overflow(umul_with_overflow(X, C)), icmp ugt (extract_result(umul_with_overflow(X, C)), K))`. Output: `icmp ugt X, (K / C)` (or `uge` variant).\",\n  \"preconditions\": [\n    \"The multiplication is `llvm.umul.with.overflow`.\",\n    \"One operand of the multiplication (`C`) is a non-zero constant.\",\n    \"The comparison constant (`K`) is a constant.\",\n    \"The comparison predicate is `ugt` or `uge`.\",\n    \"The overflow bit and the result are extracted from the exact same intrinsic call.\",\n    \"Types are integers or vectors of integers.\"\n  ],\n  \"pattern\": \"Match an `or` instruction where one operand is the overflow bit (index 1) of a `umul.with.overflow` intrinsic, and the other operand is an `icmp` (ugt/uge) comparing the result (index 0) of the same intrinsic against a constant `K`. The intrinsic must have a constant `C`.\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_Example_i64\",\n      \"ir\": \"define i1 @test(i64 %0) {\\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\\n  %3 = extractvalue { i64, i1 } %2, 0\\n  %4 = extractvalue { i64, i1 } %2, 1\\n  %5 = icmp ugt i64 %3, -16\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %0) {\\n  %2 = icmp ugt i64 %0, 109802048057794950\\n  ret i1 %2\\n}\",\n      \"why\": \"Original case: checking if x*168 exceeds 2^64-16.\"\n    },\n    {\n      \"name\": \"Predicate_uge\",\n      \"ir\": \"define i1 @test(i64 %0) {\\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 10)\\n  %3 = extractvalue { i64, i1 } %2, 0\\n  %4 = extractvalue { i64, i1 } %2, 1\\n  %5 = icmp uge i64 %3, 100\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %0) {\\n  %2 = icmp uge i64 %0, 10\\n  ret i1 %2\\n}\",\n      \"why\": \"uge predicate requires ceiling division: ceil(100/10) = 10.\"\n    },\n    {\n      \"name\": \"Small_Bitwidth_i8\",\n      \"ir\": \"define i1 @test(i8 %0) {\\n  %2 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %0, i8 5)\\n  %3 = extractvalue { i8, i1 } %2, 0\\n  %4 = extractvalue { i8, i1 } %2, 1\\n  %5 = icmp ugt i8 %3, 10\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %0) {\\n  %2 = icmp ugt i8 %0, 2\\n  ret i1 %2\\n}\",\n      \"why\": \"Testing smaller integer width (i8).\"\n    },\n    {\n      \"name\": \"Vector_Type\",\n      \"ir\": \"define <4 x i1> @test(<4 x i32> %0) {\\n  %2 = call { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32> %0, <4 x i32> <i32 3, i32 3, i32 3, i32 3>)\\n  %3 = extractvalue { <4 x i32>, <4 x i1> } %2, 0\\n  %4 = extractvalue { <4 x i32>, <4 x i1> } %2, 1\\n  %5 = icmp ugt <4 x i32> %3, <i32 20, i32 20, i32 20, i32 20>\\n  %6 = or <4 x i1> %4, %5\\n  ret <4 x i1> %6\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i32> %0) {\\n  %2 = icmp ugt <4 x i32> %0, <i32 6, i32 6, i32 6, i32 6>\\n  ret <4 x i1> %2\\n}\",\n      \"why\": \"Testing vector types with splat constants.\"\n    },\n    {\n      \"name\": \"Commutative_Or\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 7)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, 50\\n  %6 = or i1 %5, %4\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = icmp ugt i32 %0, 7\\n  ret i1 %2\\n}\",\n      \"why\": \"Or operands are commuted (cmp first, overflow second).\"\n    },\n    {\n      \"name\": \"Commutative_Mul\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 12, i32 %0)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, 100\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = icmp ugt i32 %0, 8\\n  ret i1 %2\\n}\",\n      \"why\": \"Multiplication operands are commuted (Constant, X).\"\n    },\n    {\n      \"name\": \"Constant_Multiplier_1\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 1)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, 42\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = icmp ugt i32 %0, 42\\n  ret i1 %2\\n}\",\n      \"why\": \"Multiplier is 1, optimization simplifies to direct comparison.\"\n    },\n    {\n      \"name\": \"Threshold_0\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, 0\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = icmp ugt i32 %0, 0\\n  ret i1 %2\\n}\",\n      \"why\": \"Threshold is 0, effectively checking if X != 0.\"\n    },\n    {\n      \"name\": \"Threshold_Max\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, -1\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = icmp ugt i32 %0, 429496729\\n  ret i1 %2\\n}\",\n      \"why\": \"Threshold is UINT_MAX (i32 -1). Checks for overflow specifically.\"\n    },\n    {\n      \"name\": \"Negative_Const_Zero_Mult\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 0)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ugt i32 %3, 0\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  ret i1 false\\n}\",\n      \"why\": \"Multiplier is 0. Cannot divide by zero. Should simplify to constant false (0 > 0 is false, overflow is false).\"\n    },\n    {\n      \"name\": \"Negative_Predicate_ult\",\n      \"ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ult i32 %3, 50\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %0) {\\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\\n  %3 = extractvalue { i32, i1 } %2, 0\\n  %4 = extractvalue { i32, i1 } %2, 1\\n  %5 = icmp ult i32 %3, 50\\n  %6 = or i1 %4, %5\\n  ret i1 %6\\n}\",\n      \"why\": \"Predicate is ult, not ugt/uge. Optimization does not apply.\"\n    }\n  ],\n  \"implementation_notes\": \"In InstCombine, visit the `or` instruction. Match pattern: `or(extractvalue(umul, 1), icmp(extractvalue(umul, 0), K))`. Ensure the intrinsic is `umul.with.overflow` and operands match. Check that the constant multiplier `C` is not zero. Compute `NewK = K.udiv(C)` for `ugt`, or `NewK = K.uadd_sat(C-1).udiv(C)` (or `ceil(K/C)`) for `uge`. Replace `or` with new `icmp`. For vectors, this applies element-wise.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on these test cases. Verify that the `umul.with.overflow` intrinsic is removed and replaced by a single `icmp` instruction (or constant) for positive cases. Ensure negative cases retain the intrinsic.\",\n  \"clarifying_questions\": [\n    \"Should this optimization also apply to `smul.with.overflow` with appropriate signed predicate checks?\",\n    \"Is there a performance concern if `C` is a very large power of 2 where the division simplification is trivial but the pattern match is expensive?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize `or(umul_overflow(X, C), (umul_result(X, C) > K))` to `X > K / C`. This pattern effectively checks if the mathematical product `X * C` exceeds a threshold `K`, handling the overflow bit explicitly to create a precise range check on the input `X`.",
+    "before_after": "Input: `or(extract_overflow(umul_with_overflow(X, C)), icmp ugt (extract_result(umul_with_overflow(X, C)), K))`. Output: `icmp ugt X, (K / C)` (or `uge` variant).",
+    "preconditions": [
+      "The multiplication is `llvm.umul.with.overflow`.",
+      "One operand of the multiplication (`C`) is a non-zero constant.",
+      "The comparison constant (`K`) is a constant.",
+      "The comparison predicate is `ugt` or `uge`.",
+      "The overflow bit and the result are extracted from the exact same intrinsic call.",
+      "Types are integers or vectors of integers."
+    ],
+    "pattern": "Match an `or` instruction where one operand is the overflow bit (index 1) of a `umul.with.overflow` intrinsic, and the other operand is an `icmp` (ugt/uge) comparing the result (index 0) of the same intrinsic against a constant `K`. The intrinsic must have a constant `C`.",
+    "testcases": [
+      {
+        "name": "Original_Example_i64",
+        "ir": "define i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}",
+        "why": "Original case: checking if x*168 exceeds 2^64-16."
+      },
+      {
+        "name": "Predicate_uge",
+        "ir": "define i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 10)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp uge i64 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %0) {\n  %2 = icmp uge i64 %0, 10\n  ret i1 %2\n}",
+        "why": "uge predicate requires ceiling division: ceil(100/10) = 10."
+      },
+      {
+        "name": "Small_Bitwidth_i8",
+        "ir": "define i1 @test(i8 %0) {\n  %2 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %0, i8 5)\n  %3 = extractvalue { i8, i1 } %2, 0\n  %4 = extractvalue { i8, i1 } %2, 1\n  %5 = icmp ugt i8 %3, 10\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %0) {\n  %2 = icmp ugt i8 %0, 2\n  ret i1 %2\n}",
+        "why": "Testing smaller integer width (i8)."
+      },
+      {
+        "name": "Vector_Type",
+        "ir": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = call { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32> %0, <4 x i32> <i32 3, i32 3, i32 3, i32 3>)\n  %3 = extractvalue { <4 x i32>, <4 x i1> } %2, 0\n  %4 = extractvalue { <4 x i32>, <4 x i1> } %2, 1\n  %5 = icmp ugt <4 x i32> %3, <i32 20, i32 20, i32 20, i32 20>\n  %6 = or <4 x i1> %4, %5\n  ret <4 x i1> %6\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = icmp ugt <4 x i32> %0, <i32 6, i32 6, i32 6, i32 6>\n  ret <4 x i1> %2\n}",
+        "why": "Testing vector types with splat constants."
+      },
+      {
+        "name": "Commutative_Or",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 7)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 50\n  %6 = or i1 %5, %4\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 7\n  ret i1 %2\n}",
+        "why": "Or operands are commuted (cmp first, overflow second)."
+      },
+      {
+        "name": "Commutative_Mul",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 12, i32 %0)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 8\n  ret i1 %2\n}",
+        "why": "Multiplication operands are commuted (Constant, X)."
+      },
+      {
+        "name": "Constant_Multiplier_1",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 1)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 42\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}",
+        "why": "Multiplier is 1, optimization simplifies to direct comparison."
+      },
+      {
+        "name": "Threshold_0",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 0\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 0\n  ret i1 %2\n}",
+        "why": "Threshold is 0, effectively checking if X != 0."
+      },
+      {
+        "name": "Threshold_Max",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, -1\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}",
+        "why": "Threshold is UINT_MAX (i32 -1). Checks for overflow specifically."
+      },
+      {
+        "name": "Negative_Const_Zero_Mult",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 0)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 0\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  ret i1 false\n}",
+        "why": "Multiplier is 0. Cannot divide by zero. Should simplify to constant false (0 > 0 is false, overflow is false)."
+      },
+      {
+        "name": "Negative_Predicate_ult",
+        "ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+        "why": "Predicate is ult, not ugt/uge. Optimization does not apply."
+      }
+    ],
+    "implementation_notes": "In InstCombine, visit the `or` instruction. Match pattern: `or(extractvalue(umul, 1), icmp(extractvalue(umul, 0), K))`. Ensure the intrinsic is `umul.with.overflow` and operands match. Check that the constant multiplier `C` is not zero. Compute `NewK = K.udiv(C)` for `ugt`, or `NewK = K.uadd_sat(C-1).udiv(C)` (or `ceil(K/C)`) for `uge`. Replace `or` with new `icmp`. For vectors, this applies element-wise.",
+    "regression_test_notes": "Use `opt -instcombine -S` on these test cases. Verify that the `umul.with.overflow` intrinsic is removed and replaced by a single `icmp` instruction (or constant) for positive cases. Ensure negative cases retain the intrinsic.",
+    "clarifying_questions": [
+      "Should this optimization also apply to `smul.with.overflow` with appropriate signed predicate checks?",
+      "Is there a performance concern if `C` is a very large power of 2 where the division simplification is trivial but the pattern match is expensive?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "Original_Example_i64",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 168\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp ugt i64 %#3, -16\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp ugt i64 %#0, 109802048057794950\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 168\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp ugt i64 %#3, -16\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp ugt i64 %#0, 109802048057794950\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp ugt i64 %#0, 109802048057794950\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 168\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp ugt i64 %#3, -16\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Predicate_uge",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 10)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp uge i64 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i64 %0) {\n  %2 = icmp uge i64 %0, 10\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 10\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp uge i64 %#3, 100\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp uge i64 %#0, 10\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 10)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, 99\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i64 %0) {\n  %2 = icmp uge i64 %0, 10\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 10\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp ugt i64 %#3, 99\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp uge i64 %#0, 10\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %0) {\n  %2 = icmp uge i64 %0, 10\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 10)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, 99\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = icmp uge i64 %#0, 10\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i64 %#0) {\n#1:\n  %#2 = umul_overflow i64 %#0, 10\n  %#3 = extractvalue {i64, i1, i24} %#2, 0\n  %#4 = extractvalue {i64, i1, i24} %#2, 1\n  %#5 = icmp ugt i64 %#3, 99\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Small_Bitwidth_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %0) {\n  %2 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %0, i8 5)\n  %3 = extractvalue { i8, i1 } %2, 0\n  %4 = extractvalue { i8, i1 } %2, 1\n  %5 = icmp ugt i8 %3, 10\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i8 %0) {\n  %2 = icmp ugt i8 %0, 2\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = umul_overflow i8 %#0, 5\n  %#3 = extractvalue {i8, i1} %#2, 0\n  %#4 = extractvalue {i8, i1} %#2, 1\n  %#5 = icmp ugt i8 %#3, 10\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = icmp ugt i8 %#0, 2\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %0) {\n  %2 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %0, i8 5)\n  %3 = extractvalue { i8, i1 } %2, 0\n  %4 = extractvalue { i8, i1 } %2, 1\n  %5 = icmp ugt i8 %3, 10\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i8 %0) {\n  %2 = icmp ugt i8 %0, 2\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = umul_overflow i8 %#0, 5\n  %#3 = extractvalue {i8, i1} %#2, 0\n  %#4 = extractvalue {i8, i1} %#2, 1\n  %#5 = icmp ugt i8 %#3, 10\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = icmp ugt i8 %#0, 2\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %0) {\n  %2 = icmp ugt i8 %0, 2\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %0) {\n  %2 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %0, i8 5)\n  %3 = extractvalue { i8, i1 } %2, 0\n  %4 = extractvalue { i8, i1 } %2, 1\n  %5 = icmp ugt i8 %3, 10\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = icmp ugt i8 %#0, 2\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i8 %#0) {\n#1:\n  %#2 = umul_overflow i8 %#0, 5\n  %#3 = extractvalue {i8, i1} %#2, 0\n  %#4 = extractvalue {i8, i1} %#2, 1\n  %#5 = icmp ugt i8 %#3, 10\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector_Type",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = call { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32> %0, <4 x i32> <i32 3, i32 3, i32 3, i32 3>)\n  %3 = extractvalue { <4 x i32>, <4 x i1> } %2, 0\n  %4 = extractvalue { <4 x i32>, <4 x i1> } %2, 1\n  %5 = icmp ugt <4 x i32> %3, <i32 20, i32 20, i32 20, i32 20>\n  %6 = or <4 x i1> %4, %5\n  ret <4 x i1> %6\n}",
+          "tgt": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = icmp ugt <4 x i32> %0, <i32 6, i32 6, i32 6, i32 6>\n  ret <4 x i1> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = umul_overflow <4 x i32> %#0, { 3, 3, 3, 3 }\n  %#3 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 0\n  %#4 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 1\n  %#5 = icmp ugt <4 x i32> %#3, { 20, 20, 20, 20 }\n  %#6 = or <4 x i1> %#4, %#5\n  ret <4 x i1> %#6\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = icmp ugt <4 x i32> %#0, { 6, 6, 6, 6 }\n  ret <4 x i1> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %0) {\n  %2 = call { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32> %0, <4 x i32> splat (i32 3))\n  %3 = extractvalue { <4 x i32>, <4 x i1> } %2, 0\n  %4 = extractvalue { <4 x i32>, <4 x i1> } %2, 1\n  %5 = icmp ugt <4 x i32> %3, splat (i32 20)\n  %6 = or <4 x i1> %4, %5\n  ret <4 x i1> %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = icmp ugt <4 x i32> %0, <i32 6, i32 6, i32 6, i32 6>\n  ret <4 x i1> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = umul_overflow <4 x i32> %#0, { 3, 3, 3, 3 }\n  %#3 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 0\n  %#4 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 1\n  %#5 = icmp ugt <4 x i32> %#3, { 20, 20, 20, 20 }\n  %#6 = or <4 x i1> %#4, %#5\n  ret <4 x i1> %#6\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = icmp ugt <4 x i32> %#0, { 6, 6, 6, 6 }\n  ret <4 x i1> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i32> %0) {\n  %2 = icmp ugt <4 x i32> %0, <i32 6, i32 6, i32 6, i32 6>\n  ret <4 x i1> %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %0) {\n  %2 = call { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32> %0, <4 x i32> splat (i32 3))\n  %3 = extractvalue { <4 x i32>, <4 x i1> } %2, 0\n  %4 = extractvalue { <4 x i32>, <4 x i1> } %2, 1\n  %5 = icmp ugt <4 x i32> %3, splat (i32 20)\n  %6 = or <4 x i1> %4, %5\n  ret <4 x i1> %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i32>, <4 x i1> } @llvm.umul.with.overflow.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = icmp ugt <4 x i32> %#0, { 6, 6, 6, 6 }\n  ret <4 x i1> %#2\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %#0) {\n#1:\n  %#2 = umul_overflow <4 x i32> %#0, { 3, 3, 3, 3 }\n  %#3 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 0\n  %#4 = extractvalue {<4 x i32>, <4 x i1>, i120} %#2, 1\n  %#5 = icmp ugt <4 x i32> %#3, { 20, 20, 20, 20 }\n  %#6 = or <4 x i1> %#4, %#5\n  ret <4 x i1> %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative_Or",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 7)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 50\n  %6 = or i1 %5, %4\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 7\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 7\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 50\n  %#6 = or i1 %#5, %#4\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 7\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 7)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 50\n  %6 = or i1 %5, %4\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 7\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 7\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 50\n  %#6 = or i1 %#5, %#4\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 7\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 7\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 7)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 50\n  %6 = or i1 %5, %4\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 7\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 7\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 50\n  %#6 = or i1 %#5, %#4\n  ret i1 %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative_Mul",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 12, i32 %0)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 8\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 12, %#0\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 100\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 8\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 12)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 8\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 12\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 100\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 8\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 8\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 12)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 100\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 8\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 12\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 100\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Constant_Multiplier_1",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 1)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 42\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 1\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 42\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 42\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 42\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 42\n  ret i1 %#2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 42\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 42\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 42\n  ret i1 %#2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Threshold_0",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 0\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 0\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 0\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 0\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ne i32 %0, 0\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 0\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ne i32 %#0, 0\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 0\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 0\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ne i32 %0, 0\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 0\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ne i32 %#0, 0\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Threshold_Max",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, -1\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 4294967295\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 429496729\n  ret i1 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 429496729\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 429496729\n  ret i1 %#2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = icmp ugt i32 %0, 429496729\n  ret i1 %2\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 429496729\n  ret i1 %#2\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = icmp ugt i32 %#0, 429496729\n  ret i1 %#2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Const_Zero_Mult",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 0)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ugt i32 %3, 0\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 0\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ugt i32 %#3, 0\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Predicate_ult",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 8,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 8\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %0) {\n  %2 = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %0, i32 10)\n  %3 = extractvalue { i32, i1 } %2, 0\n  %4 = extractvalue { i32, i1 } %2, 1\n  %5 = icmp ult i32 %3, 50\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\n=>\ndefine i1 @test(i32 %#0) {\n#1:\n  %#2 = umul_overflow i32 %#0, 10\n  %#3 = extractvalue {i32, i1, i24} %#2, 0\n  %#4 = extractvalue {i32, i1, i24} %#2, 1\n  %#5 = icmp ult i32 %#3, 50\n  %#6 = or i1 %#4, %#5\n  ret i1 %#6\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

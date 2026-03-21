@@ -1,0 +1,447 @@
+{
+  "issue_id": "118108",
+  "dataset_file": "118108.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\n## Elements Frequently Missed\n\n- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.\n- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.\n- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.\n- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.\n- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.\n- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.\n- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.\n- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.\n- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.\n- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.\n- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.\n- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Overly Specific Pattern Matching\n\nMany optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:\n\n- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)\n- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations\n- Parameterizing type constraints rather than hardcoding bit widths\n- Extracting core mathematical/algebraic properties rather than matching surface syntax\n\n### Pattern 2: Overly Restrictive Preconditions\n\nOptimizations frequently included unnecessary guards that blocked valid transformations:\n\n- Type restrictions (scalar-only, specific bit widths) that weren't semantically required\n- Single-use constraints that could be relaxed with profitability analysis\n- Declaration-specific guards that prevented optimizing calls to external functions\n- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases\n\n### Pattern 3: Incomplete Intrinsic Recognition\n\nTransformations involving intrinsics often missed:\n\n- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)\n- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)\n- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)\n- Flag propagation when creating or replacing intrinsics\n\n### Pattern 4: Comparison Predicate Handling\n\nOptimizations involving comparisons frequently missed:\n\n- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)\n- Signed-to-unsigned predicate conversion when operands have known signs\n- Predicate swapping when operands are commuted\n- The `samesign` attribute and its implications for predicate canonicalization\n\n### Pattern 5: Control Flow and PHI Node Transformations\n\nTransformations involving PHI nodes often failed to handle:\n\n- Loop backedges causing infinite combine loops\n- Multiple predecessors with different source values\n- Moving operations into predecessor blocks safely\n- Critical edges and dominance relationships\n\n### Pattern 6: Bitwise and Shift Operation Idioms\n\nComplex bit manipulation patterns were frequently missed:\n\n- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)\n- Mask decomposition for comparisons (`(X & Mask) == C` patterns)\n- Distributivity of operations over bitwise operations (`add` over `min/max`)\n- `disjoint` flag enabling xor distribution over or\n\n### Pattern 7: Select Instruction Folding\n\nSelect-based patterns often missed:\n\n- Folding operations into select arms when one arm simplifies\n- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)\n- Handling vector conditions in select-shuffle folding\n- Poison safety when condition could be poison\n\n### Pattern 8: Memory and Pointer Operations\n\nTransformations involving memory operations frequently missed:\n\n- Address space semantics and pointer validity\n- Null pointer undefined behavior across address spaces\n- Load sinking past calls with proper alias analysis\n- GEP canonicalization and constant offset folding\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\ndefine i1 @test(i64 %x) {\nentry:\n  ret i1 false\n}\n",
+  "model_output": "```json\n{\n    \"pattern\": \"When an 'assume' guarantees that a value's high bits are non-zero, and a subsequent 'and' masks out those high bits while keeping lower bits, the result of the 'and' cannot be zero if the high bits were non-zero. Therefore, an 'icmp eq' with zero must be false.\",\n    \"generalized_pattern\": \"Given: 1) An 'assume' that guarantees (X >> K) != 0, where K is the number of low bits preserved by a mask. 2) A mask M that clears the high bits above position K (i.e., M = (1 << K) - 1). 3) An 'icmp eq/ne' of (X & M) with zero. If the assume guarantees the high bits are non-zero, then (X & M) can be zero regardless of the low bits, so the comparison cannot be determined to be true/false solely from the assume. However, if the mask M clears the low K bits (i.e., M = ~((1 << K) - 1)), then (X & M) extracts only the high bits. If the assume guarantees those high bits are non-zero, then (X & M) != 0, so 'icmp eq' is false and 'icmp ne' is true. In the example, K=16, M = -65521 = 0xffffffffffff0000, which clears the low 16 bits. The assume 'ugt x, 65535' guarantees that at least one bit in bits [16,63] is set, so (x & 0xffffffffffff0000) != 0, making the equality false.\",\n    \"testcases\": [\n        {\n            \"name\": \"original_example\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"different_bitwidth\",\n            \"ir\": \"define i1 @test(i32 %x) {\\n  entry:\\n    %cond = icmp ugt i32 %x, 255\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i32 %x, -241\\n    %cmp = icmp eq i32 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  entry:\\n    %cond = icmp ugt i32 %x, 255\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"different_icmp_predicate\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp uge i64 %x, 65536\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp uge i64 %x, 65536\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"icmp_ne_instead_of_eq\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp ne i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 true\\n}\"\n        },\n        {\n            \"name\": \"different_mask_clearing_low_bits\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 4095\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -4096\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 4095\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"signed_comparison_assume\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp sgt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond = icmp sgt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"vector_type\",\n            \"ir\": \"define <2 x i1> @test(<2 x i64> %x) {\\n  entry:\\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\\n    %cond0 = extractelement <2 x i1> %cond, i32 0\\n    %cond1 = extractelement <2 x i1> %cond, i32 1\\n    call void @llvm.assume(i1 %cond0)\\n    call void @llvm.assume(i1 %cond1)\\n    %mask = and <2 x i64> %x, <i64 -65521, i64 -65521>\\n    %cmp = icmp eq <2 x i64> %mask, zeroinitializer\\n    ret <2 x i1> %cmp\\n}\",\n            \"expected_optimized_ir\": \"define <2 x i1> @test(<2 x i64> %x) {\\n  entry:\\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\\n    %cond0 = extractelement <2 x i1> %cond, i32 0\\n    %cond1 = extractelement <2 x i1> %cond, i32 1\\n    call void @llvm.assume(i1 %cond0)\\n    call void @llvm.assume(i1 %cond1)\\n    ret <2 x i1> zeroinitializer\\n}\"\n        },\n        {\n            \"name\": \"assume_on_truncated_value\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %trunc = trunc i64 %x to i32\\n    %cond = icmp ugt i32 %trunc, 65535\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %trunc = trunc i64 %x to i32\\n    %cond = icmp ugt i32 %trunc, 65535\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"mask_is_variable_but_clears_high_bits\",\n            \"ir\": \"define i1 @test(i64 %x, i64 %k) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x, i64 %k) {\\n  entry:\\n    %cond = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"multiple_assume_conditions\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond1 = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond1)\\n    %cond2 = icmp ult i64 %x, 1000000\\n    call void @llvm.assume(i1 %cond2)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %cond1 = icmp ugt i64 %x, 65535\\n    call void @llvm.assume(i1 %cond1)\\n    %cond2 = icmp ult i64 %x, 1000000\\n    call void @llvm.assume(i1 %cond2)\\n    ret i1 false\\n}\"\n        },\n        {\n            \"name\": \"assume_on_shifted_value\",\n            \"ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %shifted = lshr i64 %x, 4\\n    %cond = icmp ugt i64 %shifted, 4095\\n    call void @llvm.assume(i1 %cond)\\n    %mask = and i64 %x, -65521\\n    %cmp = icmp eq i64 %mask, 0\\n    ret i1 %cmp\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  entry:\\n    %shifted = lshr i64 %x, 4\\n    %cond = icmp ugt i64 %shifted, 4095\\n    call void @llvm.assume(i1 %cond)\\n    ret i1 false\\n}\"\n        }\n    ]\n}\n```",
+  "parsed": {
+    "pattern": "When an 'assume' guarantees that a value's high bits are non-zero, and a subsequent 'and' masks out those high bits while keeping lower bits, the result of the 'and' cannot be zero if the high bits were non-zero. Therefore, an 'icmp eq' with zero must be false.",
+    "generalized_pattern": "Given: 1) An 'assume' that guarantees (X >> K) != 0, where K is the number of low bits preserved by a mask. 2) A mask M that clears the high bits above position K (i.e., M = (1 << K) - 1). 3) An 'icmp eq/ne' of (X & M) with zero. If the assume guarantees the high bits are non-zero, then (X & M) can be zero regardless of the low bits, so the comparison cannot be determined to be true/false solely from the assume. However, if the mask M clears the low K bits (i.e., M = ~((1 << K) - 1)), then (X & M) extracts only the high bits. If the assume guarantees those high bits are non-zero, then (X & M) != 0, so 'icmp eq' is false and 'icmp ne' is true. In the example, K=16, M = -65521 = 0xffffffffffff0000, which clears the low 16 bits. The assume 'ugt x, 65535' guarantees that at least one bit in bits [16,63] is set, so (x & 0xffffffffffff0000) != 0, making the equality false.",
+    "testcases": [
+      {
+        "name": "original_example",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "different_bitwidth",
+        "ir": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    %mask = and i32 %x, -241\n    %cmp = icmp eq i32 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "different_icmp_predicate",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "icmp_ne_instead_of_eq",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp ne i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 true\n}"
+      },
+      {
+        "name": "different_mask_clearing_low_bits",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -4096\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "signed_comparison_assume",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "vector_type",
+        "ir": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    %mask = and <2 x i64> %x, <i64 -65521, i64 -65521>\n    %cmp = icmp eq <2 x i64> %mask, zeroinitializer\n    ret <2 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    ret <2 x i1> zeroinitializer\n}"
+      },
+      {
+        "name": "assume_on_truncated_value",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "mask_is_variable_but_clears_high_bits",
+        "ir": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      },
+      {
+        "name": "multiple_assume_conditions",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    ret i1 false\n}"
+      },
+      {
+        "name": "assume_on_shifted_value",
+        "ir": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_bitwidth",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    %mask = and i32 %x, -241\n    %cmp = icmp eq i32 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  %mask = and i32 %x, 4294967055\n  %cmp = icmp eq i32 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  call void @llvm.assume(i1 %cond)\n  %mask = and i32 %x, -241\n  %cmp = icmp eq i32 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  %mask = and i32 %x, 4294967055\n  %cmp = icmp eq i32 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  entry:\n    %cond = icmp ugt i32 %x, 255\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  call void @llvm.assume(i1 %cond)\n  %mask = and i32 %x, -241\n  %cmp = icmp eq i32 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %cond = icmp ugt i32 %x, 255\n  assume i1 %cond\n  %mask = and i32 %x, 4294967055\n  %cmp = icmp eq i32 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_icmp_predicate",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp uge i64 %x, 65536\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp uge i64 %x, 65536\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp uge i64 %x, 65536\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp uge i64 %x, 65536\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp uge i64 %x, 65536\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "icmp_ne_instead_of_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp ne i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp ne i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp ne i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp ne i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp ne i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 1\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp ne i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_mask_clearing_low_bits",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -4096\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  %mask = and i64 %x, -4096\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  call void @llvm.assume(i1 %cond)\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp ugt i64 %x, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  call void @llvm.assume(i1 %cond)\n  ret i1 false\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 4095\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_comparison_assume",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, 9223372036854710287\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, 9223372036854710287\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond = icmp sgt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, 9223372036854710287\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp sgt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, 9223372036854710287\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_type",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 4,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    %mask = and <2 x i64> %x, <i64 -65521, i64 -65521>\n    %cmp = icmp eq <2 x i64> %mask, zeroinitializer\n    ret <2 x i1> %cmp\n}",
+          "tgt": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    ret <2 x i1> zeroinitializer\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i32 0\n  %cond1 = extractelement <2 x i1> %cond, i32 1\n  assume i1 %cond0\n  assume i1 %cond1\n  %mask = and <2 x i64> %x, { -65521, -65521 }\n  %cmp = icmp eq <2 x i64> %mask, { 0, 0 }\n  ret <2 x i1> %cmp\n}\n=>\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i32 0\n  %cond1 = extractelement <2 x i1> %cond, i32 1\n  assume i1 %cond0\n  assume i1 %cond1\n  ret <2 x i1> { 0, 0 }\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, splat (i64 65535)\n  %cond0 = extractelement <2 x i1> %cond, i64 0\n  %cond1 = extractelement <2 x i1> %cond, i64 1\n  call void @llvm.assume(i1 %cond0)\n  call void @llvm.assume(i1 %cond1)\n  %mask = and <2 x i64> %x, splat (i64 -65521)\n  %cmp = icmp eq <2 x i64> %mask, zeroinitializer\n  ret <2 x i1> %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    ret <2 x i1> zeroinitializer\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i64 0\n  %cond1 = extractelement <2 x i1> %cond, i64 1\n  assume i1 %cond0\n  assume i1 %cond1\n  %mask = and <2 x i64> %x, { -65521, -65521 }\n  %cmp = icmp eq <2 x i64> %mask, { 0, 0 }\n  ret <2 x i1> %cmp\n}\n=>\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i32 0\n  %cond1 = extractelement <2 x i1> %cond, i32 1\n  assume i1 %cond0\n  assume i1 %cond1\n  ret <2 x i1> { 0, 0 }\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @test(<2 x i64> %x) {\n  entry:\n    %cond = icmp ugt <2 x i64> %x, <i64 65535, i64 65535>\n    %cond0 = extractelement <2 x i1> %cond, i32 0\n    %cond1 = extractelement <2 x i1> %cond, i32 1\n    call void @llvm.assume(i1 %cond0)\n    call void @llvm.assume(i1 %cond1)\n    ret <2 x i1> zeroinitializer\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, splat (i64 65535)\n  %cond0 = extractelement <2 x i1> %cond, i64 0\n  %cond1 = extractelement <2 x i1> %cond, i64 1\n  call void @llvm.assume(i1 %cond0)\n  call void @llvm.assume(i1 %cond1)\n  %mask = and <2 x i64> %x, splat (i64 -65521)\n  %cmp = icmp eq <2 x i64> %mask, zeroinitializer\n  ret <2 x i1> %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i32 0\n  %cond1 = extractelement <2 x i1> %cond, i32 1\n  assume i1 %cond0\n  assume i1 %cond1\n  ret <2 x i1> { 0, 0 }\n}\n=>\ndefine <2 x i1> @test(<2 x i64> %x) {\nentry:\n  %cond = icmp ugt <2 x i64> %x, { 65535, 65535 }\n  %cond0 = extractelement <2 x i1> %cond, i64 0\n  %cond1 = extractelement <2 x i1> %cond, i64 1\n  assume i1 %cond0\n  assume i1 %cond1\n  %mask = and <2 x i64> %x, { -65521, -65521 }\n  %cmp = icmp eq <2 x i64> %mask, { 0, 0 }\n  ret <2 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "assume_on_truncated_value",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %trunc = trunc i64 %x to i32\n  %cond = icmp ugt i32 %trunc, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %trunc = trunc i64 %x to i32\n  %cond = icmp ugt i32 %trunc, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %0 = and i64 %x, 4294901760\n  %cond = icmp ne i64 %0, 0\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %#0 = and i64 %x, 4294901760\n  %cond = icmp ne i64 %#0, 0\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %trunc = trunc i64 %x to i32\n  %cond = icmp ugt i32 %trunc, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %trunc = trunc i64 %x to i32\n    %cond = icmp ugt i32 %trunc, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %0 = and i64 %x, 4294901760\n  %cond = icmp ne i64 %0, 0\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %trunc = trunc i64 %x to i32\n  %cond = icmp ugt i32 %trunc, 65535\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %#0 = and i64 %x, 4294901760\n  %cond = icmp ne i64 %#0, 0\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_is_variable_but_clears_high_bits",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x, i64 %k) {\n  entry:\n    %cond = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x, i64 %k) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multiple_assume_conditions",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp samesign ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond1)\n  %cond2 = icmp ult i64 %x, 1000000\n  call void @llvm.assume(i1 %cond2)\n  %mask = and i64 %x, 983055\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp samesign ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  %mask = and i64 %x, 983055\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %cond1 = icmp ugt i64 %x, 65535\n    call void @llvm.assume(i1 %cond1)\n    %cond2 = icmp ult i64 %x, 1000000\n    call void @llvm.assume(i1 %cond2)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp samesign ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond1)\n  %cond2 = icmp ult i64 %x, 1000000\n  call void @llvm.assume(i1 %cond2)\n  %mask = and i64 %x, 983055\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond1 = icmp samesign ugt i64 %x, 65535\n  assume i1 %cond1\n  %cond2 = icmp ult i64 %x, 1000000\n  assume i1 %cond2\n  %mask = and i64 %x, 983055\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "assume_on_shifted_value",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    %mask = and i64 %x, -65521\n    %cmp = icmp eq i64 %mask, 0\n    ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %shifted = lshr i64 %x, 4\n  %cond = icmp ugt i64 %shifted, 4095\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %shifted = lshr i64 %x, 4\n  %cond = icmp ugt i64 %shifted, 4095\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %shifted = lshr i64 %x, 4\n  %cond = icmp ugt i64 %shifted, 4095\n  assume i1 %cond\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  entry:\n    %shifted = lshr i64 %x, 4\n    %cond = icmp ugt i64 %shifted, 4095\n    call void @llvm.assume(i1 %cond)\n    ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  call void @llvm.assume(i1 %cond)\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\nentry:\n  %shifted = lshr i64 %x, 4\n  %cond = icmp ugt i64 %shifted, 4095\n  assume i1 %cond\n  ret i1 0\n}\n=>\ndefine i1 @test(i64 %x) {\nentry:\n  %cond = icmp ugt i64 %x, 65535\n  assume i1 %cond\n  %mask = and i64 %x, -65521\n  %cmp = icmp eq i64 %mask, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

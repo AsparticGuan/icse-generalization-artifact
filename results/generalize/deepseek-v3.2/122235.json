@@ -1,0 +1,588 @@
+{
+  "issue_id": "122235",
+  "dataset_file": "122235.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\n## Elements Frequently Missed\n\n- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.\n- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.\n- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.\n- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.\n- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.\n- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.\n- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.\n- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.\n- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.\n- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.\n- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.\n- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Overly Specific Pattern Matching\n\nMany optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:\n\n- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)\n- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations\n- Parameterizing type constraints rather than hardcoding bit widths\n- Extracting core mathematical/algebraic properties rather than matching surface syntax\n\n### Pattern 2: Overly Restrictive Preconditions\n\nOptimizations frequently included unnecessary guards that blocked valid transformations:\n\n- Type restrictions (scalar-only, specific bit widths) that weren't semantically required\n- Single-use constraints that could be relaxed with profitability analysis\n- Declaration-specific guards that prevented optimizing calls to external functions\n- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases\n\n### Pattern 3: Incomplete Intrinsic Recognition\n\nTransformations involving intrinsics often missed:\n\n- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)\n- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)\n- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)\n- Flag propagation when creating or replacing intrinsics\n\n### Pattern 4: Comparison Predicate Handling\n\nOptimizations involving comparisons frequently missed:\n\n- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)\n- Signed-to-unsigned predicate conversion when operands have known signs\n- Predicate swapping when operands are commuted\n- The `samesign` attribute and its implications for predicate canonicalization\n\n### Pattern 5: Control Flow and PHI Node Transformations\n\nTransformations involving PHI nodes often failed to handle:\n\n- Loop backedges causing infinite combine loops\n- Multiple predecessors with different source values\n- Moving operations into predecessor blocks safely\n- Critical edges and dominance relationships\n\n### Pattern 6: Bitwise and Shift Operation Idioms\n\nComplex bit manipulation patterns were frequently missed:\n\n- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)\n- Mask decomposition for comparisons (`(X & Mask) == C` patterns)\n- Distributivity of operations over bitwise operations (`add` over `min/max`)\n- `disjoint` flag enabling xor distribution over or\n\n### Pattern 7: Select Instruction Folding\n\nSelect-based patterns often missed:\n\n- Folding operations into select arms when one arm simplifies\n- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)\n- Handling vector conditions in select-shuffle folding\n- Poison safety when condition could be poison\n\n### Pattern 8: Memory and Pointer Operations\n\nTransformations involving memory operations frequently missed:\n\n- Address space semantics and pointer validity\n- Null pointer undefined behavior across address spaces\n- Load sinking past calls with proper alias analysis\n- GEP canonicalization and constant offset folding\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i32 @test(i32 %x, i32 range(i32 0, 32) %y) {\n    %res = call i32 @llvm.fshl(i32 %x, i32 0, i32 %y)\n    ret i32 %res\n}\n\ndefine i32 @test(i32 %x, i32 range(i32 0, 32) %y) {\n    %res = shl i32 %x, %y\n    ret i32 %res\n}\n",
+  "model_output": "```json\n{\n    \"pattern\": {\n        \"description\": \"fshl(x, 0, y) with second operand zero and third operand within valid range reduces to shl(x, y)\",\n        \"generalization\": \"fshl(a, b, c) where b is zero (or any splat zero vector) and c is guaranteed to be less than the bit width reduces to shl(a, c). For fshr(a, b, c) where a is zero, reduces to lshr(b, c). The transformation requires knowing the third operand is less than the bit width, which can come from range metadata, known bits analysis, or explicit comparisons.\",\n        \"preconditions\": [\n            \"Second operand of fshl is zero (or zero vector)\",\n            \"Third operand is known to be less than the bit width (via range metadata, known bits, or explicit comparison)\",\n            \"For vectors, zero must be a splat constant\",\n            \"Preserves poison semantics: if third operand is poison, result must remain poison\"\n        ],\n        \"variations\": [\n            \"Scalar integer types\",\n            \"Vector types (fixed and scalable)\",\n            \"Different integer bit widths\",\n            \"Zero constant may be sign-extended or zero-extended\",\n            \"Third operand may have range metadata or be constrained by preceding comparisons\"\n        ],\n        \"edge_cases\": [\n            \"Third operand equal to bit width (should remain fshl for consistent behavior)\",\n            \"Third operand is poison (must not transform or preserve poison)\",\n            \"Second operand is undef/poison (cannot transform)\",\n            \"Third operand has multiple uses (transformation still valid)\"\n        ]\n    },\n    \"testcases\": [\n        {\n            \"name\": \"scalar_basic\",\n            \"ir\": \"define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\\ndeclare i32 @llvm.fshl.i32(i32, i32, i32)\",\n            \"expected_optimized_ir\": \"define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = shl i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"scalar_with_comparison\",\n            \"ir\": \"define i32 @scalar_with_comparison(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %y, 32\\n  call void @llvm.assume(i1 %cmp)\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\\ndeclare void @llvm.assume(i1)\",\n            \"expected_optimized_ir\": \"define i32 @scalar_with_comparison(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %y, 32\\n  call void @llvm.assume(i1 %cmp)\\n  %res = shl i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"scalar_64bit\",\n            \"ir\": \"define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\\n  %res = call i64 @llvm.fshl.i64(i64 %x, i64 0, i64 %y)\\n  ret i64 %res\\n}\\ndeclare i64 @llvm.fshl.i64(i64, i64, i64)\",\n            \"expected_optimized_ir\": \"define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\\n  %res = shl i64 %x, %y\\n  ret i64 %res\\n}\"\n        },\n        {\n            \"name\": \"scalar_with_zeroext\",\n            \"ir\": \"define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\\n  %y.ext = zext i8 %y to i32\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y.ext)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\\n  %y.ext = zext i8 %y to i32\\n  %res = shl i32 %x, %y.ext\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"vector_fixed\",\n            \"ir\": \"define <4 x i32> @vector_fixed(<4 x i32> %x, <4 x i32> range(<4 x i32> zeroinitializer, <4 x i32> <i32 32, i32 32, i32 32, i32 32>) %y) {\\n  %res = call <4 x i32> @llvm.fshl.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer, <4 x i32> %y)\\n  ret <4 x i32> %res\\n}\\ndeclare <4 x i32> @llvm.fshl.v4i32(<4 x i32>, <4 x i32>, <4 x i32>)\",\n            \"expected_optimized_ir\": \"define <4 x i32> @vector_fixed(<4 x i32> %x, <4 x i32> range(<4 x i32> zeroinitializer, <4 x i32> <i32 32, i32 32, i32 32, i32 32>) %y) {\\n  %res = shl <4 x i32> %x, %y\\n  ret <4 x i32> %res\\n}\"\n        },\n        {\n            \"name\": \"vector_scalable\",\n            \"ir\": \"define <vscale x 4 x i32> @vector_scalable(<vscale x 4 x i32> %x, <vscale x 4 x i32> range(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> splat (i32 32)) %y) {\\n  %res = call <vscale x 4 x i32> @llvm.fshl.nxv4i32(<vscale x 4 x i32> %x, <vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> %y)\\n  ret <vscale x 4 x i32> %res\\n}\\ndeclare <vscale x 4 x i32> @llvm.fshl.nxv4i32(<vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>)\",\n            \"expected_optimized_ir\": \"define <vscale x 4 x i32> @vector_scalable(<vscale x 4 x i32> %x, <vscale x 4 x i32> range(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> splat (i32 32)) %y) {\\n  %res = shl <vscale x 4 x i32> %x, %y\\n  ret <vscale x 4 x i32> %res\\n}\"\n        },\n        {\n            \"name\": \"fshr_counterpart\",\n            \"ir\": \"define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call i32 @llvm.fshr.i32(i32 0, i32 %x, i32 %y)\\n  ret i32 %res\\n}\\ndeclare i32 @llvm.fshr.i32(i32, i32, i32)\",\n            \"expected_optimized_ir\": \"define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = lshr i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"multi_use_shift_amount\",\n            \"ir\": \"define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\\n  %fshl = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  %add = add i32 %y, 1\\n  %ret = add i32 %fshl, %add\\n  ret i32 %ret\\n}\",\n            \"expected_optimized_ir\": \"define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\\n  %shl = shl i32 %x, %y\\n  %add = add i32 %y, 1\\n  %ret = add i32 %shl, %add\\n  ret i32 %ret\\n}\"\n        },\n        {\n            \"name\": \"with_nsw_flag\",\n            \"ir\": \"define i32 @with_nsw_flag(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call nsw i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @with_nsw_flag(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = shl nsw i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"with_nuw_flag\",\n            \"ir\": \"define i32 @with_nuw_flag(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call nuw i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @with_nuw_flag(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = shl nuw i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"exact_boundary\",\n            \"ir\": \"define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\\n  %res = shl i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"negative_test_boundary_equal\",\n            \"ir\": \"define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"negative_test_second_operand_nonzero\",\n            \"ir\": \"define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"negative_test_no_range_info\",\n            \"ir\": \"define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"with_knownbits\",\n            \"ir\": \"define i32 @with_knownbits(i32 %x, i32 %y) {\\n  %and = and i32 %y, 31\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %and)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @with_knownbits(i32 %x, i32 %y) {\\n  %and = and i32 %y, 31\\n  %res = shl i32 %x, %and\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"vector_mixed_types\",\n            \"ir\": \"define <2 x i64> @vector_mixed_types(<2 x i64> %x, <2 x i32> range(<2 x i32> zeroinitializer, <2 x i32> <i32 64, i32 64>) %y) {\\n  %y.ext = zext <2 x i32> %y to <2 x i64>\\n  %res = call <2 x i64> @llvm.fshl.v2i64(<2 x i64> %x, <2 x i64> zeroinitializer, <2 x i64> %y.ext)\\n  ret <2 x i64> %res\\n}\\ndeclare <2 x i64> @llvm.fshl.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)\",\n            \"expected_optimized_ir\": \"define <2 x i64> @vector_mixed_types(<2 x i64> %x, <2 x i32> range(<2 x i32> zeroinitializer, <2 x i32> <i32 64, i32 64>) %y) {\\n  %y.ext = zext <2 x i32> %y to <2 x i64>\\n  %res = shl <2 x i64> %x, %y.ext\\n  ret <2 x i64> %res\\n}\"\n        },\n        {\n            \"name\": \"commuted_fshr\",\n            \"ir\": \"define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = call i32 @llvm.fshr.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\n}\",\n            \"expected_optimized_ir\": \"define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\\n  %res = lshr i32 %x, %y\\n  ret i32 %res\\n}\"\n        },\n        {\n            \"name\": \"with_explicit_comparison\",\n            \"ir\": \"define i32 @with_explicit_comparison(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %y, 32\\n  br i1 %cmp, label %true, label %false\\ntrue:\\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\\n  ret i32 %res\\nfalse:\\n  ret i32 0\\n}\",\n            \"expected_optimized_ir\": \"define i32 @with_explicit_comparison(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %y, 32\\n  br i1 %cmp, label %true, label %false\\ntrue:\\n  %res = shl i32 %x, %y\\n  ret i32 %res\\nfalse:\\n  ret i32 0\\n}\"\n        }\n    ]\n}\n```",
+  "parsed": {
+    "pattern": {
+      "description": "fshl(x, 0, y) with second operand zero and third operand within valid range reduces to shl(x, y)",
+      "generalization": "fshl(a, b, c) where b is zero (or any splat zero vector) and c is guaranteed to be less than the bit width reduces to shl(a, c). For fshr(a, b, c) where a is zero, reduces to lshr(b, c). The transformation requires knowing the third operand is less than the bit width, which can come from range metadata, known bits analysis, or explicit comparisons.",
+      "preconditions": [
+        "Second operand of fshl is zero (or zero vector)",
+        "Third operand is known to be less than the bit width (via range metadata, known bits, or explicit comparison)",
+        "For vectors, zero must be a splat constant",
+        "Preserves poison semantics: if third operand is poison, result must remain poison"
+      ],
+      "variations": [
+        "Scalar integer types",
+        "Vector types (fixed and scalable)",
+        "Different integer bit widths",
+        "Zero constant may be sign-extended or zero-extended",
+        "Third operand may have range metadata or be constrained by preceding comparisons"
+      ],
+      "edge_cases": [
+        "Third operand equal to bit width (should remain fshl for consistent behavior)",
+        "Third operand is poison (must not transform or preserve poison)",
+        "Second operand is undef/poison (cannot transform)",
+        "Third operand has multiple uses (transformation still valid)"
+      ]
+    },
+    "testcases": [
+      {
+        "name": "scalar_basic",
+        "ir": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\ndeclare i32 @llvm.fshl.i32(i32, i32, i32)",
+        "expected_optimized_ir": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "scalar_with_comparison",
+        "ir": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\ndeclare void @llvm.assume(i1)",
+        "expected_optimized_ir": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = shl i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "scalar_64bit",
+        "ir": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = call i64 @llvm.fshl.i64(i64 %x, i64 0, i64 %y)\n  ret i64 %res\n}\ndeclare i64 @llvm.fshl.i64(i64, i64, i64)",
+        "expected_optimized_ir": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = shl i64 %x, %y\n  ret i64 %res\n}"
+      },
+      {
+        "name": "scalar_with_zeroext",
+        "ir": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y.ext)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}"
+      },
+      {
+        "name": "vector_fixed",
+        "ir": "define <4 x i32> @vector_fixed(<4 x i32> %x, <4 x i32> range(<4 x i32> zeroinitializer, <4 x i32> <i32 32, i32 32, i32 32, i32 32>) %y) {\n  %res = call <4 x i32> @llvm.fshl.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer, <4 x i32> %y)\n  ret <4 x i32> %res\n}\ndeclare <4 x i32> @llvm.fshl.v4i32(<4 x i32>, <4 x i32>, <4 x i32>)",
+        "expected_optimized_ir": "define <4 x i32> @vector_fixed(<4 x i32> %x, <4 x i32> range(<4 x i32> zeroinitializer, <4 x i32> <i32 32, i32 32, i32 32, i32 32>) %y) {\n  %res = shl <4 x i32> %x, %y\n  ret <4 x i32> %res\n}"
+      },
+      {
+        "name": "vector_scalable",
+        "ir": "define <vscale x 4 x i32> @vector_scalable(<vscale x 4 x i32> %x, <vscale x 4 x i32> range(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> splat (i32 32)) %y) {\n  %res = call <vscale x 4 x i32> @llvm.fshl.nxv4i32(<vscale x 4 x i32> %x, <vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> %y)\n  ret <vscale x 4 x i32> %res\n}\ndeclare <vscale x 4 x i32> @llvm.fshl.nxv4i32(<vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>)",
+        "expected_optimized_ir": "define <vscale x 4 x i32> @vector_scalable(<vscale x 4 x i32> %x, <vscale x 4 x i32> range(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> splat (i32 32)) %y) {\n  %res = shl <vscale x 4 x i32> %x, %y\n  ret <vscale x 4 x i32> %res\n}"
+      },
+      {
+        "name": "fshr_counterpart",
+        "ir": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 0, i32 %x, i32 %y)\n  ret i32 %res\n}\ndeclare i32 @llvm.fshr.i32(i32, i32, i32)",
+        "expected_optimized_ir": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "multi_use_shift_amount",
+        "ir": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %fshl = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  %add = add i32 %y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}",
+        "expected_optimized_ir": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %shl = shl i32 %x, %y\n  %add = add i32 %y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}"
+      },
+      {
+        "name": "with_nsw_flag",
+        "ir": "define i32 @with_nsw_flag(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call nsw i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @with_nsw_flag(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl nsw i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "with_nuw_flag",
+        "ir": "define i32 @with_nuw_flag(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call nuw i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @with_nuw_flag(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl nuw i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "exact_boundary",
+        "ir": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "negative_test_boundary_equal",
+        "ir": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}"
+      },
+      {
+        "name": "negative_test_second_operand_nonzero",
+        "ir": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}"
+      },
+      {
+        "name": "negative_test_no_range_info",
+        "ir": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}"
+      },
+      {
+        "name": "with_knownbits",
+        "ir": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %and)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}"
+      },
+      {
+        "name": "vector_mixed_types",
+        "ir": "define <2 x i64> @vector_mixed_types(<2 x i64> %x, <2 x i32> range(<2 x i32> zeroinitializer, <2 x i32> <i32 64, i32 64>) %y) {\n  %y.ext = zext <2 x i32> %y to <2 x i64>\n  %res = call <2 x i64> @llvm.fshl.v2i64(<2 x i64> %x, <2 x i64> zeroinitializer, <2 x i64> %y.ext)\n  ret <2 x i64> %res\n}\ndeclare <2 x i64> @llvm.fshl.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)",
+        "expected_optimized_ir": "define <2 x i64> @vector_mixed_types(<2 x i64> %x, <2 x i32> range(<2 x i32> zeroinitializer, <2 x i32> <i32 64, i32 64>) %y) {\n  %y.ext = zext <2 x i32> %y to <2 x i64>\n  %res = shl <2 x i64> %x, %y.ext\n  ret <2 x i64> %res\n}"
+      },
+      {
+        "name": "commuted_fshr",
+        "ir": "define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}"
+      },
+      {
+        "name": "with_explicit_comparison",
+        "ir": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\nfalse:\n  ret i32 0\n}",
+        "expected_optimized_ir": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\nfalse:\n  ret i32 0\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_basic",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\ndeclare i32 @llvm.fshl.i32(i32, i32, i32)",
+          "tgt": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_basic(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_basic(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_with_comparison",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\ndeclare void @llvm.assume(i1)",
+          "tgt": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #1\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  call void @llvm.assume(i1 %cmp)\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #1\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  assume i1 %cmp\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_64bit",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = call i64 @llvm.fshl.i64(i64 %x, i64 0, i64 %y)\n  ret i64 %res\n}\ndeclare i64 @llvm.fshl.i64(i64, i64, i64)",
+          "tgt": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = shl i64 %x, %y\n  ret i64 %res\n}",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = fshl i64 %x, i64 0, i64 %#range_0_%y\n  ret i64 %res\n}\n=>\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = shl i64 %x, %#range_0_%y\n  ret i64 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = call i64 @llvm.fshl.i64(i64 %x, i64 0, i64 %y)\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.fshl.i64(i64, i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = shl i64 %x, %y\n  ret i64 %res\n}",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = fshl i64 %x, i64 0, i64 %#range_0_%y\n  ret i64 %res\n}\n=>\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = shl i64 %x, %#range_0_%y\n  ret i64 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = shl i64 %x, %y\n  ret i64 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @scalar_64bit(i64 %x, i64 range(i64 0, 64) %y) {\n  %res = call i64 @llvm.fshl.i64(i64 %x, i64 0, i64 %y)\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.fshl.i64(i64, i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = shl i64 %x, %#range_0_%y\n  ret i64 %res\n}\n=>\ndefine i64 @scalar_64bit(i64 %x, i64 %y) {\ninit:\n  %#range_0_%y = !range i64 %y, i64 0, i64 64\n  br label %#0\n\n#0:\n  %res = fshl i64 %x, i64 0, i64 %#range_0_%y\n  ret i64 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_with_zeroext",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y.ext)\n  ret i32 %res\n}",
+          "tgt": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext i8 %#range_0_%y to i32\n  %res = fshl i32 %x, i32 0, i32 %y.ext\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext i8 %#range_0_%y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext nneg i8 %y to i32\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y.ext)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext nneg i8 %#range_0_%y to i32\n  %res = fshl i32 %x, i32 0, i32 %y.ext\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext i8 %#range_0_%y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext i8 %y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_with_zeroext(i32 %x, i8 range(i8 0, 32) %y) {\n  %y.ext = zext nneg i8 %y to i32\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y.ext)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext i8 %#range_0_%y to i32\n  %res = shl i32 %x, %y.ext\n  ret i32 %res\n}\n=>\ndefine i32 @scalar_with_zeroext(i32 %x, i8 %y) {\ninit:\n  %#range_0_%y = !range i8 %y, i8 0, i8 32\n  br label %#0\n\n#0:\n  %y.ext = zext nneg i8 %#range_0_%y to i32\n  %res = fshl i32 %x, i32 0, i32 %y.ext\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_fixed",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "vector_scalable",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "fshr_counterpart",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 0, i32 %x, i32 %y)\n  ret i32 %res\n}\ndeclare i32 @llvm.fshr.i32(i32, i32, i32)",
+          "tgt": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshr i32 0, i32 %x, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = lshr i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 0, i32 %x, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshr.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshr i32 0, i32 %x, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = lshr i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @fshr_counterpart(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 0, i32 %x, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshr.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = lshr i32 %x, %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @fshr_counterpart(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshr i32 0, i32 %x, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multi_use_shift_amount",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 4,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %fshl = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  %add = add i32 %y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}",
+          "tgt": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %shl = shl i32 %x, %y\n  %add = add i32 %y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}",
+          "log": "\n----------------------------------------\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %fshl = fshl i32 %x, i32 0, i32 %#range_0_%y\n  %add = add i32 %#range_0_%y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}\n=>\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %shl = shl i32 %x, %#range_0_%y\n  %add = add i32 %#range_0_%y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %fshl = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  %add = add nuw nsw i32 %y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %shl = shl i32 %x, %y\n  %add = add i32 %y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}",
+          "log": "\n----------------------------------------\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %fshl = fshl i32 %x, i32 0, i32 %#range_0_%y\n  %add = add nsw nuw i32 %#range_0_%y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}\n=>\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %shl = shl i32 %x, %#range_0_%y\n  %add = add i32 %#range_0_%y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %shl = shl i32 %x, %y\n  %add = add i32 %y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @multi_use_shift_amount(i32 %x, i32 range(i32 0, 32) %y) {\n  %fshl = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  %add = add nuw nsw i32 %y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %shl = shl i32 %x, %#range_0_%y\n  %add = add i32 %#range_0_%y, 1\n  %ret = add i32 %shl, %add\n  ret i32 %ret\n}\n=>\ndefine i32 @multi_use_shift_amount(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %fshl = fshl i32 %x, i32 0, i32 %#range_0_%y\n  %add = add nsw nuw i32 %#range_0_%y, 1\n  %ret = add i32 %fshl, %add\n  ret i32 %ret\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_nsw_flag",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "with_nuw_flag",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "exact_boundary",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = shl i32 %x, %y\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @exact_boundary(i32 %x, i32 range(i32 0, 31) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = shl i32 %x, %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @exact_boundary(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 31\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_test_boundary_equal",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 range(i32 0, 33) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_boundary_equal(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 33\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_test_second_operand_nonzero",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 1, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_second_operand_nonzero(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshl i32 %x, i32 1, i32 %#range_0_%y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_test_no_range_info",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @negative_test_no_range_info(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_knownbits",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %and)\n  ret i32 %res\n}",
+          "tgt": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %and = and i32 %y, 31\n  %res = fshl i32 %x, i32 0, i32 %and\n  ret i32 %res\n}\n=>\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @with_knownbits(i32 %x, i32 %y) {\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %and = and i32 %y, 31\n  %res = shl i32 %x, %and\n  ret i32 %res\n}\n=>\ndefine i32 @with_knownbits(i32 %x, i32 %y) {\n#0:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_mixed_types",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "commuted_fshr",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = call i32 @llvm.fshr.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n}",
+          "tgt": "define i32 @commuted_fshr(i32 %x, i32 range(i32 0, 32) %y) {\n  %res = lshr i32 %x, %y\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @commuted_fshr(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = fshr i32 %x, i32 0, i32 %#range_0_%y\n  ret i32 %res\n}\n=>\ndefine i32 @commuted_fshr(i32 %x, i32 %y) {\ninit:\n  %#range_0_%y = !range i32 %y, i32 0, i32 32\n  br label %#0\n\n#0:\n  %res = lshr i32 %x, %#range_0_%y\n  ret i32 %res\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000001 (1)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %#range_0_%y = #x00000000 (0)\n  >> Jump to %#0\ni32 %res = #x00000000 (0)\n\nTarget:\ni32 %#range_0_%y = #x00000000 (0)\n  >> Jump to %#0\ni32 %res = #x00000001 (1)\nSource value: #x00000000 (0)\nTarget value: #x00000001 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "with_explicit_comparison",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 5,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\nfalse:\n  ret i32 0\n}",
+          "tgt": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\nfalse:\n  ret i32 0\n}",
+          "log": "\n----------------------------------------\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\ntrue:                                             ; preds = %0\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n\nfalse:                                            ; preds = %0\n  ret i32 0\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\nfalse:\n  ret i32 0\n}",
+          "log": "\n----------------------------------------\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\n=>\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\nfalse:\n  ret i32 0\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\ntrue:                                             ; preds = %0\n  %res = call i32 @llvm.fshl.i32(i32 %x, i32 0, i32 %y)\n  ret i32 %res\n\nfalse:                                            ; preds = %0\n  ret i32 0\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = shl i32 %x, %y\n  ret i32 %res\n}\n=>\ndefine i32 @with_explicit_comparison(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %y, 32\n  br i1 %cmp, label %true, label %false\n\nfalse:\n  ret i32 0\n\ntrue:\n  %res = fshl i32 %x, i32 0, i32 %y\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,395 @@
+{
+  "issue_id": "82414-orig",
+  "dataset_file": "82414-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @test(i32 %x) {\r\n  %add = add nsw i32 %x, 16\r\n  %cmp = icmp sgt i32 %x, 1008\r\n  %s = select i1 %cmp, i32 %add, i32 1024\r\n  ret i32 %s\r\n}\n\ndefine i32 @test(i32 %x) {\r\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\r\n  %add = add nuw nsw i32 %smax, 16\r\n  ret i32 %add\r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Identify and fold a select pattern where the true and false values are arithmetic operations (add/sub) applied to the compared value and a constant, respectively, into a min/max intrinsic followed by the operation. This distributes the arithmetic over the select.\",\n  \"before_after\": \"Transform `select (icmp pred %x, %C), (%x op %K), (%C op %K)` into `(llvm.[s|u][min|max] %x, %C) op %K`. This removes the control flow dependency and exposes canonical min/max patterns.\",\n  \"preconditions\": [\n    \"The select condition must be an `icmp` instruction comparing a value `%x` and a constant `%C`.\",\n    \"The true and false values of the select must be binary `add` or `sub` instructions with the same opcode.\",\n    \"One operand of the true/false binary ops must be `%x` and `%C` respectively.\",\n    \"The other operand of both binary ops must be the same constant `%K`.\",\n    \"The constants must satisfy the relationship: `FalseVal_Operand_Constant = C op K`.\",\n    \"If `sub` is used, operand order must be checked (e.g., `x - K` vs `C - K`).\",\n    \"Flags (`nuw`/`nsw`) on the original instructions may allow inference of new flags on the result if the min/max operation constrains the range (e.g., `smax` guarantees a lower bound).\"\n  ],\n  \"pattern\": \"Pattern:\\n  %cmp = icmp pred %x, %C\\n  %tv = binop %x, %K\\n  %fv = binop %C, %K\\n  %s  = select i1 %cmp, ty %tv, ty %fv\\n\\nRewrite:\\n  %mm = llvm.[s|u][min|max](%x, %C)\\n  %res = binop %mm, %K\\n\\nMapping:\\n  pred = sgt, sge -> smax\\n  pred = slt, sle -> smin\\n  pred = ugt, uge -> umax\\n  pred = ult, ule -> umin\",\n  \"testcases\": [\n    {\n      \"name\": \"original_example\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %add = add nsw i32 %x, 16\\n  %cmp = icmp sgt i32 %x, 1008\\n  %s = select i1 %cmp, i32 %add, i32 1024\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\\n  %add = add nuw nsw i32 %smax, 16\\n  ret i32 %add\\n}\",\n      \"why\": \"The base case: select(sgt) of add(x, K) and add(C, K) becomes smax(x, C) + K. Note: nuw is inferable because smax >= 1008, so 1008 + 16 is positive.\"\n    },\n    {\n      \"name\": \"unsigned_umax\",\n      \"ir\": \"define i32 @test_u(i32 %x) {\\n  %add = add i32 %x, 5\\n  %cmp = icmp ugt i32 %x, 10\\n  %s = select i1 %cmp, i32 %add, i32 15\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_u(i32 %x) {\\n  %umax = call i32 @llvm.umax.i32(i32 %x, i32 10)\\n  %add = add i32 %umax, 5\\n  ret i32 %add\\n}\",\n      \"why\": \"Unsigned variant using ugt and umax.\"\n    },\n    {\n      \"name\": \"signed_smin\",\n      \"ir\": \"define i32 @test_min(i32 %x) {\\n  %add = add i32 %x, 2\\n  %cmp = icmp slt i32 %x, -20\\n  %s = select i1 %cmp, i32 %add, i32 -18\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_min(i32 %x) {\\n  %smin = call i32 @llvm.smin.i32(i32 %x, i32 -20)\\n  %add = add i32 %smin, 2\\n  ret i32 %add\\n}\",\n      \"why\": \"Variant using slt which maps to smin.\"\n    },\n    {\n      \"name\": \"subtraction\",\n      \"ir\": \"define i32 @test_sub(i32 %x) {\\n  %sub = sub i32 %x, 8\\n  %cmp = icmp sgt i32 %x, 100\\n  %s = select i1 %cmp, i32 %sub, i32 92\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_sub(i32 %x) {\\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 100)\\n  %sub = sub i32 %smax, 8\\n  ret i32 %sub\\n}\",\n      \"why\": \"Subtraction variant. smax(x, 100) - 8.\"\n    },\n    {\n      \"name\": \"vector_type\",\n      \"ir\": \"define <4 x i32> @test_vec(<4 x i32> %x) {\\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %cmp = icmp sgt <4 x i32> %x, <i32 0, i32 0, i32 0, i32 0>\\n  %s = select <4 x i1> %cmp, <4 x i32> %add, <4 x i32> <i32 1, i32 1, i32 1, i32 1>\\n  ret <4 x i32> %s\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test_vec(<4 x i32> %x) {\\n  %smax = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer)\\n  %add = add <4 x i32> %smax, <i32 1, i32 1, i32 1, i32 1>\\n  ret <4 x i32> %add\\n}\",\n      \"why\": \"Vector types should be handled similarly.\"\n    },\n    {\n      \"name\": \"no_flags\",\n      \"ir\": \"define i32 @test_no_flags(i32 %x) {\\n  %add = add i32 %x, 16\\n  %cmp = icmp sgt i32 %x, 1008\\n  %s = select i1 %cmp, i32 %add, i32 1024\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_no_flags(i32 %x) {\\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\\n  %add = add i32 %smax, 16\\n  ret i32 %add\\n}\",\n      \"why\": \"Fold should work even without nuw/nsw flags, though resulting add won't have flags unless inferred.\"\n    },\n    {\n      \"name\": \"negative_nuw_inference\",\n      \"ir\": \"define i32 @test_neg_nuw(i32 %x) {\\n  %sub = sub i32 %x, 5\\n  %cmp = icmp sgt i32 %x, 10\\n  %s = select i1 %cmp, i32 %sub, i32 5\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_neg_nuw(i32 %x) {\\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 10)\\n  %sub = sub i32 %smax, 5\\n  ret i32 %sub\\n}\",\n      \"why\": \"Resulting sub is (smax(x, 10) - 5). Minimum value is 5. Maximum is INT_MAX. Result is always >= 5, so nuw is valid. If constant logic were different (e.g. C - K < 0), nuw would not be valid.\"\n    },\n    {\n      \"name\": \"fail_constant_mismatch\",\n      \"ir\": \"define i32 @test_fail(i32 %x) {\\n  %add = add i32 %x, 16\\n  %cmp = icmp sgt i32 %x, 1008\\n  %s = select i1 %cmp, i32 %add, i32 999\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_fail(i32 %x) {\\n  %add = add i32 %x, 16\\n  %cmp = icmp sgt i32 %x, 1008\\n  %s = select i1 %cmp, i32 %add, i32 999\\n  ret i32 %s\\n}\",\n      \"why\": \"Constants do not match the pattern (1008 + 16 != 999), so no fold should occur.\"\n    },\n    {\n      \"name\": \"fail_wrong_op\",\n      \"ir\": \"define i32 @test_fail_mul(i32 %x) {\\n  %mul = mul i32 %x, 2\\n  %cmp = icmp sgt i32 %x, 10\\n  %s = select i1 %cmp, i32 %mul, i32 20\\n  ret i32 %s\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_fail_mul(i32 %x) {\\n  %mul = mul i32 %x, 2\\n  %cmp = icmp sgt i32 %x, 10\\n  %s = select i1 %cmp, i32 %mul, i32 20\\n  ret i32 %s\\n}\",\n      \"why\": \"Multiplication does not distribute over select in this way (x*2 vs 10*2 is valid mathematically, but x*2 vs C*2 where C is unrelated is not the pattern). Actually, 10*2=20, so mathematically it is smax(x, 10)*2. However, InstCombine is usually conservative with mul. I will list this as a 'should not fold' unless specifically implementing mul support.\"\n    }\n  ],\n  \"implementation_notes\": \"Implementation should reside in `InstCombineSelect.cpp` in `visitSelect`.\\n\\n1. Check if `SelectInst` operands (`TrueVal`, `FalseVal`) are `BinaryOperator`s with same opcode (`Add` or `Sub`).\\n2. Check if `Condition` is `ICmpInst` with `%x` and `%C`.\\n3. Verify the operands of the BinaryOps match the pattern:\\n   - For `Add`: Commutative. Check if one op is `%x` (in TrueVal) and `%C` (in FalseVal), and the other op is shared constant `%K`.\\n   - For `Sub`: Non-commutative. Check `TrueVal` is `%x - %K` and `FalseVal` is `%C - %K`.\\n4. Verify `C op K` equals the constant value in `FalseVal`.\\n5. Determine the MinMax intrinsic based on `ICmp` predicate.\\n6. Insert `CallInst` for Intrinsic.\\n7. Create new `Add`/`Sub` using Intrinsic result and `%K`.\\n8. Infer `nuw`/`nsw` flags if `KnownBits` analysis allows (e.g., if `smax(x, C)` ensures result is positive for `add`).\",\n  \"regression_test_notes\": \"Use `opt -passes=instcombine -S`. Test files should be in `llvm/test/Transforms/InstCombine/select.ll`. Ensure checks verify the specific intrinsic (@llvm.smax) and the removal of the `select` instruction.\",\n  \"clarifying_questions\": [\n    \"Should this transformation attempt to infer and propagate `nuw`/`nsw` flags aggressively based on the min/max bounds, or strictly preserve existing flags?\",\n    \"Should we support `mul`/`shl` in addition to `add`/`sub`? (e.g. `select x>10, x*2, 20` -> `smax(x,10)*2`)\",\n    \"Should we handle the inverted pattern where the constants are swapped (e.g. `select x < C, x+K, C+K`)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Identify and fold a select pattern where the true and false values are arithmetic operations (add/sub) applied to the compared value and a constant, respectively, into a min/max intrinsic followed by the operation. This distributes the arithmetic over the select.",
+    "before_after": "Transform `select (icmp pred %x, %C), (%x op %K), (%C op %K)` into `(llvm.[s|u][min|max] %x, %C) op %K`. This removes the control flow dependency and exposes canonical min/max patterns.",
+    "preconditions": [
+      "The select condition must be an `icmp` instruction comparing a value `%x` and a constant `%C`.",
+      "The true and false values of the select must be binary `add` or `sub` instructions with the same opcode.",
+      "One operand of the true/false binary ops must be `%x` and `%C` respectively.",
+      "The other operand of both binary ops must be the same constant `%K`.",
+      "The constants must satisfy the relationship: `FalseVal_Operand_Constant = C op K`.",
+      "If `sub` is used, operand order must be checked (e.g., `x - K` vs `C - K`).",
+      "Flags (`nuw`/`nsw`) on the original instructions may allow inference of new flags on the result if the min/max operation constrains the range (e.g., `smax` guarantees a lower bound)."
+    ],
+    "pattern": "Pattern:\n  %cmp = icmp pred %x, %C\n  %tv = binop %x, %K\n  %fv = binop %C, %K\n  %s  = select i1 %cmp, ty %tv, ty %fv\n\nRewrite:\n  %mm = llvm.[s|u][min|max](%x, %C)\n  %res = binop %mm, %K\n\nMapping:\n  pred = sgt, sge -> smax\n  pred = slt, sle -> smin\n  pred = ugt, uge -> umax\n  pred = ult, ule -> umin",
+    "testcases": [
+      {
+        "name": "original_example",
+        "ir": "define i32 @test(i32 %x) {\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add nuw nsw i32 %smax, 16\n  ret i32 %add\n}",
+        "why": "The base case: select(sgt) of add(x, K) and add(C, K) becomes smax(x, C) + K. Note: nuw is inferable because smax >= 1008, so 1008 + 16 is positive."
+      },
+      {
+        "name": "unsigned_umax",
+        "ir": "define i32 @test_u(i32 %x) {\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_u(i32 %x) {\n  %umax = call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %add = add i32 %umax, 5\n  ret i32 %add\n}",
+        "why": "Unsigned variant using ugt and umax."
+      },
+      {
+        "name": "signed_smin",
+        "ir": "define i32 @test_min(i32 %x) {\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, -20\n  %s = select i1 %cmp, i32 %add, i32 -18\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_min(i32 %x) {\n  %smin = call i32 @llvm.smin.i32(i32 %x, i32 -20)\n  %add = add i32 %smin, 2\n  ret i32 %add\n}",
+        "why": "Variant using slt which maps to smin."
+      },
+      {
+        "name": "subtraction",
+        "ir": "define i32 @test_sub(i32 %x) {\n  %sub = sub i32 %x, 8\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_sub(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}",
+        "why": "Subtraction variant. smax(x, 100) - 8."
+      },
+      {
+        "name": "vector_type",
+        "ir": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %cmp = icmp sgt <4 x i32> %x, <i32 0, i32 0, i32 0, i32 0>\n  %s = select <4 x i1> %cmp, <4 x i32> %add, <4 x i32> <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %s\n}",
+        "expected_optimized_ir": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %smax = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer)\n  %add = add <4 x i32> %smax, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %add\n}",
+        "why": "Vector types should be handled similarly."
+      },
+      {
+        "name": "no_flags",
+        "ir": "define i32 @test_no_flags(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_no_flags(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add i32 %smax, 16\n  ret i32 %add\n}",
+        "why": "Fold should work even without nuw/nsw flags, though resulting add won't have flags unless inferred."
+      },
+      {
+        "name": "negative_nuw_inference",
+        "ir": "define i32 @test_neg_nuw(i32 %x) {\n  %sub = sub i32 %x, 5\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_neg_nuw(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}",
+        "why": "Resulting sub is (smax(x, 10) - 5). Minimum value is 5. Maximum is INT_MAX. Result is always >= 5, so nuw is valid. If constant logic were different (e.g. C - K < 0), nuw would not be valid."
+      },
+      {
+        "name": "fail_constant_mismatch",
+        "ir": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+        "why": "Constants do not match the pattern (1008 + 16 != 999), so no fold should occur."
+      },
+      {
+        "name": "fail_wrong_op",
+        "ir": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+        "expected_optimized_ir": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+        "why": "Multiplication does not distribute over select in this way (x*2 vs 10*2 is valid mathematically, but x*2 vs C*2 where C is unrelated is not the pattern). Actually, 10*2=20, so mathematically it is smax(x, 10)*2. However, InstCombine is usually conservative with mul. I will list this as a 'should not fold' unless specifically implementing mul support."
+      }
+    ],
+    "implementation_notes": "Implementation should reside in `InstCombineSelect.cpp` in `visitSelect`.\n\n1. Check if `SelectInst` operands (`TrueVal`, `FalseVal`) are `BinaryOperator`s with same opcode (`Add` or `Sub`).\n2. Check if `Condition` is `ICmpInst` with `%x` and `%C`.\n3. Verify the operands of the BinaryOps match the pattern:\n   - For `Add`: Commutative. Check if one op is `%x` (in TrueVal) and `%C` (in FalseVal), and the other op is shared constant `%K`.\n   - For `Sub`: Non-commutative. Check `TrueVal` is `%x - %K` and `FalseVal` is `%C - %K`.\n4. Verify `C op K` equals the constant value in `FalseVal`.\n5. Determine the MinMax intrinsic based on `ICmp` predicate.\n6. Insert `CallInst` for Intrinsic.\n7. Create new `Add`/`Sub` using Intrinsic result and `%K`.\n8. Infer `nuw`/`nsw` flags if `KnownBits` analysis allows (e.g., if `smax(x, C)` ensures result is positive for `add`).",
+    "regression_test_notes": "Use `opt -passes=instcombine -S`. Test files should be in `llvm/test/Transforms/InstCombine/select.ll`. Ensure checks verify the specific intrinsic (@llvm.smax) and the removal of the `select` instruction.",
+    "clarifying_questions": [
+      "Should this transformation attempt to infer and propagate `nuw`/`nsw` flags aggressively based on the min/max bounds, or strictly preserve existing flags?",
+      "Should we support `mul`/`shl` in addition to `add`/`sub`? (e.g. `select x>10, x*2, 20` -> `smax(x,10)*2`)",
+      "Should we handle the inverted pattern where the constants are swapped (e.g. `select x < C, x+K, C+K`)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}",
+          "tgt": "define i32 @test(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add nuw nsw i32 %smax, 16\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add nsw nuw i32 %smax, 16\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add nuw nsw i32 %smax, 16\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add nsw nuw i32 %smax, 16\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add nuw nsw i32 %smax, 16\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add nsw nuw i32 %smax, 16\n  ret i32 %add\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %add = add nsw i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unsigned_umax",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_u(i32 %x) {\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_u(i32 %x) {\n  %umax = call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %add = add i32 %umax, 5\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_u(i32 %x) {\n#0:\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}\n=>\ndefine i32 @test_u(i32 %x) {\n#0:\n  %umax = umax i32 %x, 10\n  %add = add i32 %umax, 5\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_u(i32 %x) {\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_u(i32 %x) {\n  %umax = call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %add = add i32 %umax, 5\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_u(i32 %x) {\n#0:\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}\n=>\ndefine i32 @test_u(i32 %x) {\n#0:\n  %umax = umax i32 %x, 10\n  %add = add i32 %umax, 5\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_u(i32 %x) {\n  %umax = call i32 @llvm.umax.i32(i32 %x, i32 10)\n  %add = add i32 %umax, 5\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_u(i32 %x) {\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_u(i32 %x) {\n#0:\n  %umax = umax i32 %x, 10\n  %add = add i32 %umax, 5\n  ret i32 %add\n}\n=>\ndefine i32 @test_u(i32 %x) {\n#0:\n  %add = add i32 %x, 5\n  %cmp = icmp ugt i32 %x, 10\n  %s = select i1 %cmp, i32 %add, i32 15\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "signed_smin",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_min(i32 %x) {\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, -20\n  %s = select i1 %cmp, i32 %add, i32 -18\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_min(i32 %x) {\n  %smin = call i32 @llvm.smin.i32(i32 %x, i32 -20)\n  %add = add i32 %smin, 2\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_min(i32 %x) {\n#0:\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, 4294967276\n  %s = select i1 %cmp, i32 %add, i32 4294967278\n  ret i32 %s\n}\n=>\ndefine i32 @test_min(i32 %x) {\n#0:\n  %smin = smin i32 %x, 4294967276\n  %add = add i32 %smin, 2\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_min(i32 %x) {\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, -20\n  %s = select i1 %cmp, i32 %add, i32 -18\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_min(i32 %x) {\n  %smin = call i32 @llvm.smin.i32(i32 %x, i32 -20)\n  %add = add i32 %smin, 2\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_min(i32 %x) {\n#0:\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, 4294967276\n  %s = select i1 %cmp, i32 %add, i32 4294967278\n  ret i32 %s\n}\n=>\ndefine i32 @test_min(i32 %x) {\n#0:\n  %smin = smin i32 %x, 4294967276\n  %add = add i32 %smin, 2\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_min(i32 %x) {\n  %smin = call i32 @llvm.smin.i32(i32 %x, i32 -20)\n  %add = add i32 %smin, 2\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_min(i32 %x) {\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, -20\n  %s = select i1 %cmp, i32 %add, i32 -18\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_min(i32 %x) {\n#0:\n  %smin = smin i32 %x, 4294967276\n  %add = add i32 %smin, 2\n  ret i32 %add\n}\n=>\ndefine i32 @test_min(i32 %x) {\n#0:\n  %add = add i32 %x, 2\n  %cmp = icmp slt i32 %x, 4294967276\n  %s = select i1 %cmp, i32 %add, i32 4294967278\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "subtraction",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_sub(i32 %x) {\n  %sub = sub i32 %x, 8\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_sub(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %sub = sub i32 %x, 8\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}\n=>\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %smax = smax i32 %x, 100\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_sub(i32 %x) {\n  %sub = add i32 %x, -8\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_sub(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %sub = add i32 %x, 4294967288\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}\n=>\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %smax = smax i32 %x, 100\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_sub(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 100)\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_sub(i32 %x) {\n  %sub = add i32 %x, -8\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %smax = smax i32 %x, 100\n  %sub = sub i32 %smax, 8\n  ret i32 %sub\n}\n=>\ndefine i32 @test_sub(i32 %x) {\n#0:\n  %sub = add i32 %x, 4294967288\n  %cmp = icmp sgt i32 %x, 100\n  %s = select i1 %cmp, i32 %sub, i32 92\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_type",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %add = add <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %cmp = icmp sgt <4 x i32> %x, <i32 0, i32 0, i32 0, i32 0>\n  %s = select <4 x i1> %cmp, <4 x i32> %add, <4 x i32> <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %s\n}",
+          "tgt": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %smax = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer)\n  %add = add <4 x i32> %smax, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %add\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %cmp = icmp sgt <4 x i32> %x, { 0, 0, 0, 0 }\n  %s = select <4 x i1> %cmp, <4 x i32> %add, <4 x i32> { 1, 1, 1, 1 }\n  ret <4 x i32> %s\n}\n=>\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %smax = smax <4 x i32> %x, { 0, 0, 0, 0 }\n  %add = add <4 x i32> %smax, { 1, 1, 1, 1 }\n  ret <4 x i32> %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n  %add = add <4 x i32> %x, splat (i32 1)\n  %cmp.inv = icmp slt <4 x i32> %x, splat (i32 1)\n  %s = select <4 x i1> %cmp.inv, <4 x i32> splat (i32 1), <4 x i32> %add\n  ret <4 x i32> %s\n}\n",
+          "tgt": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %smax = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer)\n  %add = add <4 x i32> %smax, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %add\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %cmp.inv = icmp slt <4 x i32> %x, { 1, 1, 1, 1 }\n  %s = select <4 x i1> %cmp.inv, <4 x i32> { 1, 1, 1, 1 }, <4 x i32> %add\n  ret <4 x i32> %s\n}\n=>\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %smax = smax <4 x i32> %x, { 0, 0, 0, 0 }\n  %add = add <4 x i32> %smax, { 1, 1, 1, 1 }\n  ret <4 x i32> %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test_vec(<4 x i32> %x) {\n  %smax = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> zeroinitializer)\n  %add = add <4 x i32> %smax, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n  %add = add <4 x i32> %x, splat (i32 1)\n  %cmp.inv = icmp slt <4 x i32> %x, splat (i32 1)\n  %s = select <4 x i1> %cmp.inv, <4 x i32> splat (i32 1), <4 x i32> %add\n  ret <4 x i32> %s\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %smax = smax <4 x i32> %x, { 0, 0, 0, 0 }\n  %add = add <4 x i32> %smax, { 1, 1, 1, 1 }\n  ret <4 x i32> %add\n}\n=>\ndefine <4 x i32> @test_vec(<4 x i32> %x) {\n#0:\n  %add = add <4 x i32> %x, { 1, 1, 1, 1 }\n  %cmp.inv = icmp slt <4 x i32> %x, { 1, 1, 1, 1 }\n  %s = select <4 x i1> %cmp.inv, <4 x i32> { 1, 1, 1, 1 }, <4 x i32> %add\n  ret <4 x i32> %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_flags",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_no_flags(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_no_flags(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add i32 %smax, 16\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n=>\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add i32 %smax, 16\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_no_flags(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_no_flags(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add i32 %smax, 16\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n=>\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add i32 %smax, 16\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_no_flags(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1008)\n  %add = add i32 %smax, 16\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_no_flags(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %smax = smax i32 %x, 1008\n  %add = add i32 %smax, 16\n  ret i32 %add\n}\n=>\ndefine i32 @test_no_flags(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 1024\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_nuw_inference",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_neg_nuw(i32 %x) {\n  %sub = sub i32 %x, 5\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_neg_nuw(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %sub = sub i32 %x, 5\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}\n=>\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %smax = smax i32 %x, 10\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_neg_nuw(i32 %x) {\n  %sub = add i32 %x, -5\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_neg_nuw(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %sub = add i32 %x, 4294967291\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}\n=>\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %smax = smax i32 %x, 10\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_neg_nuw(i32 %x) {\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_neg_nuw(i32 %x) {\n  %sub = add i32 %x, -5\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %smax = smax i32 %x, 10\n  %sub = sub i32 %smax, 5\n  ret i32 %sub\n}\n=>\ndefine i32 @test_neg_nuw(i32 %x) {\n#0:\n  %sub = add i32 %x, 4294967291\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %sub, i32 5\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fail_constant_mismatch",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_fail(i32 %x) {\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail(i32 %x) {\n#0:\n  %add = add i32 %x, 16\n  %cmp = icmp sgt i32 %x, 1008\n  %s = select i1 %cmp, i32 %add, i32 999\n  ret i32 %s\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fail_wrong_op",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+          "tgt": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_fail_mul(i32 %x) {\n  %mul = shl i32 %x, 1\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\n",
+          "tgt": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = shl i32 %x, 1\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_fail_mul(i32 %x) {\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_fail_mul(i32 %x) {\n  %mul = shl i32 %x, 1\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = mul i32 %x, 2\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\n=>\ndefine i32 @test_fail_mul(i32 %x) {\n#0:\n  %mul = shl i32 %x, 1\n  %cmp = icmp sgt i32 %x, 10\n  %s = select i1 %cmp, i32 %mul, i32 20\n  ret i32 %s\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,440 @@
+{
+  "issue_id": "58523-orig",
+  "dataset_file": "58523-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i64 @test(i64 %0) {\r\n  %2 = sub nuw i64 71, %0\r\n  %3 = and i64 %2, -8\r\n  %4 = sub i64 64, %3\r\n  ret i64 %4\r\n}\n\ndefine i64 @test(i64 %0) {\r\n  %2 = and i64 %0, 120\r\n  ret i64 %2\r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Missed optimization of a 'round-down and subtract' pattern into a bitwise AND. Specifically, `sub(C2, and(sub(nuw C1, x), -A))` where `C1 == C2 + A - 1` simplifies to `and(x, -A)`. With the `nuw` flag providing range information, the mask can be further simplified (e.g., `-8` to `120` if `x <= 71`).\",\n  \"before_after\": \"Transforms `sub(Constant2, and(sub(Constant1, %x), Mask))` into `and(%x, NewMask)`. If `Constant1 == Constant2 + Alignment - 1` and `Mask == -Alignment`, this simplifies to `and(%x, -Alignment)`. If `nuw` is present, `NewMask` can be shrunk to `Constant1 & -Alignment`.\",\n  \"preconditions\": [\n    \"The outer instruction is a `sub` with a constant LHS (`C2`).\",\n    \"The RHS of the outer `sub` is an `and` instruction.\",\n    \"The LHS of the `and` is a `sub` instruction.\",\n    \"The LHS of the inner `sub` is a constant (`C1`).\",\n    \"The RHS of the `and` is a constant `Mask` of the form `-A` (where `A` is a power of 2, e.g., -8, -16).\",\n    \"The relationship `C1 == C2 + A - 1` must hold.\",\n    \"The operands of the `and` can be commuted.\",\n    \"The `nuw` flag on the inner `sub` enables mask shrinking but is not strictly required for the algebraic simplification to `%x & -A`.\",\n    \"The `nsw` flag does not enable mask shrinking to positive constants in the same way.\"\n  ],\n  \"pattern\": \"General Pattern: `sub(C2, and(sub(C1, %x), -A))` -> `and(%x, -A)` (given `C1 == C2 + A - 1`).\\n\\nWith `nuw` (Range Optimization): If `sub nuw C1, %x` exists, then `%x <= C1`. Since `C1` is `C2 + A - 1`, `%x` fits in `ceil(log2(C1+1))` bits. This allows simplifying `%x & -A` to `%x & (C1 & -A)` (a smaller positive constant).\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_i64_nuw\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, 120\\n  ret i64 %2\\n}\",\n      \"why\": \"Original case: C1=71, C2=64, A=8. nuw allows shrinking mask -8 to 120.\"\n    },\n    {\n      \"name\": \"Original_i64_no_nuw\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub i64 71, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, -8\\n  ret i64 %2\\n}\",\n      \"why\": \"Without nuw, the algebraic simplification still holds, but we cannot shrink the mask to 120.\"\n    },\n    {\n      \"name\": \"i32_case_nuw\",\n      \"ir\": \"define i32 @test(i32 %0) {\\n  %2 = sub nuw i32 39, %0\\n  %3 = and i32 %2, -8\\n  %4 = sub i32 32, %3\\n  ret i32 %4\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %0) {\\n  %2 = and i32 %0, 56\\n  ret i32 %2\\n}\",\n      \"why\": \"32-bit variant: C1=39, C2=32, A=8. Mask shrinks from -8 to 56 (0x38).\"\n    },\n    {\n      \"name\": \"i32_case_no_nuw\",\n      \"ir\": \"define i32 @test(i32 %0) {\\n  %2 = sub i32 39, %0\\n  %3 = and i32 %2, -8\\n  %4 = sub i32 32, %3\\n  ret i32 %4\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %0) {\\n  %2 = and i32 %0, -8\\n  ret i32 %2\\n}\",\n      \"why\": \"32-bit variant without nuw preserves the generic mask.\"\n    },\n    {\n      \"name\": \"Alignment_16_i64\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 143, %0\\n  %3 = and i64 %2, -16\\n  %4 = sub i64 128, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, 240\\n  ret i64 %2\\n}\",\n      \"why\": \"Alignment 16: C1=143, C2=128. Mask shrinks to 240 (0xF0).\"\n    },\n    {\n      \"name\": \"Vector_case\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %0) {\\n  %2 = sub nuw <4 x i32> <i32 39, i32 39, i32 39, i32 39>, %0\\n  %3 = and <4 x i32> %2, <i32 -8, i32 -8, i32 -8, i32 -8>\\n  %4 = sub <4 x i32> <i32 32, i32 32, i32 32, i32 32>, %3\\n  ret <4 x i32> %4\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %0) {\\n  %2 = and <4 x i32> %0, <i32 56, i32 56, i32 56, i32 56>\\n  ret <4 x i32> %2\\n}\",\n      \"why\": \"Vector variant works identically.\"\n    },\n    {\n      \"name\": \"Commutative_And\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 -8, %2\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, 120\\n  ret i64 %2\\n}\",\n      \"why\": \"AND operands can be in any order.\"\n    },\n    {\n      \"name\": \"Negative_Wrong_Constant\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 63, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 63, %3\\n  ret i64 %4\\n}\",\n      \"why\": \"C2=63 is not aligned to A=8, nor does C1=71 satisfy C2 + A - 1 (63+7=70 != 71). Fold should not happen.\"\n    },\n    {\n      \"name\": \"Negative_Wrong_Alignment\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -7\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -7\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"why\": \"Mask -7 is not a power of 2. Fold should not happen.\"\n    },\n    {\n      \"name\": \"Corner_C2_Zero\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %2 = sub nuw i64 7, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 0, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, 0\\n  ret i64 %2\\n}\",\n      \"why\": \"C2=0, C1=7, A=8. Result is x & -8. Since x <= 7, x & -8 is always 0.\"\n    },\n    {\n      \"name\": \"Noise_Ops\",\n      \"ir\": \"define i64 @test(i64 %0) {\\n  %noop = add i64 %0, 0\\n  %2 = sub nuw i64 71, %noop\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %0) {\\n  %2 = and i64 %0, 120\\n  ret i64 %2\\n}\",\n      \"why\": \"Noise operations like add 0 should not prevent the fold.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement in InstCombine's visitSub function.\\n\\n1. Match `sub(C2, Op)`.\\n2. Check if `Op` is `and(Mask, InnerSub)`.\\n3. Check if `InnerSub` is `sub(C1, X)`.\\n4. Check if `Mask` is a power-of-2 mask (i.e., `Mask & (Mask + 1) == 0` and `Mask != 0`). Let `A = -Mask`.\\n5. Check if `C2` is a multiple of `A`.\\n6. Check if `C1 == C2 + A - 1`.\\n7. If all match, replace with `and(X, Mask)`.\\n8. If `InnerSub` has `nuw`, use `SimplifyDemandedBits` or compute `(C1 & Mask)` to attempt to shrink the mask constant immediately.\\n\\nPitfalls:\\n- Ensure `C1` and `C2` are treated as unsigned values for the comparison `C1 == C2 + A - 1`.\\n- Be careful with `nsw` on the inner sub; it implies signed range, which doesn't help shrink the mask to a positive constant in the same way `nuw` does (unless we can prove `X` is positive).\\n- If the outer `sub` has `nuw`, verify that `X & -A` does not cause the outer sub to wrap. Given `X <= C1`, `X & -A <= C1 & -A = C2`, so `C2 - (X & -A) >= 0`. The outer sub is safe.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` to test.\\n\\nFor the original case:\\n```\\n; RUN: opt -instcombine -S < %s | FileCheck %s\\n\\ndefine i64 @test(i64 %0) {\\n; CHECK-LABEL: @test(\\n; CHECK-NEXT:    [[AND:%.*]] = and i64 %0, 120\\n; CHECK-NEXT:    ret i64 [[AND]]\\n  %2 = sub nuw i64 71, %0\\n  %3 = and i64 %2, -8\\n  %4 = sub i64 64, %3\\n  ret i64 %4\\n}\\n```\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Missed optimization of a 'round-down and subtract' pattern into a bitwise AND. Specifically, `sub(C2, and(sub(nuw C1, x), -A))` where `C1 == C2 + A - 1` simplifies to `and(x, -A)`. With the `nuw` flag providing range information, the mask can be further simplified (e.g., `-8` to `120` if `x <= 71`).",
+    "before_after": "Transforms `sub(Constant2, and(sub(Constant1, %x), Mask))` into `and(%x, NewMask)`. If `Constant1 == Constant2 + Alignment - 1` and `Mask == -Alignment`, this simplifies to `and(%x, -Alignment)`. If `nuw` is present, `NewMask` can be shrunk to `Constant1 & -Alignment`.",
+    "preconditions": [
+      "The outer instruction is a `sub` with a constant LHS (`C2`).",
+      "The RHS of the outer `sub` is an `and` instruction.",
+      "The LHS of the `and` is a `sub` instruction.",
+      "The LHS of the inner `sub` is a constant (`C1`).",
+      "The RHS of the `and` is a constant `Mask` of the form `-A` (where `A` is a power of 2, e.g., -8, -16).",
+      "The relationship `C1 == C2 + A - 1` must hold.",
+      "The operands of the `and` can be commuted.",
+      "The `nuw` flag on the inner `sub` enables mask shrinking but is not strictly required for the algebraic simplification to `%x & -A`.",
+      "The `nsw` flag does not enable mask shrinking to positive constants in the same way."
+    ],
+    "pattern": "General Pattern: `sub(C2, and(sub(C1, %x), -A))` -> `and(%x, -A)` (given `C1 == C2 + A - 1`).\n\nWith `nuw` (Range Optimization): If `sub nuw C1, %x` exists, then `%x <= C1`. Since `C1` is `C2 + A - 1`, `%x` fits in `ceil(log2(C1+1))` bits. This allows simplifying `%x & -A` to `%x & (C1 & -A)` (a smaller positive constant).",
+    "testcases": [
+      {
+        "name": "Original_i64_nuw",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+        "why": "Original case: C1=71, C2=64, A=8. nuw allows shrinking mask -8 to 120."
+      },
+      {
+        "name": "Original_i64_no_nuw",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, -8\n  ret i64 %2\n}",
+        "why": "Without nuw, the algebraic simplification still holds, but we cannot shrink the mask to 120."
+      },
+      {
+        "name": "i32_case_nuw",
+        "ir": "define i32 @test(i32 %0) {\n  %2 = sub nuw i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, 56\n  ret i32 %2\n}",
+        "why": "32-bit variant: C1=39, C2=32, A=8. Mask shrinks from -8 to 56 (0x38)."
+      },
+      {
+        "name": "i32_case_no_nuw",
+        "ir": "define i32 @test(i32 %0) {\n  %2 = sub i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, -8\n  ret i32 %2\n}",
+        "why": "32-bit variant without nuw preserves the generic mask."
+      },
+      {
+        "name": "Alignment_16_i64",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 143, %0\n  %3 = and i64 %2, -16\n  %4 = sub i64 128, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 240\n  ret i64 %2\n}",
+        "why": "Alignment 16: C1=143, C2=128. Mask shrinks to 240 (0xF0)."
+      },
+      {
+        "name": "Vector_case",
+        "ir": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = sub nuw <4 x i32> <i32 39, i32 39, i32 39, i32 39>, %0\n  %3 = and <4 x i32> %2, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %4 = sub <4 x i32> <i32 32, i32 32, i32 32, i32 32>, %3\n  ret <4 x i32> %4\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = and <4 x i32> %0, <i32 56, i32 56, i32 56, i32 56>\n  ret <4 x i32> %2\n}",
+        "why": "Vector variant works identically."
+      },
+      {
+        "name": "Commutative_And",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 -8, %2\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+        "why": "AND operands can be in any order."
+      },
+      {
+        "name": "Negative_Wrong_Constant",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+        "why": "C2=63 is not aligned to A=8, nor does C1=71 satisfy C2 + A - 1 (63+7=70 != 71). Fold should not happen."
+      },
+      {
+        "name": "Negative_Wrong_Alignment",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "why": "Mask -7 is not a power of 2. Fold should not happen."
+      },
+      {
+        "name": "Corner_C2_Zero",
+        "ir": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 7, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 0, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 0\n  ret i64 %2\n}",
+        "why": "C2=0, C1=7, A=8. Result is x & -8. Since x <= 7, x & -8 is always 0."
+      },
+      {
+        "name": "Noise_Ops",
+        "ir": "define i64 @test(i64 %0) {\n  %noop = add i64 %0, 0\n  %2 = sub nuw i64 71, %noop\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+        "why": "Noise operations like add 0 should not prevent the fold."
+      }
+    ],
+    "implementation_notes": "Implement in InstCombine's visitSub function.\n\n1. Match `sub(C2, Op)`.\n2. Check if `Op` is `and(Mask, InnerSub)`.\n3. Check if `InnerSub` is `sub(C1, X)`.\n4. Check if `Mask` is a power-of-2 mask (i.e., `Mask & (Mask + 1) == 0` and `Mask != 0`). Let `A = -Mask`.\n5. Check if `C2` is a multiple of `A`.\n6. Check if `C1 == C2 + A - 1`.\n7. If all match, replace with `and(X, Mask)`.\n8. If `InnerSub` has `nuw`, use `SimplifyDemandedBits` or compute `(C1 & Mask)` to attempt to shrink the mask constant immediately.\n\nPitfalls:\n- Ensure `C1` and `C2` are treated as unsigned values for the comparison `C1 == C2 + A - 1`.\n- Be careful with `nsw` on the inner sub; it implies signed range, which doesn't help shrink the mask to a positive constant in the same way `nuw` does (unless we can prove `X` is positive).\n- If the outer `sub` has `nuw`, verify that `X & -A` does not cause the outer sub to wrap. Given `X <= C1`, `X & -A <= C1 & -A = C2`, so `C2 - (X & -A) >= 0`. The outer sub is safe.",
+    "regression_test_notes": "Use `opt -instcombine -S` to test.\n\nFor the original case:\n```\n; RUN: opt -instcombine -S < %s | FileCheck %s\n\ndefine i64 @test(i64 %0) {\n; CHECK-LABEL: @test(\n; CHECK-NEXT:    [[AND:%.*]] = and i64 %0, 120\n; CHECK-NEXT:    ret i64 [[AND]]\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n```",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "Original_i64_nuw",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %#0 = #x0000000000000084 (132)\n\nSource:\ni64 %#2 = #x0000000000000000 (0)\n\nTarget:\ni64 %#2 = poison\ni64 %#3 = poison\ni64 %#4 = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Original_i64_no_nuw",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, -8\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, -8\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, -8\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, -8\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, -8\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, -8\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_case_nuw",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %0) {\n  %2 = sub nuw i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}",
+          "tgt": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, 56\n  ret i32 %2\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub nuw i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 56\n  ret i32 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %0) {\n  %2 = sub nuw i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}\n",
+          "tgt": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, 56\n  ret i32 %2\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub nuw i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 56\n  ret i32 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, 56\n  ret i32 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %0) {\n  %2 = sub nuw i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 56\n  ret i32 %#2\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub nuw i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %#0 = #x00000080 (128)\n\nSource:\ni32 %#2 = #x00000000 (0)\n\nTarget:\ni32 %#2 = poison\ni32 %#3 = poison\ni32 %#4 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_case_no_nuw",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %0) {\n  %2 = sub i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}",
+          "tgt": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, -8\n  ret i32 %2\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 4294967288\n  ret i32 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %0) {\n  %2 = sub i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}\n",
+          "tgt": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, -8\n  ret i32 %2\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 4294967288\n  ret i32 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %0) {\n  %2 = and i32 %0, -8\n  ret i32 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %0) {\n  %2 = sub i32 39, %0\n  %3 = and i32 %2, -8\n  %4 = sub i32 32, %3\n  ret i32 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = and i32 %#0, 4294967288\n  ret i32 %#2\n}\n=>\ndefine i32 @test(i32 %#0) {\n#1:\n  %#2 = sub i32 39, %#0\n  %#3 = and i32 %#2, 4294967288\n  %#4 = sub i32 32, %#3\n  ret i32 %#4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Alignment_16_i64",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 143, %0\n  %3 = and i64 %2, -16\n  %4 = sub i64 128, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 240\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 143, %#0\n  %#3 = and i64 %#2, -16\n  %#4 = sub i64 128, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 240\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 143, %0\n  %3 = and i64 %2, -16\n  %4 = sub i64 128, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 240\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 143, %#0\n  %#3 = and i64 %#2, -16\n  %#4 = sub i64 128, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 240\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 240\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 143, %0\n  %3 = and i64 %2, -16\n  %4 = sub i64 128, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 240\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 143, %#0\n  %#3 = and i64 %#2, -16\n  %#4 = sub i64 128, %#3\n  ret i64 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %#0 = #x00000000000000c0 (192)\n\nSource:\ni64 %#2 = #x00000000000000c0 (192)\n\nTarget:\ni64 %#2 = poison\ni64 %#3 = poison\ni64 %#4 = poison\nSource value: #x00000000000000c0 (192)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector_case",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = sub nuw <4 x i32> <i32 39, i32 39, i32 39, i32 39>, %0\n  %3 = and <4 x i32> %2, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %4 = sub <4 x i32> <i32 32, i32 32, i32 32, i32 32>, %3\n  ret <4 x i32> %4\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = and <4 x i32> %0, <i32 56, i32 56, i32 56, i32 56>\n  ret <4 x i32> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = sub nuw <4 x i32> { 39, 39, 39, 39 }, %#0\n  %#3 = and <4 x i32> %#2, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %#4 = sub <4 x i32> { 32, 32, 32, 32 }, %#3\n  ret <4 x i32> %#4\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = and <4 x i32> %#0, { 56, 56, 56, 56 }\n  ret <4 x i32> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %0) {\n  %2 = sub nuw <4 x i32> <i32 39, i32 39, i32 39, i32 39>, %0\n  %3 = and <4 x i32> %2, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %4 = sub <4 x i32> <i32 32, i32 32, i32 32, i32 32>, %3\n  ret <4 x i32> %4\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = and <4 x i32> %0, <i32 56, i32 56, i32 56, i32 56>\n  ret <4 x i32> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = sub nuw <4 x i32> { 39, 39, 39, 39 }, %#0\n  %#3 = and <4 x i32> %#2, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %#4 = sub <4 x i32> { 32, 32, 32, 32 }, %#3\n  ret <4 x i32> %#4\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = and <4 x i32> %#0, { 56, 56, 56, 56 }\n  ret <4 x i32> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %0) {\n  %2 = and <4 x i32> %0, <i32 56, i32 56, i32 56, i32 56>\n  ret <4 x i32> %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %0) {\n  %2 = sub nuw <4 x i32> <i32 39, i32 39, i32 39, i32 39>, %0\n  %3 = and <4 x i32> %2, <i32 -8, i32 -8, i32 -8, i32 -8>\n  %4 = sub <4 x i32> <i32 32, i32 32, i32 32, i32 32>, %3\n  ret <4 x i32> %4\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = and <4 x i32> %#0, { 56, 56, 56, 56 }\n  ret <4 x i32> %#2\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %#0) {\n#1:\n  %#2 = sub nuw <4 x i32> { 39, 39, 39, 39 }, %#0\n  %#3 = and <4 x i32> %#2, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %#4 = sub <4 x i32> { 32, 32, 32, 32 }, %#3\n  ret <4 x i32> %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i32> %#0 = < #x00000000 (0), #x00000000 (0), #x00000080 (128), #x00000000 (0) >\n\nSource:\n<4 x i32> %#2 = < #x00000000 (0), #x00000000 (0), #x00000000 (0), #x00000000 (0) >\n\nTarget:\n<4 x i32> %#2 = < #x00000027 (39), #x00000027 (39), poison, #x00000027 (39) >\n<4 x i32> %#3 = < #x00000020 (32), #x00000020 (32), poison, #x00000020 (32) >\n<4 x i32> %#4 = < #x00000000 (0), #x00000000 (0), poison, #x00000000 (0) >\nSource value: < #x00000000 (0), #x00000000 (0), #x00000000 (0), #x00000000 (0) >\nTarget value: < #x00000000 (0), #x00000000 (0), poison, #x00000000 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative_And",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 -8, %2\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 -8, %#2\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %#0 = #x0000000000000084 (132)\n\nSource:\ni64 %#2 = #x0000000000000000 (0)\n\nTarget:\ni64 %#2 = poison\ni64 %#3 = poison\ni64 %#4 = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Wrong_Constant",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 63, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 63, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Wrong_Alignment",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -7\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -7\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Corner_C2_Zero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = sub nuw i64 7, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 0, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 0\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 7, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 0, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 0\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 7, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 0, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 0\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 7, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 0, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 0\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 0\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 7, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 0, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 0\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 7, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 0, %#3\n  ret i64 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %#0 = #x0000000000000008 (8)\n\nSource:\ni64 %#2 = #x0000000000000000 (0)\n\nTarget:\ni64 %#2 = poison\ni64 %#3 = poison\ni64 %#4 = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Noise_Ops",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %0) {\n  %noop = add i64 %0, 0\n  %2 = sub nuw i64 71, %noop\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %noop = add i64 %#0, 0\n  %#2 = sub nuw i64 71, %noop\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "tgt": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %0) {\n  %2 = and i64 %0, 120\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %0) {\n  %2 = sub nuw i64 71, %0\n  %3 = and i64 %2, -8\n  %4 = sub i64 64, %3\n  ret i64 %4\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = and i64 %#0, 120\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i64 %#0) {\n#1:\n  %#2 = sub nuw i64 71, %#0\n  %#3 = and i64 %#2, -8\n  %#4 = sub i64 64, %#3\n  ret i64 %#4\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %#0 = #x0000000000000084 (132)\n\nSource:\ni64 %#2 = #x0000000000000000 (0)\n\nTarget:\ni64 %#2 = poison\ni64 %#3 = poison\ni64 %#4 = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.2s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

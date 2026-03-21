@@ -1,0 +1,634 @@
+{
+  "issue_id": "121775",
+  "dataset_file": "121775.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i8 @xor_shl(i8 %x, i8 %y, i8 %zarg, i8 %shamt) {\n  %z = sdiv i8 42, %zarg\n  %sx = shl i8 %x, %shamt\n  %sy = shl i8 %y, %shamt\n  %a = xor i8 %z, %sx\n  %r = xor i8 %a, %sy\n  ret i8 %r\n}\n\ndefine i8 @xor_shl(i8 %x, i8 %y, i8 %zarg, i8 %shamt) {\n  %z = sdiv i8 42, %zarg\n  %1 = xor i8 %x, %y\n  %2 = shl i8 %1, %shamt\n  %r = xor i8 %2, %z\n  ret i8 %r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Factor out common shift operations from XOR operands. The pattern `(A ^ (B << S) ^ (D << S))` can be optimized to `A ^ ((B ^ D) << S)`, reducing the number of shift instructions and potentially enabling further simplification of the XOR chain.\",\n  \"before_after\": {\n    \"original_pattern\": \"%r = xor %z, %sx\\n%r2 = xor %r, %sy\\n(where %sx = shl %x, %S and %sy = shl %y, %S)\",\n    \"optimized_pattern\": \"%xy = xor %x, %y\\n%shifted = shl %xy, %S\\n%r = xor %z, %shifted\"\n  },\n  \"preconditions\": [\n    \"The operation must be an XOR (which is associative and commutative).\",\n    \"At least two operands in the XOR expression tree must be shift operations (shl, lshr, or ashr).\",\n    \"The shift operations must be of the same type (opcode and bitwidth).\",\n    \"The shift amounts must be identical (same Value*).\",\n    \"The data type of the values being shifted must match.\",\n    \"Flags (nuw, nsw, exact) must be compatible (present on both source shifts to be preserved on the result).\"\n  ],\n  \"pattern\": \"Find a binary expression tree rooted at `xor`. Identify two leaf nodes `L1` and `L2` such that `L1 = (A << S)` and `L2 = (B << S)` (or `>>`), where the shift opcode and `S` are identical. Replace `L1 ^ L2` with `(A ^ B) << S`. This applies recursively through the XOR tree.\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_scalar_shl\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sy = shl i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = shl i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Basic case: factoring common left shift from two XORed operands.\"\n    },\n    {\n      \"name\": \"three_operands_assoc\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sy = shl i32 %y, %s\\n  %tmp = xor i32 %sx, %sy\\n  %r = xor i32 %tmp, %z\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %sxy = shl i32 %xy, %s\\n  %r = xor i32 %sxy, %z\\n  ret i32 %r\\n}\",\n      \"why\": \"Associativity: factor out shift from two operands, leaving the third untouched.\"\n    },\n    {\n      \"name\": \"lshr_variant\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = lshr i32 %x, %s\\n  %sy = lshr i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = lshr i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Right shift (logical) also distributes over XOR.\"\n    },\n    {\n      \"name\": \"ashr_variant\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = ashr i32 %x, %s\\n  %sy = ashr i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = ashr i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Right shift (arithmetic) distributes over XOR in two's complement.\"\n    },\n    {\n      \"name\": \"vector_shl\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\\n  %sx = shl <4 x i32> %x, %s\\n  %sy = shl <4 x i32> %y, %s\\n  %r = xor <4 x i32> %sx, %sy\\n  ret <4 x i32> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\\n  %xy = xor <4 x i32> %x, %y\\n  %r = shl <4 x i32> %xy, %s\\n  ret <4 x i32> %r\\n}\",\n      \"why\": \"Vector types should support the same factorization.\"\n    },\n    {\n      \"name\": \"constant_shift_amount\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %sx = shl i32 %x, 5\\n  %sy = shl i32 %y, 5\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %xy = xor i32 %x, %y\\n  %r = shl i32 %xy, 5\\n  ret i32 %r\\n}\",\n      \"why\": \"Constant shift amounts are common and should be handled.\"\n    },\n    {\n      \"name\": \"mixed_tree_structure\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sz = shl i32 %z, %s\\n  %tmp1 = xor i32 %sx, %y\\n  %r = xor i32 %tmp1, %sz\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %xz = xor i32 %x, %z\\n  %sxz = shl i32 %xz, %s\\n  %r = xor i32 %sxz, %y\\n  ret i32 %r\\n}\",\n      \"why\": \"The shifted operands are not adjacent in the IR tree but are logically part of the same XOR reduction.\"\n    },\n    {\n      \"name\": \"nuw_flags_preserved\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl nuw i32 %x, %s\\n  %sy = shl nuw i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = shl nuw i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"If both inputs have nuw, the result has nuw (since top bits of X and Y are 0).\"\n    },\n    {\n      \"name\": \"nuw_flags_dropped\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl nuw i32 %x, %s\\n  %sy = shl i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = shl i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Flags must be dropped if not present on both operands.\"\n    },\n    {\n      \"name\": \"exact_flags_lshr\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = lshr exact i32 %x, %s\\n  %sy = lshr exact i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = lshr exact i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Exact flag (low bits zero) is preserved through XOR.\"\n    },\n    {\n      \"name\": \"shift_by_zero\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %sx = shl i32 %x, 0\\n  %sy = shl i32 %y, 0\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %r = xor i32 %x, %y\\n  ret i32 %r\\n}\",\n      \"why\": \"Factoring out a shift by 0 should allow the shift to be eliminated entirely.\"\n    },\n    {\n      \"name\": \"negative_mismatched_opcode\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sy = lshr i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sy = lshr i32 %y, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"why\": \"Should not optimize if shift opcodes differ (shl vs lshr).\"\n    },\n    {\n      \"name\": \"negative_mismatched_amount\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\\n  %sx = shl i32 %x, %s1\\n  %sy = shl i32 %y, %s2\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\\n  %sx = shl i32 %x, %s1\\n  %sy = shl i32 %y, %s2\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"why\": \"Should not optimize if shift amounts are different values.\"\n    },\n    {\n      \"name\": \"commuted_operands\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %sy = shl i32 %y, %s\\n  %r = xor i32 %sy, %sx\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %s) {\\n  %xy = xor i32 %x, %y\\n  %r = shl i32 %xy, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"XOR is commutative; order of operands doesn't matter.\"\n    },\n    {\n      \"name\": \"nested_xor_shift\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %sx = shl i32 %x, %s\\n  %tmp = xor i32 %y, %z\\n  %sy = shl i32 %tmp, %s\\n  %r = xor i32 %sx, %sy\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\\n  %tmp = xor i32 %y, %z\\n  %1 = xor i32 %x, %tmp\\n  %r = shl i32 %1, %s\\n  ret i32 %r\\n}\",\n      \"why\": \"Operands themselves can be XORs; factor the shift out to the root of the XOR tree.\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstCombine::visitXor (or a helper like matchXorShiftShiftPattern)\",\n    \"logic\": \"1. Check if either operand of the XOR is a shift (shl/lshr/ashr). 2. Check if the other operand is also a shift with matching opcode and amount. If yes, fold. 3. If not, check if the other operand is an XOR. Recursively check its operands for a matching shift. 4. If a match is found, replace (A ^ (B << S) ^ (D << S)) with A ^ ((B ^ D) << S).\",\n    \"flags_handling\": \"If both shifts have NUW/NSW/EXACT, set the flag on the new shift. If only one has it, or they differ, do not set the flag (conservative).\",\n    \"complexity\": \"This is effectively a reassociation. Be careful with infinite loops (e.g., flipping back and forth if we also implement distributing shift *into* xor, though distributing in is usually less profitable). The fold reduces instruction count, so it is safe.\",\n    \"helper_functions\": \"Use m_Shift(m_Value(A), m_Value(S)) and m_Xor(m_BinOp, ...).\"\n  },\n  \"regression_test_notes\": \"Use 'opt -instcombine' on the provided IR. Check that the number of 'shl'/'lshr'/'ashr' instructions decreases and the XOR tree collapses. Verify flags in FileCheck using CHECK-DAG.\",\n  \"clarifying_questions\": [\n    \"Should this transformation apply to 'add' as well? (e.g. (A << S) + (B << S) -> (A+B) << S). Logically yes, but the prompt focused on XOR.\",\n    \"Should we aggressively look for multiple pairs (e.g. 3 shifted terms) in one pass, or rely on iterative execution of InstCombine?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Factor out common shift operations from XOR operands. The pattern `(A ^ (B << S) ^ (D << S))` can be optimized to `A ^ ((B ^ D) << S)`, reducing the number of shift instructions and potentially enabling further simplification of the XOR chain.",
+    "before_after": {
+      "original_pattern": "%r = xor %z, %sx\n%r2 = xor %r, %sy\n(where %sx = shl %x, %S and %sy = shl %y, %S)",
+      "optimized_pattern": "%xy = xor %x, %y\n%shifted = shl %xy, %S\n%r = xor %z, %shifted"
+    },
+    "preconditions": [
+      "The operation must be an XOR (which is associative and commutative).",
+      "At least two operands in the XOR expression tree must be shift operations (shl, lshr, or ashr).",
+      "The shift operations must be of the same type (opcode and bitwidth).",
+      "The shift amounts must be identical (same Value*).",
+      "The data type of the values being shifted must match.",
+      "Flags (nuw, nsw, exact) must be compatible (present on both source shifts to be preserved on the result)."
+    ],
+    "pattern": "Find a binary expression tree rooted at `xor`. Identify two leaf nodes `L1` and `L2` such that `L1 = (A << S)` and `L2 = (B << S)` (or `>>`), where the shift opcode and `S` are identical. Replace `L1 ^ L2` with `(A ^ B) << S`. This applies recursively through the XOR tree.",
+    "testcases": [
+      {
+        "name": "basic_scalar_shl",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "Basic case: factoring common left shift from two XORed operands."
+      },
+      {
+        "name": "three_operands_assoc",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %tmp = xor i32 %sx, %sy\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}",
+        "why": "Associativity: factor out shift from two operands, leaving the third untouched."
+      },
+      {
+        "name": "lshr_variant",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = lshr i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "Right shift (logical) also distributes over XOR."
+      },
+      {
+        "name": "ashr_variant",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = ashr i32 %x, %s\n  %sy = ashr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "Right shift (arithmetic) distributes over XOR in two's complement."
+      },
+      {
+        "name": "vector_shl",
+        "ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %sx = shl <4 x i32> %x, %s\n  %sy = shl <4 x i32> %y, %s\n  %r = xor <4 x i32> %sx, %sy\n  ret <4 x i32> %r\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}",
+        "why": "Vector types should support the same factorization."
+      },
+      {
+        "name": "constant_shift_amount",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %sx = shl i32 %x, 5\n  %sy = shl i32 %y, 5\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}",
+        "why": "Constant shift amounts are common and should be handled."
+      },
+      {
+        "name": "mixed_tree_structure",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sz = shl i32 %z, %s\n  %tmp1 = xor i32 %sx, %y\n  %r = xor i32 %tmp1, %sz\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}",
+        "why": "The shifted operands are not adjacent in the IR tree but are logically part of the same XOR reduction."
+      },
+      {
+        "name": "nuw_flags_preserved",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl nuw i32 %x, %s\n  %sy = shl nuw i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl nuw i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "If both inputs have nuw, the result has nuw (since top bits of X and Y are 0)."
+      },
+      {
+        "name": "nuw_flags_dropped",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl nuw i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "Flags must be dropped if not present on both operands."
+      },
+      {
+        "name": "exact_flags_lshr",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = lshr exact i32 %x, %s\n  %sy = lshr exact i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "Exact flag (low bits zero) is preserved through XOR."
+      },
+      {
+        "name": "shift_by_zero",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %sx = shl i32 %x, 0\n  %sy = shl i32 %y, 0\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}",
+        "why": "Factoring out a shift by 0 should allow the shift to be eliminated entirely."
+      },
+      {
+        "name": "negative_mismatched_opcode",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "why": "Should not optimize if shift opcodes differ (shl vs lshr)."
+      },
+      {
+        "name": "negative_mismatched_amount",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "why": "Should not optimize if shift amounts are different values."
+      },
+      {
+        "name": "commuted_operands",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sy, %sx\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+        "why": "XOR is commutative; order of operands doesn't matter."
+      },
+      {
+        "name": "nested_xor_shift",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %tmp = xor i32 %y, %z\n  %sy = shl i32 %tmp, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %1 = xor i32 %x, %tmp\n  %r = shl i32 %1, %s\n  ret i32 %r\n}",
+        "why": "Operands themselves can be XORs; factor the shift out to the root of the XOR tree."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstCombine::visitXor (or a helper like matchXorShiftShiftPattern)",
+      "logic": "1. Check if either operand of the XOR is a shift (shl/lshr/ashr). 2. Check if the other operand is also a shift with matching opcode and amount. If yes, fold. 3. If not, check if the other operand is an XOR. Recursively check its operands for a matching shift. 4. If a match is found, replace (A ^ (B << S) ^ (D << S)) with A ^ ((B ^ D) << S).",
+      "flags_handling": "If both shifts have NUW/NSW/EXACT, set the flag on the new shift. If only one has it, or they differ, do not set the flag (conservative).",
+      "complexity": "This is effectively a reassociation. Be careful with infinite loops (e.g., flipping back and forth if we also implement distributing shift *into* xor, though distributing in is usually less profitable). The fold reduces instruction count, so it is safe.",
+      "helper_functions": "Use m_Shift(m_Value(A), m_Value(S)) and m_Xor(m_BinOp, ...)."
+    },
+    "regression_test_notes": "Use 'opt -instcombine' on the provided IR. Check that the number of 'shl'/'lshr'/'ashr' instructions decreases and the XOR tree collapses. Verify flags in FileCheck using CHECK-DAG.",
+    "clarifying_questions": [
+      "Should this transformation apply to 'add' as well? (e.g. (A << S) + (B << S) -> (A+B) << S). Logically yes, but the prompt focused on XOR.",
+      "Should we aggressively look for multiple pairs (e.g. 3 shifted terms) in one pass, or rely on iterative execution of InstCombine?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_scalar_shl",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "three_operands_assoc",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %tmp = xor i32 %sx, %sy\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %tmp = xor i32 %sx, %sy\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %tmp = shl i32 %sx1, %s\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %tmp = shl i32 %sx1, %s\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %tmp = shl i32 %sx1, %s\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %sxy = shl i32 %xy, %s\n  %r = xor i32 %sxy, %z\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %tmp = shl i32 %sx1, %s\n  %r = xor i32 %tmp, %z\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "lshr_variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = lshr i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = lshr i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ashr_variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = ashr i32 %x, %s\n  %sy = ashr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = ashr i32 %x, %s\n  %sy = ashr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = ashr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = ashr i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = ashr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = ashr i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = ashr i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_shl",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %sx = shl <4 x i32> %x, %s\n  %sy = shl <4 x i32> %y, %s\n  %r = xor <4 x i32> %sx, %sy\n  ret <4 x i32> %r\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %sx = shl <4 x i32> %x, %s\n  %sy = shl <4 x i32> %y, %s\n  %r = xor <4 x i32> %sx, %sy\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %sx1 = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %sx1, %s\n  ret <4 x i32> %r\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %sx1 = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %sx1, %s\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n  %sx1 = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %sx1, %s\n  ret <4 x i32> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %xy = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %xy, %s\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y, <4 x i32> %s) {\n#0:\n  %sx1 = xor <4 x i32> %x, %y\n  %r = shl <4 x i32> %sx1, %s\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_shift_amount",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %sx = shl i32 %x, 5\n  %sy = shl i32 %y, 5\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %sx = shl i32 %x, 5\n  %sy = shl i32 %y, 5\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, 5\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, 5\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, 5\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, 5\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, 5\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mixed_tree_structure",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sz = shl i32 %z, %s\n  %tmp1 = xor i32 %sx, %y\n  %r = xor i32 %tmp1, %sz\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sz = shl i32 %z, %s\n  %tmp1 = xor i32 %sx, %y\n  %r = xor i32 %tmp1, %sz\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %1 = xor i32 %x, %z\n  %2 = shl i32 %1, %s\n  %r = xor i32 %2, %y\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %#1 = xor i32 %x, %z\n  %#2 = shl i32 %#1, %s\n  %r = xor i32 %#2, %y\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %1 = xor i32 %x, %z\n  %2 = shl i32 %1, %s\n  %r = xor i32 %2, %y\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %xz = xor i32 %x, %z\n  %sxz = shl i32 %xz, %s\n  %r = xor i32 %sxz, %y\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %#1 = xor i32 %x, %z\n  %#2 = shl i32 %#1, %s\n  %r = xor i32 %#2, %y\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_flags_preserved",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl nuw i32 %x, %s\n  %sy = shl nuw i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl nuw i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl nuw i32 %x, %s\n  %sy = shl nuw i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl nuw i32 %xy, %s\n  ret i32 %r\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "nuw_flags_dropped",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl nuw i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl nuw i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "exact_flags_lshr",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = lshr exact i32 %x, %s\n  %sy = lshr exact i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = lshr exact i32 %x, %s\n  %sy = lshr exact i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000001 (1)\ni32 %y = #x00000000 (0)\ni32 %s = #x00000001 (1)\n\nSource:\ni32 %sx1 = #x00000001 (1)\ni32 %r = #x00000000 (0)\n\nTarget:\ni32 %xy = #x00000001 (1)\ni32 %r = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = lshr exact i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx1 = xor i32 %x, %y\n  %r = lshr i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "shift_by_zero",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %sx = shl i32 %x, 0\n  %sy = shl i32 %y, 0\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %sx = shl i32 %x, 0\n  %sy = shl i32 %y, 0\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %r = xor i32 %x, %y\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_mismatched_opcode",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = lshr i32 %y, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_mismatched_amount",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s1, i32 %s2) {\n#0:\n  %sx = shl i32 %x, %s1\n  %sy = shl i32 %y, %s2\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sy, %sx\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %sy = shl i32 %y, %s\n  %r = xor i32 %sy, %sx\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sy1 = xor i32 %y, %x\n  %r = shl i32 %sy1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sy1 = xor i32 %y, %x\n  %r = shl i32 %sy1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %s) {\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n  %sy1 = xor i32 %y, %x\n  %r = shl i32 %sy1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %xy = xor i32 %x, %y\n  %r = shl i32 %xy, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %s) {\n#0:\n  %sy1 = xor i32 %y, %x\n  %r = shl i32 %sy1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nested_xor_shift",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %sx = shl i32 %x, %s\n  %tmp = xor i32 %y, %z\n  %sy = shl i32 %tmp, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %1 = xor i32 %x, %tmp\n  %r = shl i32 %1, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %sx = shl i32 %x, %s\n  %tmp = xor i32 %y, %z\n  %sy = shl i32 %tmp, %s\n  %r = xor i32 %sx, %sy\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %tmp = xor i32 %y, %z\n  %#1 = xor i32 %x, %tmp\n  %r = shl i32 %#1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %sx1 = xor i32 %x, %tmp\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %1 = xor i32 %x, %tmp\n  %r = shl i32 %1, %s\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %tmp = xor i32 %y, %z\n  %sx1 = xor i32 %x, %tmp\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %tmp = xor i32 %y, %z\n  %#1 = xor i32 %x, %tmp\n  %r = shl i32 %#1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %1 = xor i32 %x, %tmp\n  %r = shl i32 %1, %s\n  ret i32 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n  %tmp = xor i32 %y, %z\n  %sx1 = xor i32 %x, %tmp\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %tmp = xor i32 %y, %z\n  %#1 = xor i32 %x, %tmp\n  %r = shl i32 %#1, %s\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z, i32 %s) {\n#0:\n  %tmp = xor i32 %y, %z\n  %sx1 = xor i32 %x, %tmp\n  %r = shl i32 %sx1, %s\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

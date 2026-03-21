@@ -1,0 +1,393 @@
+{
+  "issue_id": "157315",
+  "dataset_file": "157315.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test_i8_eq(i8 %x) {\n  %v1 = tail call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = tail call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\ndefine i1 @test_i8_eq(i8 %x) {\n  %1 = add i8 %x, 50\n  %cmp = icmp ult i8 %1, 101\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses the opportunity to simplify a comparison of a clamped value against its original input (e.g., `icmp eq (smin(smax(x, Lo), Hi), x)`) into a single unsigned range check (e.g., `icmp ule (sub x, Lo), (Hi - Lo)`). This pattern checks if `x` lies within the inclusive range `[Lo, Hi]`.\",\n  \"before_after\": \"Transforms `icmp eq/ne (smin (smax X, Lo), Hi), X` into `icmp ule/ugt (sub X, Lo), (Hi - Lo)`. This replaces a min/max chain and a comparison with a single subtraction and an unsigned comparison.\",\n  \"preconditions\": [\n    \"The operation is a clamp: `min(max(X, Lo), Hi)` or `max(min(X, Hi), Lo)`.\",\n    \"`Lo` and `Hi` are constants (or constant expressions).\",\n    \"`Lo <= Hi` (for signed clamp) or `Lo u<= Hi` (for unsigned clamp).\",\n    \"The comparison is between the clamped result and the unclamped input `X`.\",\n    \"The predicate is `eq` (X is in range) or `ne` (X is out of range).\",\n    \"Types are integers or vectors of integers.\"\n  ],\n  \"pattern\": \"Alive2 / MLIR style rewrite:\\n\\n```\\n// Signed Clamp Check\\n%clamped = llvm.smin(llvm.smax(%x, %Lo), %Hi)\\nicmp eq %clamped, %x  \\n  =>\\n%diff = sub %x, %Lo\\nicmp ule %diff, (%Hi - %Lo)\\n\\n// Signed Clamp Check (Inverse)\\n%clamped = llvm.smin(llvm.smax(%x, %Lo), %Hi)\\nicmp ne %clamped, %x\\n  =>\\n%diff = sub %x, %Lo\\nicmp ugt %diff, (%Hi - %Lo)\\n\\n// Unsigned Clamp Check\\n%clamped = llvm.umin(llvm.umax(%x, %Lo), %Hi)\\nicmp eq %clamped, %x\\n  =>\\n%diff = sub %x, %Lo\\nicmp ule %diff, (%Hi - %Lo)\\n```\",\n  \"testcases\": [\n    {\n      \"name\": \"Original Example i8 Signed\",\n      \"ir\": \"define i1 @test_i8_eq(i8 %x) {\\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\\n  %cmp = icmp eq i8 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i8 @llvm.smax.i8(i8, i8)\\ndeclare i8 @llvm.smin.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i1 @test_i8_eq(i8 %x) {\\n  %diff = add i8 %x, 50\\n  %cmp = icmp ult i8 %diff, 101\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Canonical signed range check [-50, 50]. Expected: (x+50) < 101.\"\n    },\n    {\n      \"name\": \"i32 Signed Ne Predicate\",\n      \"ir\": \"define i1 @test_i32_ne(i32 %x) {\\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 10)\\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 20)\\n  %cmp = icmp ne i32 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test_i32_ne(i32 %x) {\\n  %diff = sub i32 %x, 10\\n  %cmp = icmp ugt i32 %diff, 10\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Inverse check. X is NOT in [10, 20].\"\n    },\n    {\n      \"name\": \"i8 Unsigned Clamp\",\n      \"ir\": \"define i1 @test_i8_unsigned(i8 %x) {\\n  %v1 = call i8 @llvm.umax.i8(i8 %x, i8 100)\\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 200)\\n  %cmp = icmp eq i8 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.umin.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i1 @test_i8_unsigned(i8 %x) {\\n  %diff = sub i8 %x, 100\\n  %cmp = icmp ule i8 %diff, 100\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Unsigned range check [100, 200].\"\n    },\n    {\n      \"name\": \"Swapped Clamp Order\",\n      \"ir\": \"define i1 @test_swapped(i16 %x) {\\n  %v1 = call i16 @llvm.smin.i16(i16 %x, i16 100)\\n  %v2 = call i16 @llvm.smax.i16(i16 %v1, i16 0)\\n  %cmp = icmp eq i16 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i16 @llvm.smin.i16(i16, i16)\\ndeclare i16 @llvm.smax.i16(i16, i16)\",\n      \"expected_optimized_ir\": \"define i1 @test_swapped(i16 %x) {\\n  %diff = sub i16 %x, 0\\n  %cmp = icmp ule i16 %diff, 100\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Clamps can be min(max) or max(min).\"\n    },\n    {\n      \"name\": \"Vector of i32\",\n      \"ir\": \"define <4 x i1> @test_vec(<4 x i32> %x) {\\n  %v1 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -5, i32 -5, i32 -5, i32 -5>)\\n  %v2 = call <4 x i32> @llvm.smin.v4i32(<4 x i32> %v1, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\\n  %cmp = icmp eq <4 x i32> %v2, %x\\n  ret <4 x i1> %cmp\\n}\\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test_vec(<4 x i32> %x) {\\n  %diff = add <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\\n  %cmp = icmp ult <4 x i32> %diff, <i32 11, i32 11, i32 11, i32 11>\\n  ret <4 x i1> %cmp\\n}\",\n      \"why\": \"Vector types should fold element-wise.\"\n    },\n    {\n      \"name\": \"Single Point Range\",\n      \"ir\": \"define i1 @test_single_point(i32 %x) {\\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 42)\\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 42)\\n  %cmp = icmp eq i32 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i1 @test_single_point(i32 %x) {\\n  %cmp = icmp eq i32 %x, 42\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Range [42, 42] simplifies to equality check.\"\n    },\n    {\n      \"name\": \"Select Pattern (Blind Spot)\",\n      \"ir\": \"define i1 @test_selects(i8 %x) {\\n  %cmp1 = icmp slt i8 %x, -50\\n  %v1 = select i1 %cmp1, i8 -50, i8 %x\\n  %cmp2 = icmp sgt i8 %v1, 50\\n  %v2 = select i1 %cmp2, i8 50, i8 %v1\\n  %cmp3 = icmp eq i8 %v2, %x\\n  ret i1 %cmp3\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_selects(i8 %x) {\\n  %diff = add i8 %x, 50\\n  %cmp = icmp ult i8 %diff, 101\\n  ret i1 %cmp\\n}\",\n      \"why\": \"InstCombine should match min/max patterns formed by selects.\"\n    },\n    {\n      \"name\": \"Full Range (Always True)\",\n      \"ir\": \"define i1 @test_full_range(i8 %x) {\\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -128)\\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 127)\\n  %cmp = icmp eq i8 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i8 @llvm.smax.i8(i8, i8)\\ndeclare i8 @llvm.smin.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i1 @test_full_range(i8 %x) {\\n  ret i1 true\\n}\",\n      \"why\": \"Clamping to min/max values is a no-op, so X always equals X.\"\n    },\n    {\n      \"name\": \"i64 Wide Integers\",\n      \"ir\": \"define i1 @test_i64(i64 %x) {\\n  %v1 = call i64 @llvm.smax.i64(i64 %x, i64 -1000)\\n  %v2 = call i64 @llvm.smin.i64(i64 %v1, i64 1000)\\n  %cmp = icmp eq i64 %v2, %x\\n  ret i1 %cmp\\n}\\ndeclare i64 @llvm.smax.i64(i64, i64)\\ndeclare i64 @llvm.smin.i64(i64, i64)\",\n      \"expected_optimized_ir\": \"define i1 @test_i64(i64 %x) {\\n  %diff = add i64 %x, 1000\\n  %cmp = icmp ult i64 %diff, 2001\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Valid for arbitrary bit widths.\"\n    }\n  ],\n  \"implementation_notes\": \"The implementation should reside in `InstCombineCompares.cpp` or `InstCombineSelect.cpp`.\\n\\n1. **Matching**: Look for `icmp` pred `%y, %x` where `%y` is a `min` or `max` intrinsic (or `select` pattern). Traverse the use-def chain of `%y` to identify if it forms a clamp (min of max or max of min) with constants `Lo` and `Hi`.\\n\\n2. **Validation**: Ensure `Lo <= Hi`. Ensure the inner op takes `%x` and one constant, and the outer op takes the result of the inner and the other constant.\\n\\n3. **Folding**:\\n   - Calculate `RangeSize = Hi - Lo`.\\n   - If `RangeSize` is the maximum value for the bitwidth (e.g., -1 for unsigned, or `MaxInt - MinInt`), the comparison is always `true` (for `eq`) or `false` (for `ne`).\\n   - Otherwise, generate `Diff = X - Lo`.\\n   - Generate `icmp ule Diff, RangeSize` (for `eq`) or `icmp ugt Diff, RangeSize` (for `ne`).\\n   - *Optimization*: If `Lo` is 0, `Diff` is just `X`. If `Hi` is `MaxInt`, `RangeSize` wraps to `MaxInt - Lo`.\\n\\n4. **Pitfalls**:\\n   - **Constant Overflow**: `Hi - Lo` calculation must be done using `APInt` to handle wrapping correctly (e.g., `Max - Min` wraps to -1/MaxUInt). `Hi - Lo` effectively represents the distance.\\n   - **Signedness**: The resulting comparison is *always* unsigned (`ult`/`ule`/`ugt`/`uge`). This works for both signed and unsigned clamps because we are comparing the distance between two bit-patterns.\\n   - **Flags**: If the clamp is implemented via `select` with `nsw`/`nuw` flags on the condition, be careful not to introduce UB where there was none (though clamps are usually safe).\",\n  \"regression_test_notes\": \"Use `opt -passes=instcombine -S`. Verify that the `smin`/`smax` intrinsics are replaced by `add`/`sub` and `icmp`. Ensure `FileCheck` checks for the absence of `llvm.smax` and the presence of `icmp ult/ule`.\\n\\nExample Check:\\n```\\n; CHECK-NOT: llvm.smax\\n; CHECK-NOT: llvm.smin\\n; CHECK: add i8 %x, 50\\n; CHECK: icmp ult i8 {{.*}}, 101\\n```\",\n  \"clarifying_questions\": [\n    \"Should this optimization trigger if the clamp is implemented using `select` instructions with `nsw`/`nuw` flags on the arithmetic feeding them, or strictly only for the `min/max` intrinsics?\",\n    \"Is there a preference in the codebase for `icmp ule (sub X, Lo), Size` vs `icmp ult (add X, -Lo), Size + 1`? The former avoids the Size+1 overflow edge case.\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses the opportunity to simplify a comparison of a clamped value against its original input (e.g., `icmp eq (smin(smax(x, Lo), Hi), x)`) into a single unsigned range check (e.g., `icmp ule (sub x, Lo), (Hi - Lo)`). This pattern checks if `x` lies within the inclusive range `[Lo, Hi]`.",
+    "before_after": "Transforms `icmp eq/ne (smin (smax X, Lo), Hi), X` into `icmp ule/ugt (sub X, Lo), (Hi - Lo)`. This replaces a min/max chain and a comparison with a single subtraction and an unsigned comparison.",
+    "preconditions": [
+      "The operation is a clamp: `min(max(X, Lo), Hi)` or `max(min(X, Hi), Lo)`.",
+      "`Lo` and `Hi` are constants (or constant expressions).",
+      "`Lo <= Hi` (for signed clamp) or `Lo u<= Hi` (for unsigned clamp).",
+      "The comparison is between the clamped result and the unclamped input `X`.",
+      "The predicate is `eq` (X is in range) or `ne` (X is out of range).",
+      "Types are integers or vectors of integers."
+    ],
+    "pattern": "Alive2 / MLIR style rewrite:\n\n```\n// Signed Clamp Check\n%clamped = llvm.smin(llvm.smax(%x, %Lo), %Hi)\nicmp eq %clamped, %x  \n  =>\n%diff = sub %x, %Lo\nicmp ule %diff, (%Hi - %Lo)\n\n// Signed Clamp Check (Inverse)\n%clamped = llvm.smin(llvm.smax(%x, %Lo), %Hi)\nicmp ne %clamped, %x\n  =>\n%diff = sub %x, %Lo\nicmp ugt %diff, (%Hi - %Lo)\n\n// Unsigned Clamp Check\n%clamped = llvm.umin(llvm.umax(%x, %Lo), %Hi)\nicmp eq %clamped, %x\n  =>\n%diff = sub %x, %Lo\nicmp ule %diff, (%Hi - %Lo)\n```",
+    "testcases": [
+      {
+        "name": "Original Example i8 Signed",
+        "ir": "define i1 @test_i8_eq(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)",
+        "expected_optimized_ir": "define i1 @test_i8_eq(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+        "why": "Canonical signed range check [-50, 50]. Expected: (x+50) < 101."
+      },
+      {
+        "name": "i32 Signed Ne Predicate",
+        "ir": "define i1 @test_i32_ne(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 20)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\ndeclare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test_i32_ne(i32 %x) {\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}",
+        "why": "Inverse check. X is NOT in [10, 20]."
+      },
+      {
+        "name": "i8 Unsigned Clamp",
+        "ir": "define i1 @test_i8_unsigned(i8 %x) {\n  %v1 = call i8 @llvm.umax.i8(i8 %x, i8 100)\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 200)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.umin.i8(i8, i8)",
+        "expected_optimized_ir": "define i1 @test_i8_unsigned(i8 %x) {\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}",
+        "why": "Unsigned range check [100, 200]."
+      },
+      {
+        "name": "Swapped Clamp Order",
+        "ir": "define i1 @test_swapped(i16 %x) {\n  %v1 = call i16 @llvm.smin.i16(i16 %x, i16 100)\n  %v2 = call i16 @llvm.smax.i16(i16 %v1, i16 0)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\ndeclare i16 @llvm.smin.i16(i16, i16)\ndeclare i16 @llvm.smax.i16(i16, i16)",
+        "expected_optimized_ir": "define i1 @test_swapped(i16 %x) {\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}",
+        "why": "Clamps can be min(max) or max(min)."
+      },
+      {
+        "name": "Vector of i32",
+        "ir": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %v1 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -5, i32 -5, i32 -5, i32 -5>)\n  %v2 = call <4 x i32> @llvm.smin.v4i32(<4 x i32> %v1, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)",
+        "expected_optimized_ir": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %diff = add <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %cmp = icmp ult <4 x i32> %diff, <i32 11, i32 11, i32 11, i32 11>\n  ret <4 x i1> %cmp\n}",
+        "why": "Vector types should fold element-wise."
+      },
+      {
+        "name": "Single Point Range",
+        "ir": "define i1 @test_single_point(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 42)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 42)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\ndeclare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)",
+        "expected_optimized_ir": "define i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}",
+        "why": "Range [42, 42] simplifies to equality check."
+      },
+      {
+        "name": "Select Pattern (Blind Spot)",
+        "ir": "define i1 @test_selects(i8 %x) {\n  %cmp1 = icmp slt i8 %x, -50\n  %v1 = select i1 %cmp1, i8 -50, i8 %x\n  %cmp2 = icmp sgt i8 %v1, 50\n  %v2 = select i1 %cmp2, i8 50, i8 %v1\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}",
+        "expected_optimized_ir": "define i1 @test_selects(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+        "why": "InstCombine should match min/max patterns formed by selects."
+      },
+      {
+        "name": "Full Range (Always True)",
+        "ir": "define i1 @test_full_range(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -128)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 127)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)",
+        "expected_optimized_ir": "define i1 @test_full_range(i8 %x) {\n  ret i1 true\n}",
+        "why": "Clamping to min/max values is a no-op, so X always equals X."
+      },
+      {
+        "name": "i64 Wide Integers",
+        "ir": "define i1 @test_i64(i64 %x) {\n  %v1 = call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %v2 = call i64 @llvm.smin.i64(i64 %v1, i64 1000)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\ndeclare i64 @llvm.smax.i64(i64, i64)\ndeclare i64 @llvm.smin.i64(i64, i64)",
+        "expected_optimized_ir": "define i1 @test_i64(i64 %x) {\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}",
+        "why": "Valid for arbitrary bit widths."
+      }
+    ],
+    "implementation_notes": "The implementation should reside in `InstCombineCompares.cpp` or `InstCombineSelect.cpp`.\n\n1. **Matching**: Look for `icmp` pred `%y, %x` where `%y` is a `min` or `max` intrinsic (or `select` pattern). Traverse the use-def chain of `%y` to identify if it forms a clamp (min of max or max of min) with constants `Lo` and `Hi`.\n\n2. **Validation**: Ensure `Lo <= Hi`. Ensure the inner op takes `%x` and one constant, and the outer op takes the result of the inner and the other constant.\n\n3. **Folding**:\n   - Calculate `RangeSize = Hi - Lo`.\n   - If `RangeSize` is the maximum value for the bitwidth (e.g., -1 for unsigned, or `MaxInt - MinInt`), the comparison is always `true` (for `eq`) or `false` (for `ne`).\n   - Otherwise, generate `Diff = X - Lo`.\n   - Generate `icmp ule Diff, RangeSize` (for `eq`) or `icmp ugt Diff, RangeSize` (for `ne`).\n   - *Optimization*: If `Lo` is 0, `Diff` is just `X`. If `Hi` is `MaxInt`, `RangeSize` wraps to `MaxInt - Lo`.\n\n4. **Pitfalls**:\n   - **Constant Overflow**: `Hi - Lo` calculation must be done using `APInt` to handle wrapping correctly (e.g., `Max - Min` wraps to -1/MaxUInt). `Hi - Lo` effectively represents the distance.\n   - **Signedness**: The resulting comparison is *always* unsigned (`ult`/`ule`/`ugt`/`uge`). This works for both signed and unsigned clamps because we are comparing the distance between two bit-patterns.\n   - **Flags**: If the clamp is implemented via `select` with `nsw`/`nuw` flags on the condition, be careful not to introduce UB where there was none (though clamps are usually safe).",
+    "regression_test_notes": "Use `opt -passes=instcombine -S`. Verify that the `smin`/`smax` intrinsics are replaced by `add`/`sub` and `icmp`. Ensure `FileCheck` checks for the absence of `llvm.smax` and the presence of `icmp ult/ule`.\n\nExample Check:\n```\n; CHECK-NOT: llvm.smax\n; CHECK-NOT: llvm.smin\n; CHECK: add i8 %x, 50\n; CHECK: icmp ult i8 {{.*}}, 101\n```",
+    "clarifying_questions": [
+      "Should this optimization trigger if the clamp is implemented using `select` instructions with `nsw`/`nuw` flags on the arithmetic feeding them, or strictly only for the `min/max` intrinsics?",
+      "Is there a preference in the codebase for `icmp ule (sub X, Lo), Size` vs `icmp ult (add X, -Lo), Size + 1`? The former avoids the Size+1 overflow edge case."
+    ]
+  },
+  "validation": [
+    {
+      "name": "Original Example i8 Signed",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i8_eq(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)",
+          "tgt": "define i1 @test_i8_eq(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 206\n  %v2 = smin i8 %v1, 50\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8_eq(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_i8_eq(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 206\n  %v2 = smin i8 %v1, 50\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i8_eq(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8_eq(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_eq(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 206\n  %v2 = smin i8 %v1, 50\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32 Signed Ne Predicate",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i32_ne(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 20)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\ndeclare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)",
+          "tgt": "define i1 @test_i32_ne(i32 %x) {\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %v1 = smax i32 %x, 10\n  %v2 = smin i32 %v1, 20\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i32_ne(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 20)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_i32_ne(i32 %x) {\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %v1 = smax i32 %x, 10\n  %v2 = smin i32 %v1, 20\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i32_ne(i32 %x) {\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i32_ne(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 10)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 20)\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %diff = sub i32 %x, 10\n  %cmp = icmp ugt i32 %diff, 10\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i32_ne(i32 %x) {\n#0:\n  %v1 = smax i32 %x, 10\n  %v2 = smin i32 %v1, 20\n  %cmp = icmp ne i32 %v2, %x\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8 Unsigned Clamp",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i8_unsigned(i8 %x) {\n  %v1 = call i8 @llvm.umax.i8(i8 %x, i8 100)\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 200)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.umin.i8(i8, i8)",
+          "tgt": "define i1 @test_i8_unsigned(i8 %x) {\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %v1 = umax i8 %x, 100\n  %v2 = umin i8 %v1, 200\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8_unsigned(i8 %x) {\n  %v1 = call i8 @llvm.umax.i8(i8 %x, i8 100)\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 -56)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_i8_unsigned(i8 %x) {\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %v1 = umax i8 %x, 100\n  %v2 = umin i8 %v1, 200\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i8_unsigned(i8 %x) {\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8_unsigned(i8 %x) {\n  %v1 = call i8 @llvm.umax.i8(i8 %x, i8 100)\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 -56)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %diff = sub i8 %x, 100\n  %cmp = icmp ule i8 %diff, 100\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i8_unsigned(i8 %x) {\n#0:\n  %v1 = umax i8 %x, 100\n  %v2 = umin i8 %v1, 200\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Swapped Clamp Order",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_swapped(i16 %x) {\n  %v1 = call i16 @llvm.smin.i16(i16 %x, i16 100)\n  %v2 = call i16 @llvm.smax.i16(i16 %v1, i16 0)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\ndeclare i16 @llvm.smin.i16(i16, i16)\ndeclare i16 @llvm.smax.i16(i16, i16)",
+          "tgt": "define i1 @test_swapped(i16 %x) {\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %v1 = smin i16 %x, 100\n  %v2 = smax i16 %v1, 0\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_swapped(i16 %x) {\n  %1 = call i16 @llvm.smax.i16(i16 %x, i16 0)\n  %v2 = call i16 @llvm.smin.i16(i16 %1, i16 100)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smax.i16(i16, i16) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_swapped(i16 %x) {\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %#1 = smax i16 %x, 0\n  %v2 = smin i16 %#1, 100\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_swapped(i16 %x) {\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_swapped(i16 %x) {\n  %1 = call i16 @llvm.smax.i16(i16 %x, i16 0)\n  %v2 = call i16 @llvm.smin.i16(i16 %1, i16 100)\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smax.i16(i16, i16) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %diff = sub i16 %x, 0\n  %cmp = icmp ule i16 %diff, 100\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_swapped(i16 %x) {\n#0:\n  %#1 = smax i16 %x, 0\n  %v2 = smin i16 %#1, 100\n  %cmp = icmp eq i16 %v2, %x\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector of i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %v1 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -5, i32 -5, i32 -5, i32 -5>)\n  %v2 = call <4 x i32> @llvm.smin.v4i32(<4 x i32> %v1, <4 x i32> <i32 5, i32 5, i32 5, i32 5>)\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)",
+          "tgt": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %diff = add <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %cmp = icmp ult <4 x i32> %diff, <i32 11, i32 11, i32 11, i32 11>\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %v1 = smax <4 x i32> %x, { 4294967291, 4294967291, 4294967291, 4294967291 }\n  %v2 = smin <4 x i32> %v1, { 5, 5, 5, 5 }\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %diff = add <4 x i32> %x, { 5, 5, 5, 5 }\n  %cmp = icmp ult <4 x i32> %diff, { 11, 11, 11, 11 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n  %v1 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> splat (i32 -5))\n  %v2 = call <4 x i32> @llvm.smin.v4i32(<4 x i32> %v1, <4 x i32> splat (i32 5))\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %diff = add <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %cmp = icmp ult <4 x i32> %diff, <i32 11, i32 11, i32 11, i32 11>\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %v1 = smax <4 x i32> %x, { 4294967291, 4294967291, 4294967291, 4294967291 }\n  %v2 = smin <4 x i32> %v1, { 5, 5, 5, 5 }\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %diff = add <4 x i32> %x, { 5, 5, 5, 5 }\n  %cmp = icmp ult <4 x i32> %diff, { 11, 11, 11, 11 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test_vec(<4 x i32> %x) {\n  %diff = add <4 x i32> %x, <i32 5, i32 5, i32 5, i32 5>\n  %cmp = icmp ult <4 x i32> %diff, <i32 11, i32 11, i32 11, i32 11>\n  ret <4 x i1> %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n  %v1 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> splat (i32 -5))\n  %v2 = call <4 x i32> @llvm.smin.v4i32(<4 x i32> %v1, <4 x i32> splat (i32 5))\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %diff = add <4 x i32> %x, { 5, 5, 5, 5 }\n  %cmp = icmp ult <4 x i32> %diff, { 11, 11, 11, 11 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test_vec(<4 x i32> %x) {\n#0:\n  %v1 = smax <4 x i32> %x, { 4294967291, 4294967291, 4294967291, 4294967291 }\n  %v2 = smin <4 x i32> %v1, { 5, 5, 5, 5 }\n  %cmp = icmp eq <4 x i32> %v2, %x\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Single Point Range",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_single_point(i32 %x) {\n  %v1 = call i32 @llvm.smax.i32(i32 %x, i32 42)\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 42)\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\ndeclare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)",
+          "tgt": "define i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %v1 = smax i32 %x, 42\n  %v2 = smin i32 %v1, 42\n  %cmp = icmp eq i32 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_single_point(i32 %x) {\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_single_point(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 42\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Select Pattern (Blind Spot)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_selects(i8 %x) {\n  %cmp1 = icmp slt i8 %x, -50\n  %v1 = select i1 %cmp1, i8 -50, i8 %x\n  %cmp2 = icmp sgt i8 %v1, 50\n  %v2 = select i1 %cmp2, i8 50, i8 %v1\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}",
+          "tgt": "define i1 @test_selects(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %cmp1 = icmp slt i8 %x, 206\n  %v1 = select i1 %cmp1, i8 206, i8 %x\n  %cmp2 = icmp sgt i8 %v1, 50\n  %v2 = select i1 %cmp2, i8 50, i8 %v1\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}\n=>\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_selects(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_selects(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 206\n  %v2 = smin i8 %v1, 50\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}\n=>\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_selects(i8 %x) {\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_selects(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -50)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 50)\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %diff = add i8 %x, 50\n  %cmp = icmp ult i8 %diff, 101\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_selects(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 206\n  %v2 = smin i8 %v1, 50\n  %cmp3 = icmp eq i8 %v2, %x\n  ret i1 %cmp3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Full Range (Always True)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_full_range(i8 %x) {\n  %v1 = call i8 @llvm.smax.i8(i8 %x, i8 -128)\n  %v2 = call i8 @llvm.smin.i8(i8 %v1, i8 127)\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\ndeclare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)",
+          "tgt": "define i1 @test_full_range(i8 %x) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  %v1 = smax i8 %x, 128\n  %v2 = smin i8 %v1, 127\n  %cmp = icmp eq i8 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_full_range(i8 %x) {\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_full_range(i8 %x) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_full_range(i8 %x) {\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_full_range(i8 %x) {\n  ret i1 true\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test_full_range(i8 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i64 Wide Integers",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i64(i64 %x) {\n  %v1 = call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %v2 = call i64 @llvm.smin.i64(i64 %v1, i64 1000)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\ndeclare i64 @llvm.smax.i64(i64, i64)\ndeclare i64 @llvm.smin.i64(i64, i64)",
+          "tgt": "define i1 @test_i64(i64 %x) {\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %v1 = smax i64 %x, -1000\n  %v2 = smin i64 %v1, 1000\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i64(i64 %x) {\n  %v1 = call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %v2 = call i64 @llvm.smin.i64(i64 %v1, i64 1000)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @test_i64(i64 %x) {\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %v1 = smax i64 %x, -1000\n  %v2 = smin i64 %v1, 1000\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i64(i64 %x) {\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i64(i64 %x) {\n  %v1 = call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %v2 = call i64 @llvm.smin.i64(i64 %v1, i64 1000)\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %diff = add i64 %x, 1000\n  %cmp = icmp ult i64 %diff, 2001\n  ret i1 %cmp\n}\n=>\ndefine i1 @test_i64(i64 %x) {\n#0:\n  %v1 = smax i64 %x, -1000\n  %v2 = smin i64 %v1, 1000\n  %cmp = icmp eq i64 %v2, %x\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

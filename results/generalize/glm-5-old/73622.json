@@ -1,0 +1,473 @@
+{
+  "issue_id": "73622",
+  "dataset_file": "73622.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i8 @floor_sdiv_by_2(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n\ndefine i8 @floor_sdiv_by_2(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize arithmetic floor division by a power of two (specifically 2) implemented via truncating division and a conditional adjustment into a single arithmetic shift right (`ashr`). The pattern recognizes the adjustment logic checking if the dividend is negative and has a remainder.\",\n  \"before_after\": \"Transforms `sdiv(X, 2^K) + sext((and(X, Mask) == Mask))` into `ashr(X, K)`, where `Mask` combines the sign bit and the lower K bits.\",\n  \"preconditions\": [\n    \"The divisor `C` in the `sdiv` must be a positive power of 2 (2^K).\",\n    \"The adjustment term must be `0` or `-1`.\",\n    \"The condition for adjustment must be true iff `X < 0` AND `(X % C) != 0`.\",\n    \"The mask `M` used in the check must be `SignBit | (C - 1)`.\",\n    \"The `add` instruction (or equivalent `sub`) must apply the adjustment to round towards negative infinity.\",\n    \"For strict legality with `nsw` flags, the result must not overflow, though for floor-div by 2^K, overflow is impossible unless `K=0`.\"\n  ],\n  \"pattern\": \"Generalized Pattern:\\n\\n  %Div = sdiv iN %X, C          ; C = 2^K, K > 0\\n  %Mask = and iN %X, M          ; M = (1 << (N-1)) | (C - 1)\\n  %Cond = icmp eq iN %Mask, M   ; Checks sign bit set AND lower K bits set\\n  %Adj = sext i1 %Cond to iN    ; Yields 0 or -1\\n  %Res = add iN %Div, %Adj      ; Adds -1 if adjustment needed\\n\\nFolds to:\\n\\n  %Res = ashr iN %X, K\",\n  \"testcases\": [\n    {\n      \"name\": \"original_example_i8\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, -127\\n  %icmp = icmp eq i8 %and, -127\\n  %sext = sext i1 %icmp to i8\\n  %rv = add nsw i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 1\\n  ret i8 %rv\\n}\",\n      \"why\": \"The original example: floor division by 2.\"\n    },\n    {\n      \"name\": \"i16_div_by_2\",\n      \"ir\": \"define i16 @test(i16 %x) {\\n  %div = sdiv i16 %x, 2\\n  %and = and i16 %x, -32767\\n  %icmp = icmp eq i16 %and, -32767\\n  %sext = sext i1 %icmp to i16\\n  %rv = add nsw i16 %div, %sext\\n  ret i16 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i16 @test(i16 %x) {\\n  %rv = ashr i16 %x, 1\\n  ret i16 %rv\\n}\",\n      \"why\": \"Bitwidth variation (i16) for divisor 2.\"\n    },\n    {\n      \"name\": \"i32_div_by_2\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %div = sdiv i32 %x, 2\\n  %and = and i32 %x, -2147483647\\n  %icmp = icmp eq i32 %and, -2147483647\\n  %sext = sext i1 %icmp to i32\\n  %rv = add nsw i32 %div, %sext\\n  ret i32 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %rv = ashr i32 %x, 1\\n  ret i32 %rv\\n}\",\n      \"why\": \"Bitwidth variation (i32) for divisor 2.\"\n    },\n    {\n      \"name\": \"i8_div_by_4\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 4\\n  %and = and i8 %x, -124\\n  %icmp = icmp eq i8 %and, -124\\n  %sext = sext i1 %icmp to i8\\n  %rv = add nsw i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 2\\n  ret i8 %rv\\n}\",\n      \"why\": \"Divisor 4 (2^2). Mask is SignBit (0x80) | 3 (0x03) = 0x83 (-124).\"\n    },\n    {\n      \"name\": \"i8_div_by_4_select_form\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 4\\n  %and = and i8 %x, -124\\n  %icmp = icmp eq i8 %and, -124\\n  %sel = select i1 %icmp, i8 -1, i8 0\\n  %rv = add nsw i8 %div, %sel\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 2\\n  ret i8 %rv\\n}\",\n      \"why\": \"Structure variant: using `select` instead of `sext`.\"\n    },\n    {\n      \"name\": \"i8_div_by_2_sub_form\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, -127\\n  %icmp = icmp eq i8 %and, -127\\n  %sel = select i1 %icmp, i8 1, i8 0\\n  %rv = sub nsw i8 %div, %sel\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 1\\n  ret i8 %rv\\n}\",\n      \"why\": \"Structure variant: using `sub` with adjustment 1.\"\n    },\n    {\n      \"name\": \"vector_i8_div_by_2\",\n      \"ir\": \"define <4 x i8> @test(<4 x i8> %x) {\\n  %div = sdiv <4 x i8> %x, <i8 2, i8 2, i8 2, i8 2>\\n  %and = and <4 x i8> %x, <i8 -127, i8 -127, i8 -127, i8 -127>\\n  %icmp = icmp eq <4 x i8> %and, <i8 -127, i8 -127, i8 -127, i8 -127>\\n  %sext = sext <4 x i1> %icmp to <4 x i8>\\n  %rv = add <4 x i8> %div, %sext\\n  ret <4 x i8> %rv\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i8> @test(<4 x i8> %x) {\\n  %rv = ashr <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\\n  ret <4 x i8> %rv\\n}\",\n      \"why\": \"Vector variant.\"\n    },\n    {\n      \"name\": \"no_nsw_flag\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, -127\\n  %icmp = icmp eq i8 %and, -127\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 1\\n  ret i8 %rv\\n}\",\n      \"why\": \"Boundary condition: `nsw` is not strictly required for correctness here, but the fold is still valid.\"\n    },\n    {\n      \"name\": \"negative_wrong_mask_1\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, 1\\n  %icmp = icmp eq i8 %and, 1\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, 1\\n  %icmp = icmp eq i8 %and, 1\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"why\": \"Negative case: Mask only checks oddness, not sign. This implements ceil division for positives, not floor division for negatives. Should not fold to ashr.\"\n    },\n    {\n      \"name\": \"negative_wrong_mask_2\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, -128\\n  %icmp = icmp eq i8 %and, -128\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %and = and i8 %x, -128\\n  %icmp = icmp eq i8 %and, -128\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"why\": \"Negative case: Mask only checks sign. Adjusts all negative numbers, not just odd ones. Should not fold.\"\n    },\n    {\n      \"name\": \"negative_div_by_3\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 3\\n  %and = and i8 %x, -127\\n  %icmp = icmp eq i8 %and, -127\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 3\\n  %and = and i8 %x, -127\\n  %icmp = icmp eq i8 %and, -127\\n  %sext = sext i1 %icmp to i8\\n  %rv = add i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"why\": \"Negative case: Divisor is 3, not a power of 2. Should not fold.\"\n    },\n    {\n      \"name\": \"decomposed_logic\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %div = sdiv i8 %x, 2\\n  %is.neg = icmp slt i8 %x, 0\\n  %is.odd = icmp ne i8 %x, 0\\n  %and = and i8 %x, 1\\n  %is.odd2 = icmp ne i8 %and, 0\\n  %cond = and i1 %is.neg, %is.odd2\\n  %sext = sext i1 %cond to i8\\n  %rv = add nsw i8 %div, %sext\\n  ret i8 %rv\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %rv = ashr i8 %x, 1\\n  ret i8 %rv\\n}\",\n      \"why\": \"Structure variant: Logic decomposed into SLT and AND on LSB. InstCombine might need to canonicalize this to the single AND mask form first, but semantically it matches.\"\n    }\n  ],\n  \"implementation_notes\": \"This optimization can be implemented in `InstCombineAddSub` or a helper function.\\n\\n1. Match `Add` (or `Sub`) where one operand is `SRem` or derived from `SDiv`. Wait, the pattern uses `SDiv` directly.\\n2. LHS = `SDiv(X, C)`. RHS = `Sext(ICmp)` or `Select`.\\n3. Check if `C` is a power of 2 constant. Let `K = log2(C)`.\\n4. Check if RHS is `0` or `-1` (or `1` for Sub).\\n5. Analyze the condition:\\n   - If `Sext(ICmp)`, `ICmp` must be `eq` (for add -1) or `ne` (for sub 1).\\n   - Check operands of `ICmp`. Ideally `(and X, M) == M`.\\n   - Calculate expected `M` = `(1 << BitWidth) | (C - 1)` (i.e., SignBit | (C-1)).\\n   - Verify the mask matches.\\n6. If all match, replace `Add/Sub` with `AShr X, K`.\\n\\nPitfalls:\\n- Ensure `C` is not 0 or 1 (though ashr by 0 is valid, it's trivial).\\n- Ensure `C` is positive (div by negative power of 2 is rare/undefined).\\n- Handling `nsw` flags: `ashr` is `nsw` safe. The `add` in the source might not be `nsw` if the user wrote it without flags, but the result is mathematically equivalent to `ashr`.\",\n  \"regression_test_notes\": \"Test with `opt -passes=instcombine -S`. Use `FileCheck` to verify the `ashr` instruction appears and the `sdiv`/`icmp`/`and` disappear. Ensure negative cases retain the original logic.\",\n  \"clarifying_questions\": [\n    \"Should this fold handle the case where the adjustment is added via `or` instead of `add` (e.g. `div | -1`)? (Probably not, as `or` is not `add`, but `div | 0` is `div`).\",\n    \"Is there a preference for handling `SDiv` by `1`? (The mask would be SignBit, `ashr` by 0. The logic holds but is a no-op).\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize arithmetic floor division by a power of two (specifically 2) implemented via truncating division and a conditional adjustment into a single arithmetic shift right (`ashr`). The pattern recognizes the adjustment logic checking if the dividend is negative and has a remainder.",
+    "before_after": "Transforms `sdiv(X, 2^K) + sext((and(X, Mask) == Mask))` into `ashr(X, K)`, where `Mask` combines the sign bit and the lower K bits.",
+    "preconditions": [
+      "The divisor `C` in the `sdiv` must be a positive power of 2 (2^K).",
+      "The adjustment term must be `0` or `-1`.",
+      "The condition for adjustment must be true iff `X < 0` AND `(X % C) != 0`.",
+      "The mask `M` used in the check must be `SignBit | (C - 1)`.",
+      "The `add` instruction (or equivalent `sub`) must apply the adjustment to round towards negative infinity.",
+      "For strict legality with `nsw` flags, the result must not overflow, though for floor-div by 2^K, overflow is impossible unless `K=0`."
+    ],
+    "pattern": "Generalized Pattern:\n\n  %Div = sdiv iN %X, C          ; C = 2^K, K > 0\n  %Mask = and iN %X, M          ; M = (1 << (N-1)) | (C - 1)\n  %Cond = icmp eq iN %Mask, M   ; Checks sign bit set AND lower K bits set\n  %Adj = sext i1 %Cond to iN    ; Yields 0 or -1\n  %Res = add iN %Div, %Adj      ; Adds -1 if adjustment needed\n\nFolds to:\n\n  %Res = ashr iN %X, K",
+    "testcases": [
+      {
+        "name": "original_example_i8",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+        "why": "The original example: floor division by 2."
+      },
+      {
+        "name": "i16_div_by_2",
+        "ir": "define i16 @test(i16 %x) {\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, -32767\n  %icmp = icmp eq i16 %and, -32767\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}",
+        "expected_optimized_ir": "define i16 @test(i16 %x) {\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}",
+        "why": "Bitwidth variation (i16) for divisor 2."
+      },
+      {
+        "name": "i32_div_by_2",
+        "ir": "define i32 @test(i32 %x) {\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, -2147483647\n  %icmp = icmp eq i32 %and, -2147483647\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}",
+        "why": "Bitwidth variation (i32) for divisor 2."
+      },
+      {
+        "name": "i8_div_by_4",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, -124\n  %icmp = icmp eq i8 %and, -124\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}",
+        "why": "Divisor 4 (2^2). Mask is SignBit (0x80) | 3 (0x03) = 0x83 (-124)."
+      },
+      {
+        "name": "i8_div_by_4_select_form",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, -124\n  %icmp = icmp eq i8 %and, -124\n  %sel = select i1 %icmp, i8 -1, i8 0\n  %rv = add nsw i8 %div, %sel\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}",
+        "why": "Structure variant: using `select` instead of `sext`."
+      },
+      {
+        "name": "i8_div_by_2_sub_form",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sel = select i1 %icmp, i8 1, i8 0\n  %rv = sub nsw i8 %div, %sel\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+        "why": "Structure variant: using `sub` with adjustment 1."
+      },
+      {
+        "name": "vector_i8_div_by_2",
+        "ir": "define <4 x i8> @test(<4 x i8> %x) {\n  %div = sdiv <4 x i8> %x, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i8> %x, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %icmp = icmp eq <4 x i8> %and, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}",
+        "expected_optimized_ir": "define <4 x i8> @test(<4 x i8> %x) {\n  %rv = ashr <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i8> %rv\n}",
+        "why": "Vector variant."
+      },
+      {
+        "name": "no_nsw_flag",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+        "why": "Boundary condition: `nsw` is not strictly required for correctness here, but the fold is still valid."
+      },
+      {
+        "name": "negative_wrong_mask_1",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 1\n  %icmp = icmp eq i8 %and, 1\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 1\n  %icmp = icmp eq i8 %and, 1\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "why": "Negative case: Mask only checks oddness, not sign. This implements ceil division for positives, not floor division for negatives. Should not fold to ashr."
+      },
+      {
+        "name": "negative_wrong_mask_2",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -128\n  %icmp = icmp eq i8 %and, -128\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -128\n  %icmp = icmp eq i8 %and, -128\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "why": "Negative case: Mask only checks sign. Adjusts all negative numbers, not just odd ones. Should not fold."
+      },
+      {
+        "name": "negative_div_by_3",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+        "why": "Negative case: Divisor is 3, not a power of 2. Should not fold."
+      },
+      {
+        "name": "decomposed_logic",
+        "ir": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %is.neg = icmp slt i8 %x, 0\n  %is.odd = icmp ne i8 %x, 0\n  %and = and i8 %x, 1\n  %is.odd2 = icmp ne i8 %and, 0\n  %cond = and i1 %is.neg, %is.odd2\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+        "why": "Structure variant: Logic decomposed into SLT and AND on LSB. InstCombine might need to canonicalize this to the single AND mask form first, but semantically it matches."
+      }
+    ],
+    "implementation_notes": "This optimization can be implemented in `InstCombineAddSub` or a helper function.\n\n1. Match `Add` (or `Sub`) where one operand is `SRem` or derived from `SDiv`. Wait, the pattern uses `SDiv` directly.\n2. LHS = `SDiv(X, C)`. RHS = `Sext(ICmp)` or `Select`.\n3. Check if `C` is a power of 2 constant. Let `K = log2(C)`.\n4. Check if RHS is `0` or `-1` (or `1` for Sub).\n5. Analyze the condition:\n   - If `Sext(ICmp)`, `ICmp` must be `eq` (for add -1) or `ne` (for sub 1).\n   - Check operands of `ICmp`. Ideally `(and X, M) == M`.\n   - Calculate expected `M` = `(1 << BitWidth) | (C - 1)` (i.e., SignBit | (C-1)).\n   - Verify the mask matches.\n6. If all match, replace `Add/Sub` with `AShr X, K`.\n\nPitfalls:\n- Ensure `C` is not 0 or 1 (though ashr by 0 is valid, it's trivial).\n- Ensure `C` is positive (div by negative power of 2 is rare/undefined).\n- Handling `nsw` flags: `ashr` is `nsw` safe. The `add` in the source might not be `nsw` if the user wrote it without flags, but the result is mathematically equivalent to `ashr`.",
+    "regression_test_notes": "Test with `opt -passes=instcombine -S`. Use `FileCheck` to verify the `ashr` instruction appears and the `sdiv`/`icmp`/`and` disappear. Ensure negative cases retain the original logic.",
+    "clarifying_questions": [
+      "Should this fold handle the case where the adjustment is added via `or` instead of `add` (e.g. `div | -1`)? (Probably not, as `or` is not `add`, but `div | 0` is `div`).",
+      "Is there a preference for handling `SDiv` by `1`? (The mask would be SignBit, `ashr` by 0. The logic holds but is a no-op)."
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i16_div_by_2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @test(i16 %x) {\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, -32767\n  %icmp = icmp eq i16 %and, -32767\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}",
+          "tgt": "define i16 @test(i16 %x) {\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i16 %x) {\n#0:\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, 32769\n  %icmp = icmp eq i16 %and, 32769\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}\n=>\ndefine i16 @test(i16 %x) {\n#0:\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @test(i16 %x) {\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, -32767\n  %icmp = icmp eq i16 %and, -32767\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}\n",
+          "tgt": "define i16 @test(i16 %x) {\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i16 %x) {\n#0:\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, 32769\n  %icmp = icmp eq i16 %and, 32769\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}\n=>\ndefine i16 @test(i16 %x) {\n#0:\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @test(i16 %x) {\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @test(i16 %x) {\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, -32767\n  %icmp = icmp eq i16 %and, -32767\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @test(i16 %x) {\n#0:\n  %rv = ashr i16 %x, 1\n  ret i16 %rv\n}\n=>\ndefine i16 @test(i16 %x) {\n#0:\n  %div = sdiv i16 %x, 2\n  %and = and i16 %x, 32769\n  %icmp = icmp eq i16 %and, 32769\n  %sext = sext i1 %icmp to i16\n  %rv = add nsw i16 %div, %sext\n  ret i16 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_div_by_2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, -2147483647\n  %icmp = icmp eq i32 %and, -2147483647\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}",
+          "tgt": "define i32 @test(i32 %x) {\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, 2147483649\n  %icmp = icmp eq i32 %and, 2147483649\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, -2147483647\n  %icmp = icmp eq i32 %and, -2147483647\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, 2147483649\n  %icmp = icmp eq i32 %and, 2147483649\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, -2147483647\n  %icmp = icmp eq i32 %and, -2147483647\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %rv = ashr i32 %x, 1\n  ret i32 %rv\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %div = sdiv i32 %x, 2\n  %and = and i32 %x, 2147483649\n  %icmp = icmp eq i32 %and, 2147483649\n  %sext = sext i1 %icmp to i32\n  %rv = add nsw i32 %div, %sext\n  ret i32 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8_div_by_4",
+      "missed_optimization": false,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, -124\n  %icmp = icmp eq i8 %and, -124\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, 132\n  %icmp = icmp eq i8 %and, 132\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xb9 (185, -71)\n\nSource:\ni8 %div = #xef (239, -17)\ni8 %and = #x80 (128, -128)\ni1 %icmp = #x0 (0)\ni8 %sext = #x00 (0)\ni8 %rv = #xef (239, -17)\n\nTarget:\ni8 %rv = #xee (238, -18)\nSource value: #xef (239, -17)\nTarget value: #xee (238, -18)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "i8_div_by_4_select_form",
+      "missed_optimization": false,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, -124\n  %icmp = icmp eq i8 %and, -124\n  %sel = select i1 %icmp, i8 -1, i8 0\n  %rv = add nsw i8 %div, %sel\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 4\n  %and = and i8 %x, 132\n  %icmp = icmp eq i8 %and, 132\n  %sel = select i1 %icmp, i8 255, i8 0\n  %rv = add nsw i8 %div, %sel\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 2\n  ret i8 %rv\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #xfa (250, -6)\n\nSource:\ni8 %div = #xff (255, -1)\ni8 %and = #x80 (128, -128)\ni1 %icmp = #x0 (0)\ni8 %sel = #x00 (0)\ni8 %rv = #xff (255, -1)\n\nTarget:\ni8 %rv = #xfe (254, -2)\nSource value: #xff (255, -1)\nTarget value: #xfe (254, -2)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "i8_div_by_2_sub_form",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sel = select i1 %icmp, i8 1, i8 0\n  %rv = sub nsw i8 %div, %sel\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sel = select i1 %icmp, i8 1, i8 0\n  %rv = sub nsw i8 %div, %sel\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sel.neg = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sel.neg\n  ret i8 %rv\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sel.neg = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sel.neg\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sel.neg = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sel.neg\n  ret i8 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sel.neg = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sel.neg\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_i8_div_by_2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i8> @test(<4 x i8> %x) {\n  %div = sdiv <4 x i8> %x, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i8> %x, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %icmp = icmp eq <4 x i8> %and, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}",
+          "tgt": "define <4 x i8> @test(<4 x i8> %x) {\n  %rv = ashr <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i8> %rv\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %div = sdiv <4 x i8> %x, { 2, 2, 2, 2 }\n  %and = and <4 x i8> %x, { 129, 129, 129, 129 }\n  %icmp = icmp eq <4 x i8> %and, { 129, 129, 129, 129 }\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %rv = ashr <4 x i8> %x, { 1, 1, 1, 1 }\n  ret <4 x i8> %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i8> @test(<4 x i8> %x) {\n  %div = sdiv <4 x i8> %x, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i8> %x, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %icmp = icmp eq <4 x i8> %and, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add nsw <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}\n",
+          "tgt": "define <4 x i8> @test(<4 x i8> %x) {\n  %rv = ashr <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i8> %rv\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %div = sdiv <4 x i8> %x, { 2, 2, 2, 2 }\n  %and = and <4 x i8> %x, { 129, 129, 129, 129 }\n  %icmp = icmp eq <4 x i8> %and, { 129, 129, 129, 129 }\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add nsw <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %rv = ashr <4 x i8> %x, { 1, 1, 1, 1 }\n  ret <4 x i8> %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i8> @test(<4 x i8> %x) {\n  %rv = ashr <4 x i8> %x, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i8> %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i8> @test(<4 x i8> %x) {\n  %div = sdiv <4 x i8> %x, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i8> %x, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %icmp = icmp eq <4 x i8> %and, <i8 -127, i8 -127, i8 -127, i8 -127>\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add nsw <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %rv = ashr <4 x i8> %x, { 1, 1, 1, 1 }\n  ret <4 x i8> %rv\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x) {\n#0:\n  %div = sdiv <4 x i8> %x, { 2, 2, 2, 2 }\n  %and = and <4 x i8> %x, { 129, 129, 129, 129 }\n  %icmp = icmp eq <4 x i8> %and, { 129, 129, 129, 129 }\n  %sext = sext <4 x i1> %icmp to <4 x i8>\n  %rv = add nsw <4 x i8> %div, %sext\n  ret <4 x i8> %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_nsw_flag",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_wrong_mask_1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 15,
+        "expected": 15,
+        "current_opt": 13,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 15\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "negative_wrong_mask_2",
+      "missed_optimization": false,
+      "cost": {
+        "source": 15,
+        "expected": 15,
+        "current_opt": 13,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 15\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "negative_div_by_3",
+      "missed_optimization": true,
+      "cost": {
+        "source": 15,
+        "expected": 15,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 15\n",
+        "expected_log": "Cost: 15\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, -127\n  %icmp = icmp eq i8 %and, -127\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 3\n  %and = and i8 %x, 129\n  %icmp = icmp eq i8 %and, 129\n  %sext = sext i1 %icmp to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "decomposed_logic",
+      "missed_optimization": true,
+      "cost": {
+        "source": 18,
+        "expected": 2,
+        "current_opt": 15,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 18\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 15\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %is.neg = icmp slt i8 %x, 0\n  %is.odd = icmp ne i8 %x, 0\n  %and = and i8 %x, 1\n  %is.odd2 = icmp ne i8 %and, 0\n  %cond = and i1 %is.neg, %is.odd2\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %is.neg = icmp slt i8 %x, 0\n  %and = and i8 %x, 1\n  %is.odd2 = icmp ne i8 %and, 0\n  %cond = and i1 %is.neg, %is.odd2\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %1 = and i8 %x, -127\n  %cond = icmp eq i8 %1, -127\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %#1 = and i8 %x, 129\n  %cond = icmp eq i8 %#1, 129\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %div = sdiv i8 %x, 2\n  %1 = and i8 %x, -127\n  %cond = icmp eq i8 %1, -127\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %rv = ashr i8 %x, 1\n  ret i8 %rv\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %div = sdiv i8 %x, 2\n  %#1 = and i8 %x, 129\n  %cond = icmp eq i8 %#1, 129\n  %sext = sext i1 %cond to i8\n  %rv = add nsw i8 %div, %sext\n  ret i8 %rv\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.6s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

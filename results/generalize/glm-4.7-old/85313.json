@@ -1,0 +1,544 @@
+{
+  "issue_id": "85313",
+  "dataset_file": "85313.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ntarget datalayout = \"n32\"\n\ndefine i1 @lshr_x_by_const_cmp_x(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n\ntarget datalayout = \"n32\"\n\ndefine i1 @lshr_x_by_const_cmp_x(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize comparisons between a value and its logical right-shifted self. If a value is equal to itself shifted right by a non-zero constant, the value must be zero. This allows folding `icmp (lshr x, C), x` into `icmp x, 0` (or equivalent true/false for specific predicates).\",\n  \"before_after\": \"Fold `icmp Pred (lshr %x, %C), %x` into `icmp Pred' %x, 0` (or `true`/`false` constant) when `%C` is a positive constant.\",\n  \"preconditions\": [\n    \"The shift opcode must be `lshr` (logical shift right).\",\n    \"The shift amount `%C` must be a constant integer.\",\n    \"The shift amount `%C` must satisfy `0 < C < BitWidth(%x)`. (Shifting by 0 is an identity; shifting by >= BitWidth is poison/undefined).\",\n    \"The comparison is between the shift result and the unshifted operand `%x`.\",\n    \"For signed predicates (`slt`, `sle`, `sgt`, `sge`), the fold is generally unsafe or complex because `lshr` yields an unsigned result; the optimization primarily targets unsigned predicates (`eq`, `ne`, `ult`, `ule`, `ugt`, `uge`).\"\n  ],\n  \"pattern\": {\n    \"match\": \"icmp Pred (lshr %x, %C), %x\",\n    \"constraints\": [\n      \"C = const_int\",\n      \"C > 0\",\n      \"C < bitwidth(%x)\"\n    ],\n    \"rewrite_rules\": [\n      {\n        \"predicate\": \"eq\",\n        \"result\": \"icmp eq %x, 0\"\n      },\n      {\n        \"predicate\": \"ne\",\n        \"result\": \"icmp ne %x, 0\"\n      },\n      {\n        \"predicate\": \"uge\",\n        \"result\": \"icmp eq %x, 0\"\n      },\n      {\n        \"predicate\": \"ult\",\n        \"result\": \"icmp ne %x, 0\"\n      },\n      {\n        \"predicate\": \"ugt\",\n        \"result\": \"false\"\n      },\n      {\n        \"predicate\": \"ule\",\n        \"result\": \"true\"\n      }\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"Basic EQ Case (i32)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 1\\n  %r = icmp eq i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp eq i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"Core example: x == x >> 1 implies x == 0.\"\n    },\n    {\n      \"name\": \"Basic NE Case (i32)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 1\\n  %r = icmp ne i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp ne i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"Inequality: x != x >> 1 implies x != 0.\"\n    },\n    {\n      \"name\": \"Vector Case (<4 x i32>)\",\n      \"ir\": \"define <4 x i1> @test(<4 x i32> %x) {\\n  %v = lshr <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %r = icmp eq <4 x i32> %v, %x\\n  ret <4 x i1> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i32> %x) {\\n  %r = icmp eq <4 x i32> %x, zeroinitializer\\n  ret <4 x i1> %r\\n}\",\n      \"why\": \"Fold applies element-wise to vectors.\"\n    },\n    {\n      \"name\": \"Commutative Operands\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 5\\n  %r = icmp eq i32 %x, %v\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp eq i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"Matcher should handle swapped icmp operands.\"\n    },\n    {\n      \"name\": \"Shift Amount 0 (No Fold)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 0\\n  %r = icmp eq i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp eq i32 %x, %x\\n  ret i1 %r\\n}\",\n      \"why\": \"Shift by 0 is identity. x == x is always true, but the specific 'x==0' fold is invalid here (any x works).\"\n    },\n    {\n      \"name\": \"Shift Amount 31 (Max Safe i32)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 31\\n  %r = icmp eq i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp eq i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"Valid shift amount. Top 31 bits must be 0, propagating to all bits.\"\n    },\n    {\n      \"name\": \"Unsigned Less Than (ult)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 2\\n  %r = icmp ult i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp ne i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"x >> C < x is true for all x > 0, and false for x=0.\"\n    },\n    {\n      \"name\": \"Unsigned Greater Than (ugt)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 1\\n  %r = icmp ugt i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  ret i1 false\\n}\",\n      \"why\": \"Logical right shift never increases the value.\"\n    },\n    {\n      \"name\": \"Unsigned Less or Equal (ule)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = lshr i32 %x, 1\\n  %r = icmp ule i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  ret i1 true\\n}\",\n      \"why\": \"Result of shift is always <= original value.\"\n    },\n    {\n      \"name\": \"Arithmetic Shift (ashr) - Negative Test\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %v = ashr i32 %x, 1\\n  %r = icmp eq i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %v = ashr i32 %x, 1\\n  %r = icmp eq i32 %v, %x\\n  ret i1 %r\\n}\",\n      \"why\": \"ashr preserves sign bits. x == x >> 1 is true for 0 and -1, not just 0. This specific fold does not apply.\"\n    },\n    {\n      \"name\": \"With Noise (Add 0)\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %x2 = add i32 %x, 0\\n  %v = lshr i32 %x2, 1\\n  %r = icmp eq i32 %v, %x2\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %r = icmp eq i32 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"InstCombine should simplify through identity operations like add 0.\"\n    },\n    {\n      \"name\": \"i8 Bitwidth\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %v = lshr i8 %x, 3\\n  %r = icmp eq i8 %v, %x\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %r = icmp eq i8 %x, 0\\n  ret i1 %r\\n}\",\n      \"why\": \"Pattern is independent of bitwidth (as long as shift amount is valid).\"\n    },\n    {\n      \"name\": \"Select Context\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v = lshr i32 %x, 1\\n  %cond = icmp eq i32 %v, %x\\n  %res = select i1 %cond, i32 %y, i32 0\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cond = icmp eq i32 %x, 0\\n  %res = select i1 %cond, i32 %y, i32 0\\n  ret i32 %res\\n}\",\n      \"why\": \"Fold should work when the icmp is used in a select.\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstCombine::visitICmpInst\",\n    \"logic\": \"1. Check if either operand of the ICmp is a `lshr`. 2. Check if the other operand is the LHS of that `lshr` (or RHS in case of commutation). 3. Verify the shift amount is a ConstantInt `C` where `0 < C < BitWidth`. 4. Based on the ICmp predicate, replace the comparison with `icmp X, 0` or a constant true/false.\",\n    \"pitfalls\": [\n      \"Do not match `ashr` (arithmetic shift). `ashr x, C == x` implies `x` is 0 or -1.\",\n      \"Do not match if the shift amount is 0.\",\n      \"Do not match if the shift amount is >= BitWidth (undefined behavior/poison).\",\n      \"Ensure the `lshr` instruction is not marked as `exact` if the optimization logic changes (though for `eq`, exactness doesn't change the result, but `lshr` exact implies the shifted-out bits are zero, which is consistent with x==0 anyway).\",\n      \"Be careful with vector constants; the shift amount must be a splat constant or the fold must be valid element-wise (usually InstCombine requires splat constants for vector shifts in these generic patterns).\"\n    ]\n  },\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on the provided IR. Check that `lshr` is eliminated in the 'true' cases and remains in 'false' cases (like ashr).\",\n  \"clarifying_questions\": [\n    \"Should this optimization fire if the `lshr` has multiple uses? (Usually InstCombine creates a new `icmp` and leaves the `lshr` if it has other uses, or replaces the `icmp` and DCE removes `lshr` later).\",\n    \"Should we handle the case where the shift amount is a `ConstantInt` but not a splat for vectors? (e.g., shifting element 0 by 1 and element 1 by 2). This is harder to match but possible.\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize comparisons between a value and its logical right-shifted self. If a value is equal to itself shifted right by a non-zero constant, the value must be zero. This allows folding `icmp (lshr x, C), x` into `icmp x, 0` (or equivalent true/false for specific predicates).",
+    "before_after": "Fold `icmp Pred (lshr %x, %C), %x` into `icmp Pred' %x, 0` (or `true`/`false` constant) when `%C` is a positive constant.",
+    "preconditions": [
+      "The shift opcode must be `lshr` (logical shift right).",
+      "The shift amount `%C` must be a constant integer.",
+      "The shift amount `%C` must satisfy `0 < C < BitWidth(%x)`. (Shifting by 0 is an identity; shifting by >= BitWidth is poison/undefined).",
+      "The comparison is between the shift result and the unshifted operand `%x`.",
+      "For signed predicates (`slt`, `sle`, `sgt`, `sge`), the fold is generally unsafe or complex because `lshr` yields an unsigned result; the optimization primarily targets unsigned predicates (`eq`, `ne`, `ult`, `ule`, `ugt`, `uge`)."
+    ],
+    "pattern": {
+      "match": "icmp Pred (lshr %x, %C), %x",
+      "constraints": [
+        "C = const_int",
+        "C > 0",
+        "C < bitwidth(%x)"
+      ],
+      "rewrite_rules": [
+        {
+          "predicate": "eq",
+          "result": "icmp eq %x, 0"
+        },
+        {
+          "predicate": "ne",
+          "result": "icmp ne %x, 0"
+        },
+        {
+          "predicate": "uge",
+          "result": "icmp eq %x, 0"
+        },
+        {
+          "predicate": "ult",
+          "result": "icmp ne %x, 0"
+        },
+        {
+          "predicate": "ugt",
+          "result": "false"
+        },
+        {
+          "predicate": "ule",
+          "result": "true"
+        }
+      ]
+    },
+    "testcases": [
+      {
+        "name": "Basic EQ Case (i32)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+        "why": "Core example: x == x >> 1 implies x == 0."
+      },
+      {
+        "name": "Basic NE Case (i32)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+        "why": "Inequality: x != x >> 1 implies x != 0."
+      },
+      {
+        "name": "Vector Case (<4 x i32>)",
+        "ir": "define <4 x i1> @test(<4 x i32> %x) {\n  %v = lshr <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i32> %x) {\n  %r = icmp eq <4 x i32> %x, zeroinitializer\n  ret <4 x i1> %r\n}",
+        "why": "Fold applies element-wise to vectors."
+      },
+      {
+        "name": "Commutative Operands",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %x, %v\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+        "why": "Matcher should handle swapped icmp operands."
+      },
+      {
+        "name": "Shift Amount 0 (No Fold)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 0\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, %x\n  ret i1 %r\n}",
+        "why": "Shift by 0 is identity. x == x is always true, but the specific 'x==0' fold is invalid here (any x works)."
+      },
+      {
+        "name": "Shift Amount 31 (Max Safe i32)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+        "why": "Valid shift amount. Top 31 bits must be 0, propagating to all bits."
+      },
+      {
+        "name": "Unsigned Less Than (ult)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+        "why": "x >> C < x is true for all x > 0, and false for x=0."
+      },
+      {
+        "name": "Unsigned Greater Than (ugt)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ugt i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+        "why": "Logical right shift never increases the value."
+      },
+      {
+        "name": "Unsigned Less or Equal (ule)",
+        "ir": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ule i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  ret i1 true\n}",
+        "why": "Result of shift is always <= original value."
+      },
+      {
+        "name": "Arithmetic Shift (ashr) - Negative Test",
+        "ir": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+        "why": "ashr preserves sign bits. x == x >> 1 is true for 0 and -1, not just 0. This specific fold does not apply."
+      },
+      {
+        "name": "With Noise (Add 0)",
+        "ir": "define i1 @test(i32 %x) {\n  %x2 = add i32 %x, 0\n  %v = lshr i32 %x2, 1\n  %r = icmp eq i32 %v, %x2\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+        "why": "InstCombine should simplify through identity operations like add 0."
+      },
+      {
+        "name": "i8 Bitwidth",
+        "ir": "define i1 @test(i8 %x) {\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}",
+        "why": "Pattern is independent of bitwidth (as long as shift amount is valid)."
+      },
+      {
+        "name": "Select Context",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+        "why": "Fold should work when the icmp is used in a select."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstCombine::visitICmpInst",
+      "logic": "1. Check if either operand of the ICmp is a `lshr`. 2. Check if the other operand is the LHS of that `lshr` (or RHS in case of commutation). 3. Verify the shift amount is a ConstantInt `C` where `0 < C < BitWidth`. 4. Based on the ICmp predicate, replace the comparison with `icmp X, 0` or a constant true/false.",
+      "pitfalls": [
+        "Do not match `ashr` (arithmetic shift). `ashr x, C == x` implies `x` is 0 or -1.",
+        "Do not match if the shift amount is 0.",
+        "Do not match if the shift amount is >= BitWidth (undefined behavior/poison).",
+        "Ensure the `lshr` instruction is not marked as `exact` if the optimization logic changes (though for `eq`, exactness doesn't change the result, but `lshr` exact implies the shifted-out bits are zero, which is consistent with x==0 anyway).",
+        "Be careful with vector constants; the shift amount must be a splat constant or the fold must be valid element-wise (usually InstCombine requires splat constants for vector shifts in these generic patterns)."
+      ]
+    },
+    "regression_test_notes": "Use `opt -instcombine -S` on the provided IR. Check that `lshr` is eliminated in the 'true' cases and remains in 'false' cases (like ashr).",
+    "clarifying_questions": [
+      "Should this optimization fire if the `lshr` has multiple uses? (Usually InstCombine creates a new `icmp` and leaves the `lshr` if it has other uses, or replaces the `icmp` and DCE removes `lshr` later).",
+      "Should we handle the case where the shift amount is a `ConstantInt` but not a splat for vectors? (e.g., shifting element 0 by 1 and element 1 by 2). This is harder to match but possible."
+    ]
+  },
+  "validation": [
+    {
+      "name": "Basic EQ Case (i32)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Basic NE Case (i32)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp ne i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector Case (<4 x i32>)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i32> %x) {\n  %v = lshr <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}",
+          "tgt": "define <4 x i1> @test(<4 x i32> %x) {\n  %r = icmp eq <4 x i32> %x, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %v = lshr <4 x i32> %x, { 1, 1, 1, 1 }\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %r = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %x) {\n  %v = lshr <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i32> %x) {\n  %r = icmp eq <4 x i32> %x, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %v = lshr <4 x i32> %x, { 1, 1, 1, 1 }\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %r = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i32> %x) {\n  %r = icmp eq <4 x i32> %x, zeroinitializer\n  ret <4 x i1> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %x) {\n  %v = lshr <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %r = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %v = lshr <4 x i32> %x, { 1, 1, 1, 1 }\n  %r = icmp eq <4 x i32> %v, %x\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative Operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %x, %v\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %x, %v\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 5\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Shift Amount 0 (No Fold)",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 2,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Shift Amount 31 (Max Safe i32)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 31\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Unsigned Less Than (ult)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp ne i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 2\n  %r = icmp ult i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Unsigned Greater Than (ugt)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ugt i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp ugt i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Unsigned Less or Equal (ule)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp ule i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp ule i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 true\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 1\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Arithmetic Shift (ashr) - Negative Test",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = ashr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "With Noise (Add 0)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %x2 = add i32 %x, 0\n  %v = lshr i32 %x2, 1\n  %r = icmp eq i32 %v, %x2\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %x2 = add i32 %x, 0\n  %v = lshr i32 %x2, 1\n  %r = icmp eq i32 %v, %x2\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %r = icmp eq i32 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %v = lshr i32 %x, 1\n  %r = icmp eq i32 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8 Bitwidth",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %r = icmp eq i8 %x, 0\n  ret i1 %r\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %v = lshr i8 %x, 3\n  %r = icmp eq i8 %v, %x\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Select Context",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cond = icmp eq i32 %x, 0\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v = lshr i32 %x, 1\n  %cond = icmp eq i32 %v, %x\n  %res = select i1 %cond, i32 %y, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Found Python3: /data/btguan/miniconda3/bin/python3 (found suitable version \"3.13.5\", minimum required is \"3.6\") found components: Interpreter \n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

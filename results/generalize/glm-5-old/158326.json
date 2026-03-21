@@ -1,0 +1,496 @@
+{
+  "issue_id": "158326",
+  "dataset_file": "158326.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @merge_range_check_and(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n\ndefine i1 @merge_range_check_and(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Missed optimization: Intersecting an unsigned range check (`icmp ult`) with a masked equality check (`icmp eq (and X, M), C`) can be simplified to a single equality check (`icmp eq X, C`) when the range limit excludes all other members of the masked set.\",\n  \"before_after\": \"Transforms `and (icmp ult X, Limit), (icmp eq (and X, Mask), C)` into `icmp eq X, C` under specific preconditions.\",\n  \"preconditions\": [\n    \"1. `Limit`, `Mask`, and `C` are constants.\",\n    \"2. `(C & ~Mask) == 0` (The equality check `icmp eq (and X, Mask), C` is not impossible).\",\n    \"3. `C < Limit` (The target value is within the range).\",\n    \"4. `Limit <= C + ((~Mask) & -(~Mask))` (The limit is strictly less than the next value in the masked arithmetic progression). If `Mask == -1`, this condition simplifies to just `C < Limit`.\"\n  ],\n  \"pattern\": \"The pattern matches an `i1` `and` instruction combining two `icmp` checks:\\n1. A range check: `icmp ult iN %val, %limit`\\n2. A masked equality: `icmp eq iN (and iN %val, %mask), %c`\\n\\nThe optimization applies if the set of values satisfying the masked equality (an arithmetic progression `C, C+Step, C+2*Step...` modulo 2^N) intersects the range `[0, Limit)` at exactly one point `C`. This requires `Limit` to be greater than `C` but less than or equal to the next element in the progression (`C + Step`).\",\n  \"testcases\": [\n    {\n      \"name\": \"Original Example i8\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 3\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 2\\n  ret i1 %and\\n}\",\n      \"why\": \"Basic case: Mask=-2 (Step=1), C=2, Limit=3. 3 <= 2+1.\"\n    },\n    {\n      \"name\": \"Commutative And\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %cmp1 = icmp ult i8 %a, 3\\n  %and = and i1 %cmp2, %cmp1\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 2\\n  ret i1 %and\\n}\",\n      \"why\": \"Operands of `and` are commuted.\"\n    },\n    {\n      \"name\": \"Wider Type i32\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %cmp1 = icmp ult i32 %a, 6\\n  %masked = and i32 %a, -4\\n  %cmp2 = icmp eq i32 %masked, 4\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %and = icmp eq i32 %a, 4\\n  ret i1 %and\\n}\",\n      \"why\": \"Mask=-4 (Step=1), C=4, Limit=6. 6 <= 4+1 is FALSE. Wait, Mask=-4 clears 2 bits. ~Mask=3. Step = lowbit(3) = 1. Set is {4, 5, 8, 9...}. Limit=6. Intersection {4, 5}. Optimization should NOT fire. Correcting expected output.\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %cmp1 = icmp ult i32 %a, 6\\n  %masked = and i32 %a, -4\\n  %cmp2 = icmp eq i32 %masked, 4\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"why\": \"Negative case: Mask=-4 (Step=1), C=4, Limit=6. Set is {4, 5, 8...}. Intersection with [0,6) is {4, 5}. Cannot simplify to single eq.\"\n    },\n    {\n      \"name\": \"Wider Type i32 (Positive)\",\n      \"ir\": \"define i1 @test(i32 %a) {\\n  %cmp1 = icmp ult i32 %a, 5\\n  %masked = and i32 %a, -4\\n  %cmp2 = icmp eq i32 %masked, 4\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a) {\\n  %and = icmp eq i32 %a, 4\\n  ret i1 %and\\n}\",\n      \"why\": \"Mask=-4 (Step=1), C=4, Limit=5. 5 <= 4+1. Intersection {4}.\"\n    },\n    {\n      \"name\": \"Vector Case\",\n      \"ir\": \"define <4 x i1> @test(<4 x i8> %a) {\\n  %cmp1 = icmp ult <4 x i8> %a, <i8 3, i8 3, i8 3, i8 3>\\n  %masked = and <4 x i8> %a, <i8 -2, i8 -2, i8 -2, i8 -2>\\n  %cmp2 = icmp eq <4 x i8> %masked, <i8 2, i8 2, i8 2, i8 2>\\n  %and = and <4 x i1> %cmp1, %cmp2\\n  ret <4 x i1> %and\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i8> %a) {\\n  %and = icmp eq <4 x i8> %a, <i8 2, i8 2, i8 2, i8 2>\\n  ret <4 x i1> %and\\n}\",\n      \"why\": \"Vectorized version of the basic case.\"\n    },\n    {\n      \"name\": \"Zero Base\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 1\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 0\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 0\\n  ret i1 %and\\n}\",\n      \"why\": \"C=0, Mask=-2 (Step=1), Limit=1. 1 <= 0+1. Intersection {0}.\"\n    },\n    {\n      \"name\": \"Non-Power-of-Two Mask (Step 2)\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 3\\n  %masked = and i8 %a, -3\\n  %cmp2 = icmp eq i8 %masked, 1\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 1\\n  ret i1 %and\\n}\",\n      \"why\": \"Mask=-3 (...11101). ~Mask=2. Step=2. Set {1, 3, 5...}. Limit=3. 3 <= 1+2. Intersection {1}.\"\n    },\n    {\n      \"name\": \"Negative: Limit too high\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 4\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 4\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"why\": \"Limit=4, Step=1, C=2. 4 <= 2+1 is False. Intersection is {2, 3}. No fold.\"\n    },\n    {\n      \"name\": \"Negative: Limit too low\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 2\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  ret i1 false\\n}\",\n      \"why\": \"Limit=2, C=2. C < Limit is false (2 is not < 2). Intersection empty.\"\n    },\n    {\n      \"name\": \"Structural: Or of Inverses (De Morgan)\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp uge i8 %a, 3\\n  %masked = and i8 %a, -2\\n  %cmp2 = icmp ne i8 %masked, 2\\n  %or = or i1 %cmp1, %cmp2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %or = icmp ne i8 %a, 2\\n  ret i1 %or\\n}\",\n      \"why\": \"Equivalent to !( (a<3) & ((a&-2)==2) ). Should fold to !(a==2).\"\n    },\n    {\n      \"name\": \"Structural Noise (Add 0)\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %add = add i8 %a, 0\\n  %cmp1 = icmp ult i8 %add, 3\\n  %masked = and i8 %add, -2\\n  %cmp2 = icmp eq i8 %masked, 2\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 2\\n  ret i1 %and\\n}\",\n      \"why\": \"Pattern should be robust to trivial identity operations.\"\n    },\n    {\n      \"name\": \"Mask -1 (Simple Eq)\",\n      \"ir\": \"define i1 @test(i8 %a) {\\n  %cmp1 = icmp ult i8 %a, 5\\n  %masked = and i8 %a, -1\\n  %cmp2 = icmp eq i8 %masked, 4\\n  %and = and i1 %cmp1, %cmp2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a) {\\n  %and = icmp eq i8 %a, 4\\n  ret i1 %and\\n}\",\n      \"why\": \"Mask=-1 implies equality check only. 4 < 5, so fold to eq.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement this in `InstCombineAndOrXor.cpp` within the `visitAnd` function. \\n1. Check if operands of `and` are `ICmpInst`.\\n2. Match the pattern `(ult X, Limit)` and `(eq (and X, Mask), C)`.\\n3. Verify `Limit`, `Mask`, `C` are constants.\\n4. Verify `(C & ~Mask) == 0`.\\n5. If `Limit <= C`, return `false`.\\n6. If `Mask == -1`, return `ICmp_eq(X, C)` if `Limit > C`.\\n7. Else, compute `Step = (~Mask) & -(~Mask)`. If `Limit <= C + Step`, return `ICmp_eq(X, C)`.\\n\\nPitfalls: Ensure handling of `Step` calculation does not overflow. Ensure we only fold if the intersection is provably a single element (singleton).\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on these test cases. FileCheck should check for the specific `icmp eq` instruction in the positive cases, and verify the absence of the `and` instruction combining the two checks.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Missed optimization: Intersecting an unsigned range check (`icmp ult`) with a masked equality check (`icmp eq (and X, M), C`) can be simplified to a single equality check (`icmp eq X, C`) when the range limit excludes all other members of the masked set.",
+    "before_after": "Transforms `and (icmp ult X, Limit), (icmp eq (and X, Mask), C)` into `icmp eq X, C` under specific preconditions.",
+    "preconditions": [
+      "1. `Limit`, `Mask`, and `C` are constants.",
+      "2. `(C & ~Mask) == 0` (The equality check `icmp eq (and X, Mask), C` is not impossible).",
+      "3. `C < Limit` (The target value is within the range).",
+      "4. `Limit <= C + ((~Mask) & -(~Mask))` (The limit is strictly less than the next value in the masked arithmetic progression). If `Mask == -1`, this condition simplifies to just `C < Limit`."
+    ],
+    "pattern": "The pattern matches an `i1` `and` instruction combining two `icmp` checks:\n1. A range check: `icmp ult iN %val, %limit`\n2. A masked equality: `icmp eq iN (and iN %val, %mask), %c`\n\nThe optimization applies if the set of values satisfying the masked equality (an arithmetic progression `C, C+Step, C+2*Step...` modulo 2^N) intersects the range `[0, Limit)` at exactly one point `C`. This requires `Limit` to be greater than `C` but less than or equal to the next element in the progression (`C + Step`).",
+    "testcases": [
+      {
+        "name": "Original Example i8",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+        "why": "Basic case: Mask=-2 (Step=1), C=2, Limit=3. 3 <= 2+1."
+      },
+      {
+        "name": "Commutative And",
+        "ir": "define i1 @test(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+        "why": "Operands of `and` are commuted."
+      },
+      {
+        "name": "Wider Type i32",
+        "ir": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "why": "Negative case: Mask=-4 (Step=1), C=4, Limit=6. Set is {4, 5, 8...}. Intersection with [0,6) is {4, 5}. Cannot simplify to single eq."
+      },
+      {
+        "name": "Wider Type i32 (Positive)",
+        "ir": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %a) {\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}",
+        "why": "Mask=-4 (Step=1), C=4, Limit=5. 5 <= 4+1. Intersection {4}."
+      },
+      {
+        "name": "Vector Case",
+        "ir": "define <4 x i1> @test(<4 x i8> %a) {\n  %cmp1 = icmp ult <4 x i8> %a, <i8 3, i8 3, i8 3, i8 3>\n  %masked = and <4 x i8> %a, <i8 -2, i8 -2, i8 -2, i8 -2>\n  %cmp2 = icmp eq <4 x i8> %masked, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i8> %a) {\n  %and = icmp eq <4 x i8> %a, <i8 2, i8 2, i8 2, i8 2>\n  ret <4 x i1> %and\n}",
+        "why": "Vectorized version of the basic case."
+      },
+      {
+        "name": "Zero Base",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 1\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 0\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}",
+        "why": "C=0, Mask=-2 (Step=1), Limit=1. 1 <= 0+1. Intersection {0}."
+      },
+      {
+        "name": "Non-Power-of-Two Mask (Step 2)",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -3\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}",
+        "why": "Mask=-3 (...11101). ~Mask=2. Step=2. Set {1, 3, 5...}. Limit=3. 3 <= 1+2. Intersection {1}."
+      },
+      {
+        "name": "Negative: Limit too high",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 4\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 4\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "why": "Limit=4, Step=1, C=2. 4 <= 2+1 is False. Intersection is {2, 3}. No fold."
+      },
+      {
+        "name": "Negative: Limit too low",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 2\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+        "why": "Limit=2, C=2. C < Limit is false (2 is not < 2). Intersection empty."
+      },
+      {
+        "name": "Structural: Or of Inverses (De Morgan)",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp uge i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}",
+        "why": "Equivalent to !( (a<3) & ((a&-2)==2) ). Should fold to !(a==2)."
+      },
+      {
+        "name": "Structural Noise (Add 0)",
+        "ir": "define i1 @test(i8 %a) {\n  %add = add i8 %a, 0\n  %cmp1 = icmp ult i8 %add, 3\n  %masked = and i8 %add, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+        "why": "Pattern should be robust to trivial identity operations."
+      },
+      {
+        "name": "Mask -1 (Simple Eq)",
+        "ir": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -1\n  %cmp2 = icmp eq i8 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}",
+        "why": "Mask=-1 implies equality check only. 4 < 5, so fold to eq."
+      }
+    ],
+    "implementation_notes": "Implement this in `InstCombineAndOrXor.cpp` within the `visitAnd` function. \n1. Check if operands of `and` are `ICmpInst`.\n2. Match the pattern `(ult X, Limit)` and `(eq (and X, Mask), C)`.\n3. Verify `Limit`, `Mask`, `C` are constants.\n4. Verify `(C & ~Mask) == 0`.\n5. If `Limit <= C`, return `false`.\n6. If `Mask == -1`, return `ICmp_eq(X, C)` if `Limit > C`.\n7. Else, compute `Step = (~Mask) & -(~Mask)`. If `Limit <= C + Step`, return `ICmp_eq(X, C)`.\n\nPitfalls: Ensure handling of `Step` calculation does not overflow. Ensure we only fold if the intersection is provably a single element (singleton).",
+    "regression_test_notes": "Use `opt -instcombine -S` on these test cases. FileCheck should check for the specific `icmp eq` instruction in the positive cases, and verify the absence of the `and` instruction combining the two checks.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "Original Example i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative And",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %cmp1 = icmp ult i8 %a, 3\n  %and = and i1 %cmp2, %cmp1\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Wider Type i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 6\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Wider Type i32 (Positive)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i32 %a) {\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i32 %a) {\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a) {\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a) {\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, -4\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a) {\n#0:\n  %and = icmp eq i32 %a, 4\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a) {\n#0:\n  %cmp1 = icmp ult i32 %a, 5\n  %masked = and i32 %a, 4294967292\n  %cmp2 = icmp eq i32 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector Case",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i8> %a) {\n  %cmp1 = icmp ult <4 x i8> %a, <i8 3, i8 3, i8 3, i8 3>\n  %masked = and <4 x i8> %a, <i8 -2, i8 -2, i8 -2, i8 -2>\n  %cmp2 = icmp eq <4 x i8> %masked, <i8 2, i8 2, i8 2, i8 2>\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}",
+          "tgt": "define <4 x i1> @test(<4 x i8> %a) {\n  %and = icmp eq <4 x i8> %a, <i8 2, i8 2, i8 2, i8 2>\n  ret <4 x i1> %and\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %cmp1 = icmp ult <4 x i8> %a, { 3, 3, 3, 3 }\n  %masked = and <4 x i8> %a, { 254, 254, 254, 254 }\n  %cmp2 = icmp eq <4 x i8> %masked, { 2, 2, 2, 2 }\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %and = icmp eq <4 x i8> %a, { 2, 2, 2, 2 }\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i8> %a) {\n  %cmp1 = icmp ult <4 x i8> %a, splat (i8 3)\n  %masked = and <4 x i8> %a, splat (i8 -2)\n  %cmp2 = icmp eq <4 x i8> %masked, splat (i8 2)\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i8> %a) {\n  %and = icmp eq <4 x i8> %a, <i8 2, i8 2, i8 2, i8 2>\n  ret <4 x i1> %and\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %cmp1 = icmp ult <4 x i8> %a, { 3, 3, 3, 3 }\n  %masked = and <4 x i8> %a, { 254, 254, 254, 254 }\n  %cmp2 = icmp eq <4 x i8> %masked, { 2, 2, 2, 2 }\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %and = icmp eq <4 x i8> %a, { 2, 2, 2, 2 }\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i8> %a) {\n  %and = icmp eq <4 x i8> %a, <i8 2, i8 2, i8 2, i8 2>\n  ret <4 x i1> %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i8> %a) {\n  %cmp1 = icmp ult <4 x i8> %a, splat (i8 3)\n  %masked = and <4 x i8> %a, splat (i8 -2)\n  %cmp2 = icmp eq <4 x i8> %masked, splat (i8 2)\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %and = icmp eq <4 x i8> %a, { 2, 2, 2, 2 }\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a) {\n#0:\n  %cmp1 = icmp ult <4 x i8> %a, { 3, 3, 3, 3 }\n  %masked = and <4 x i8> %a, { 254, 254, 254, 254 }\n  %cmp2 = icmp eq <4 x i8> %masked, { 2, 2, 2, 2 }\n  %and = and <4 x i1> %cmp1, %cmp2\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Zero Base",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 1\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 0\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 1\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 0\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp eq i8 %a, 0\n  ret i1 %cmp1\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp eq i8 %a, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp eq i8 %a, 0\n  ret i1 %cmp1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 0\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp eq i8 %a, 0\n  ret i1 %cmp1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Non-Power-of-Two Mask (Step 2)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -3\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 253\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -3\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 253\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -3\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 1\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 253\n  %cmp2 = icmp eq i8 %masked, 1\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative: Limit too high",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Negative: Limit too low",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 2\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 2\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Structural: Or of Inverses (De Morgan)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp uge i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp uge i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ugt i8 %a, 2\n  %masked = and i8 %a, -2\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ugt i8 %a, 2\n  %masked = and i8 %a, 254\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ugt i8 %a, 2\n  %masked = and i8 %a, -2\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %or = icmp ne i8 %a, 2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ugt i8 %a, 2\n  %masked = and i8 %a, 254\n  %cmp2 = icmp ne i8 %masked, 2\n  %or = or i1 %cmp1, %cmp2\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Structural Noise (Add 0)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %add = add i8 %a, 0\n  %cmp1 = icmp ult i8 %add, 3\n  %masked = and i8 %add, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %add = add i8 %a, 0\n  %cmp1 = icmp ult i8 %add, 3\n  %masked = and i8 %add, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Mask -1 (Simple Eq)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -1\n  %cmp2 = icmp eq i8 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, 255\n  %cmp2 = icmp eq i8 %masked, 4\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp2 = icmp eq i8 %a, 4\n  ret i1 %cmp2\n}\n",
+          "tgt": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp2 = icmp eq i8 %a, 4\n  ret i1 %cmp2\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a) {\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a) {\n  %cmp2 = icmp eq i8 %a, 4\n  ret i1 %cmp2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a) {\n#0:\n  %and = icmp eq i8 %a, 4\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a) {\n#0:\n  %cmp2 = icmp eq i8 %a, 4\n  ret i1 %cmp2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

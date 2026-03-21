@@ -1,0 +1,514 @@
+{
+  "issue_id": "60167",
+  "dataset_file": "60167.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\n## Elements Frequently Missed\n\n- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.\n- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.\n- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.\n- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.\n- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.\n- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.\n- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.\n- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.\n- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.\n- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.\n- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.\n- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Overly Specific Pattern Matching\n\nMany optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:\n\n- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)\n- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations\n- Parameterizing type constraints rather than hardcoding bit widths\n- Extracting core mathematical/algebraic properties rather than matching surface syntax\n\n### Pattern 2: Overly Restrictive Preconditions\n\nOptimizations frequently included unnecessary guards that blocked valid transformations:\n\n- Type restrictions (scalar-only, specific bit widths) that weren't semantically required\n- Single-use constraints that could be relaxed with profitability analysis\n- Declaration-specific guards that prevented optimizing calls to external functions\n- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases\n\n### Pattern 3: Incomplete Intrinsic Recognition\n\nTransformations involving intrinsics often missed:\n\n- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)\n- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)\n- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)\n- Flag propagation when creating or replacing intrinsics\n\n### Pattern 4: Comparison Predicate Handling\n\nOptimizations involving comparisons frequently missed:\n\n- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)\n- Signed-to-unsigned predicate conversion when operands have known signs\n- Predicate swapping when operands are commuted\n- The `samesign` attribute and its implications for predicate canonicalization\n\n### Pattern 5: Control Flow and PHI Node Transformations\n\nTransformations involving PHI nodes often failed to handle:\n\n- Loop backedges causing infinite combine loops\n- Multiple predecessors with different source values\n- Moving operations into predecessor blocks safely\n- Critical edges and dominance relationships\n\n### Pattern 6: Bitwise and Shift Operation Idioms\n\nComplex bit manipulation patterns were frequently missed:\n\n- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)\n- Mask decomposition for comparisons (`(X & Mask) == C` patterns)\n- Distributivity of operations over bitwise operations (`add` over `min/max`)\n- `disjoint` flag enabling xor distribution over or\n\n### Pattern 7: Select Instruction Folding\n\nSelect-based patterns often missed:\n\n- Folding operations into select arms when one arm simplifies\n- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)\n- Handling vector conditions in select-shuffle folding\n- Poison safety when condition could be poison\n\n### Pattern 8: Memory and Pointer Operations\n\nTransformations involving memory operations frequently missed:\n\n- Address space semantics and pointer validity\n- Null pointer undefined behavior across address spaces\n- Load sinking past calls with proper alias analysis\n- GEP canonicalization and constant offset folding\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+  "model_output": "```json\n{\n    \"pattern\": \"select i1 %cond, i1 true, i1 %val  ->  i1 %val   when %cond == select i1 %x, i1 %val, i1 false\",\n    \"generalization\": \"select i1 %cond, i1 true, i1 %val  ->  i1 %val   when %cond == select i1 %x, i1 %val, i1 false\",\n    \"matcher_expression\": \"m_Select(m_Value(Cond), m_One(), m_Value(Val)) where Cond == select i1 X, i1 Val, i1 false\",\n    \"testcases\": [\n        {\n            \"name\": \"original_example\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"commuted_select_operands\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 false, i1 %y\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"vector_type_i1x4\",\n            \"ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> zeroinitializer\\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\\n  ret <4 x i1> %r\\n}\",\n            \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  ret <4 x i1> %y\\n}\"\n        },\n        {\n            \"name\": \"scalable_vector_sve\",\n            \"ir\": \"define <vscale x 4 x i1> @test(<vscale x 4 x i1> %x, <vscale x 4 x i1> %y) {\\n  %a = select <vscale x 4 x i1> %x, <vscale x 4 x i1> %y, <vscale x 4 x i1> zeroinitializer\\n  %r = select <vscale x 4 x i1> %a, <vscale x 4 x i1> shufflevector (<vscale x 4 x i1> insertelement (<vscale x 4 x i1> poison, i1 true, i32 0), <vscale x 4 x i1> poison, <vscale x 4 x i32> zeroinitializer), <vscale x 4 x i1> %y\\n  ret <vscale x 4 x i1> %r\\n}\",\n            \"expected_optimized_ir\": \"define <vscale x 4 x i1> @test(<vscale x 4 x i1> %x, <vscale x 4 x i1> %y) {\\n  ret <vscale x 4 x i1> %y\\n}\"\n        },\n        {\n            \"name\": \"with_poison_in_vector\",\n            \"ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 poison, i1 false>\\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\\n  ret <4 x i1> %r\\n}\",\n            \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  ret <4 x i1> %y\\n}\"\n        },\n        {\n            \"name\": \"multi_use_intermediate\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r1 = select i1 %a, i1 true, i1 %y\\n  %r2 = select i1 %a, i1 %y, i1 false\\n  %r = or i1 %r1, %r2\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r2 = select i1 %a, i1 %y, i1 false\\n  %r = or i1 %y, %r2\\n  ret i1 %r\\n}\"\n        },\n        {\n            \"name\": \"different_select_condition\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y, i1 %z) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 true, i1 %z\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y, i1 %z) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 true, i1 %z\\n  ret i1 %r\\n}\"\n        },\n        {\n            \"name\": \"logical_and_form\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = and i1 %x, %y\\n  %r = select i1 %a, i1 true, i1 %y\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"wider_integer_type\",\n            \"ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %a = select i1 %x, i8 %y, i8 0\\n  %r = select i1 %a, i8 -1, i8 %y\\n  ret i8 %r\\n}\",\n            \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  ret i8 %y\\n}\"\n        },\n        {\n            \"name\": \"with_metadata\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false, !prof !0\\n  %r = select i1 %a, i1 true, i1 %y, !prof !1\\n  ret i1 %r\\n}\\n!0 = !{!\\\"branch_weights\\\", i32 3, i32 5}\\n!1 = !{!\\\"branch_weights\\\", i32 7, i32 9}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"nested_select_chain\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %b = select i1 %a, i1 true, i1 %y\\n  %c = select i1 %b, i1 true, i1 %y\\n  ret i1 %c\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"with_undef_in_vector\",\n            \"ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 undef, i1 false>\\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\\n  ret <4 x i1> %r\\n}\",\n            \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\\n  ret <4 x i1> %y\\n}\"\n        },\n        {\n            \"name\": \"different_true_value\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 %y, i1 %y\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"commuted_final_select\",\n            \"ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  %a = select i1 %x, i1 %y, i1 false\\n  %r = select i1 %a, i1 %y, i1 true\\n  ret i1 %r\\n}\",\n            \"expected_optimized_ir\": \"define i1 @test(i1 %x, i1 %y) {\\n  ret i1 %y\\n}\"\n        },\n        {\n            \"name\": \"i32_type_with_splat\",\n            \"ir\": \"define i32 @test(i1 %x, i32 %y) {\\n  %a = select i1 %x, i32 %y, i32 0\\n  %r = select i1 %a, i32 -1, i32 %y\\n  ret i32 %r\\n}\",\n            \"expected_optimized_ir\": \"define i32 @test(i1 %x, i32 %y) {\\n  ret i32 %y\\n}\"\n        }\n    ]\n}\n```",
+  "parsed": {
+    "pattern": "select i1 %cond, i1 true, i1 %val  ->  i1 %val   when %cond == select i1 %x, i1 %val, i1 false",
+    "generalization": "select i1 %cond, i1 true, i1 %val  ->  i1 %val   when %cond == select i1 %x, i1 %val, i1 false",
+    "matcher_expression": "m_Select(m_Value(Cond), m_One(), m_Value(Val)) where Cond == select i1 X, i1 Val, i1 false",
+    "testcases": [
+      {
+        "name": "original_example",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "commuted_select_operands",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 false, i1 %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "vector_type_i1x4",
+        "ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> zeroinitializer\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}"
+      },
+      {
+        "name": "scalable_vector_sve",
+        "ir": "define <vscale x 4 x i1> @test(<vscale x 4 x i1> %x, <vscale x 4 x i1> %y) {\n  %a = select <vscale x 4 x i1> %x, <vscale x 4 x i1> %y, <vscale x 4 x i1> zeroinitializer\n  %r = select <vscale x 4 x i1> %a, <vscale x 4 x i1> shufflevector (<vscale x 4 x i1> insertelement (<vscale x 4 x i1> poison, i1 true, i32 0), <vscale x 4 x i1> poison, <vscale x 4 x i32> zeroinitializer), <vscale x 4 x i1> %y\n  ret <vscale x 4 x i1> %r\n}",
+        "expected_optimized_ir": "define <vscale x 4 x i1> @test(<vscale x 4 x i1> %x, <vscale x 4 x i1> %y) {\n  ret <vscale x 4 x i1> %y\n}"
+      },
+      {
+        "name": "with_poison_in_vector",
+        "ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 poison, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}"
+      },
+      {
+        "name": "multi_use_intermediate",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r1 = select i1 %a, i1 true, i1 %y\n  %r2 = select i1 %a, i1 %y, i1 false\n  %r = or i1 %r1, %r2\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r2 = select i1 %a, i1 %y, i1 false\n  %r = or i1 %y, %r2\n  ret i1 %r\n}"
+      },
+      {
+        "name": "different_select_condition",
+        "ir": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}"
+      },
+      {
+        "name": "logical_and_form",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "wider_integer_type",
+        "ir": "define i8 @test(i8 %x, i8 %y) {\n  %a = select i1 %x, i8 %y, i8 0\n  %r = select i1 %a, i8 -1, i8 %y\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y) {\n  ret i8 %y\n}"
+      },
+      {
+        "name": "with_metadata",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false, !prof !0\n  %r = select i1 %a, i1 true, i1 %y, !prof !1\n  ret i1 %r\n}\n!0 = !{!\"branch_weights\", i32 3, i32 5}\n!1 = !{!\"branch_weights\", i32 7, i32 9}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "nested_select_chain",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %b = select i1 %a, i1 true, i1 %y\n  %c = select i1 %b, i1 true, i1 %y\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "with_undef_in_vector",
+        "ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 undef, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}"
+      },
+      {
+        "name": "different_true_value",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 %y, i1 %y\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "commuted_final_select",
+        "ir": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 %y, i1 true\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}"
+      },
+      {
+        "name": "i32_type_with_splat",
+        "ir": "define i32 @test(i1 %x, i32 %y) {\n  %a = select i1 %x, i32 %y, i32 0\n  %r = select i1 %a, i32 -1, i32 %y\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i1 %x, i32 %y) {\n  ret i32 %y\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = poison\ni1 %y = #x1 (1)\n\nSource:\n\nTarget:\ni1 %a = poison\ni1 %r = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_select_operands",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 false, i1 %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 0, i1 %y\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %not.x = xor i1 %x, true\n  %a = select i1 %not.x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %not.x = xor i1 %x, 1\n  %a = select i1 %not.x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %not.x = xor i1 %x, true\n  %a = select i1 %not.x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %not.x = xor i1 %x, 1\n  %a = select i1 %not.x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = poison\ni1 %y = #x1 (1)\n\nSource:\n\nTarget:\ni1 %not.x = poison\ni1 %a = poison\ni1 %r = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_type_i1x4",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> zeroinitializer\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, 0, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> zeroinitializer\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, 0, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> zeroinitializer\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, 0, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i1> %x = < #x0 (0), #x0 (0), #x0 (0), poison >\n<4 x i1> %y = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSource:\n\nTarget:\n<4 x i1> %a = < #x0 (0), #x0 (0), #x0 (0), poison >\n<4 x i1> %r = < #x0 (0), #x0 (0), #x0 (0), poison >\nSource value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), poison >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalable_vector_sve",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": "Command '['/data/btguan/auto-opt/utils/alive2/build/alive-tv', '--disable-undef-input', '/tmp/tmp84kdbj4p', '/tmp/tmp3unmsgt5', '-src-unroll=8', '-tgt-unroll=8']' returned non-zero exit status 1.\nERROR: Unsupported type: <vscale x 4 x i1>\nERROR: Could not translate 'test' to Alive IR\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  1 Alive2 errors\n",
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "with_poison_in_vector",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 poison, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, poison, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 poison, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, poison, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 poison, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, poison, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i1> %x = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n<4 x i1> %y = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSource:\n\nTarget:\n<4 x i1> %a = < #x0 (0), #x0 (0), poison, #x0 (0) >\n<4 x i1> %r = < #x0 (0), #x0 (0), poison, #x0 (0) >\nSource value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), poison, #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multi_use_intermediate",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "different_select_condition",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 true, i1 %z\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y, i1 %z) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %z\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "logical_and_form",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 true, i1 %y\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = and i1 %x, %y\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "wider_integer_type",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "with_metadata",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false, !prof !0\n  %r = select i1 %a, i1 true, i1 %y, !prof !1\n  ret i1 %r\n}\n!0 = !{!\"branch_weights\", i32 3, i32 5}\n!1 = !{!\"branch_weights\", i32 7, i32 9}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false, !prof !0\n  %r = select i1 %a, i1 true, i1 %y, !prof !1\n  ret i1 %r\n}\n\n!0 = !{!\"branch_weights\", i32 3, i32 5}\n!1 = !{!\"branch_weights\", i32 7, i32 9}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false, !prof !0\n  %r = select i1 %a, i1 true, i1 %y, !prof !1\n  ret i1 %r\n}\n\n!0 = !{!\"branch_weights\", i32 3, i32 5}\n!1 = !{!\"branch_weights\", i32 7, i32 9}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 1, i1 %y\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = poison\ni1 %y = #x1 (1)\n\nSource:\n\nTarget:\ni1 %a = poison\ni1 %r = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nested_select_chain",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %b = select i1 %a, i1 true, i1 %y\n  %c = select i1 %b, i1 true, i1 %y\n  ret i1 %c\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %b = select i1 %a, i1 1, i1 %y\n  %c = select i1 %b, i1 1, i1 %y\n  ret i1 %c\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %c = select i1 %a, i1 true, i1 %y\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %c = select i1 %a, i1 1, i1 %y\n  ret i1 %c\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %c = select i1 %a, i1 true, i1 %y\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %c = select i1 %a, i1 1, i1 %y\n  ret i1 %c\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = poison\ni1 %y = #x1 (1)\n\nSource:\n\nTarget:\ni1 %a = poison\ni1 %c = poison\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_undef_in_vector",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 undef, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, undef, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 undef, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, undef, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  ret <4 x i1> %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> <i1 false, i1 false, i1 undef, i1 false>\n  %r = select <4 x i1> %a, <4 x i1> <i1 true, i1 true, i1 true, i1 true>, <4 x i1> %y\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  ret <4 x i1> %y\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %x, <4 x i1> %y) {\n#0:\n  %a = select <4 x i1> %x, <4 x i1> %y, <4 x i1> { 0, 0, undef, 0 }\n  %r = select <4 x i1> %a, <4 x i1> { 1, 1, 1, 1 }, <4 x i1> %y\n  ret <4 x i1> %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i1> %x = < #x0 (0), #x0 (0), #x0 (0), poison >\n<4 x i1> %y = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSource:\n\nTarget:\n<4 x i1> %a = < #x0 (0), #x0 (0), #x0 (0), poison >\n<4 x i1> %r = < #x0 (0), #x0 (0), #x0 (0), poison >\nSource value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), poison >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "different_true_value",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 %y, i1 %y\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 %y, i1 %y\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_final_select",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %x, i1 %y) {\n  %a = select i1 %x, i1 %y, i1 false\n  %r = select i1 %a, i1 %y, i1 true\n  ret i1 %r\n}",
+          "tgt": "define i1 @test(i1 %x, i1 %y) {\n  ret i1 %y\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  %a = select i1 %x, i1 %y, i1 0\n  %r = select i1 %a, i1 %y, i1 1\n  ret i1 %r\n}\n=>\ndefine i1 @test(i1 %x, i1 %y) {\n#0:\n  ret i1 %y\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni1 %x = #x0 (0)\ni1 %y = poison\n\nSource:\ni1 %a = #x0 (0)\ni1 %r = #x1 (1)\n\nTarget:\nSource value: #x1 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "i32_type_with_splat",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.4s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

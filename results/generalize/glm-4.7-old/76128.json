@@ -1,0 +1,354 @@
+{
+  "issue_id": "76128",
+  "dataset_file": "76128.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}\n\ndefine i32 @fold_add_udiv_urem_commuted(i32 noundef %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %0 = mul nuw i32 %div, 6\n  %add = add i32 %0, %val\n  ret i32 %add\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize `add (mul/shl (udiv X, D), C), (urem X, D)` to `add (mul (udiv X, D), C-D), X`. This eliminates the expensive `urem` instruction by utilizing the algebraic identity `X = D*(X/D) + (X%D)`, replacing the remainder term with the original value `X` and adjusting the coefficient of the division term.\",\n  \"before_after\": \"Transforms `add (shl (udiv %val, 10), 4), (urem %val, 10)` into `add (mul (udiv %val, 10), 6), %val`. (Note: `nuw` flags should propagate from the shift/mul if present, but should not be invented if the original was wrapping).\",\n  \"preconditions\": [\n    \"The `udiv` and `urem` instructions must operate on the same dividend value `%val` and the same constant divisor `D`.\",\n    \"The `mul` (or `shl`) instruction must have a constant operand `C`.\",\n    \"The `urem` instruction must have exactly one use (the `add` instruction), otherwise it cannot be eliminated.\",\n    \"The `mul`/`shl` instruction must have exactly one use (the `add` instruction) for a simple replacement.\",\n    \"The divisor `D` must be a constant.\",\n    \"If the `mul`/`shl` has `nuw`/`nsw` flags, the new constant `C-D` must allow those flags to be preserved (e.g., if `C` and `D` are positive and `C > D`, `nuw` can be preserved).\"\n  ],\n  \"pattern\": \"General Pattern: `add (mul (udiv X, D_const), C_const), (urem X, D_const)` -> `add (mul (udiv X, D_const), C_const - D_const), X`\\n\\nVariations:\\n- `shl` is treated as `mul` where `C = 2^k`.\\n- Commutative `add`: `add (urem...), (mul...)` matches as well.\",\n  \"testcases\": [\n    {\n      \"name\": \"Basic Fold (Shl + Urem)\",\n      \"ir\": \"define i32 @test(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %shl, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul i32 %div, 6\\n  %add = add i32 %mul, %val\\n  ret i32 %add\\n}\",\n      \"why\": \"Canonical case: 16*q + r -> 6*q + val.\"\n    },\n    {\n      \"name\": \"Mul + Urem (non-power-of-2)\",\n      \"ir\": \"define i32 @test_mul(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 7\\n  %mul = mul i32 %div, 20\\n  %rem = urem i32 %val, 7\\n  %add = add i32 %mul, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_mul(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 7\\n  %mul = mul i32 %div, 13\\n  %add = add i32 %mul, %val\\n  ret i32 %add\\n}\",\n      \"why\": \"Uses mul instead of shl, 20*q + r -> 13*q + val.\"\n    },\n    {\n      \"name\": \"Commutative Add (Urem first)\",\n      \"ir\": \"define i32 @test_commute(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %rem = urem i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %add = add i32 %rem, %shl\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_commute(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul i32 %div, 6\\n  %add = add i32 %val, %mul\\n  ret i32 %add\\n}\",\n      \"why\": \"Operands of add are commuted; pattern should still match.\"\n    },\n    {\n      \"name\": \"C == D (Collapses to X)\",\n      \"ir\": \"define i32 @test_identity(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul i32 %div, 10\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %mul, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_identity(i32 %val) {\\nentry:\\n  ret i32 %val\\n}\",\n      \"why\": \"10*q + r simplifies directly to val.\"\n    },\n    {\n      \"name\": \"C < D (Negative Constant)\",\n      \"ir\": \"define i32 @test_neg_const(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul i32 %div, 4\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %mul, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_neg_const(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul i32 %div, -6\\n  %add = add i32 %mul, %val\\n  ret i32 %add\\n}\",\n      \"why\": \"4*q + r -> -6*q + val.\"\n    },\n    {\n      \"name\": \"Vector Type\",\n      \"ir\": \"define <4 x i32> @test_vec(<4 x i32> %val) {\\nentry:\\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\\n  %shl = shl <4 x i32> %div, <i32 2, i32 2, i32 2, i32 2>\\n  %rem = urem <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\\n  %add = add <4 x i32> %shl, %rem\\n  ret <4 x i32> %add\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test_vec(<4 x i32> %val) {\\nentry:\\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\\n  %mul = mul <4 x i32> %div, <i32 -6, i32 -6, i32 -6, i32 -6>\\n  %add = add <4 x i32> %mul, %val\\n  ret <4 x i32> %add\\n}\",\n      \"why\": \"Applies to vectors. 4*q + r -> -6*q + val.\"\n    },\n    {\n      \"name\": \"i8 Bitwidth\",\n      \"ir\": \"define i8 @test_i8(i8 %val) {\\nentry:\\n  %div = udiv i8 %val, 5\\n  %shl = shl i8 %div, 3\\n  %rem = urem i8 %val, 5\\n  %add = add i8 %shl, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test_i8(i8 %val) {\\nentry:\\n  %div = udiv i8 %val, 5\\n  %mul = mul i8 %div, 3\\n  %add = add i8 %mul, %val\\n  ret i8 %add\\n}\",\n      \"why\": \"Test with smaller integer type (i8). 8*q + r -> 3*q + val.\"\n    },\n    {\n      \"name\": \"Flag Propagation (nuw)\",\n      \"ir\": \"define i32 @test_nuw(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl nuw i32 %div, 4\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %shl, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_nuw(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %mul = mul nuw i32 %div, 6\\n  %add = add i32 %mul, %val\\n  ret i32 %add\\n}\",\n      \"why\": \"If shl is nuw, the new mul is also nuw because 6 < 16.\"\n    },\n    {\n      \"name\": \"Negative: Urem Multiple Uses\",\n      \"ir\": \"define i32 @test_no_fold_urem_use(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %shl, %rem\\n  %use2 = add i32 %rem, 1\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_no_fold_urem_use(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %rem = urem i32 %val, 10\\n  %add = add i32 %shl, %rem\\n  %use2 = add i32 %rem, 1\\n  ret i32 %add\\n}\",\n      \"why\": \"Cannot fold because %rem is used twice.\"\n    },\n    {\n      \"name\": \"Negative: Divisor Mismatch\",\n      \"ir\": \"define i32 @test_no_fold_div_mismatch(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %rem = urem i32 %val, 5\\n  %add = add i32 %shl, %rem\\n  ret i32 %add\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test_no_fold_div_mismatch(i32 %val) {\\nentry:\\n  %div = udiv i32 %val, 10\\n  %shl = shl i32 %div, 4\\n  %rem = urem i32 %val, 5\\n  %add = add i32 %shl, %rem\\n  ret i32 %add\\n}\",\n      \"why\": \"Divisors (10 vs 5) do not match.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement in `InstCombineAddSub.cpp`. Look for `Add` instructions where one operand is `Mul`/`Shl` and the other is `Urem` (or `Srem`). Check if `Mul`/`Shl` operand is `Udiv` (or `Sdiv`). Check that `Udiv`/`Urem` share the same dividend and constant divisor.\\n\\nPitfalls:\\n- Ensure `Urem` has exactly one use.\\n- Ensure `Mul`/`Shl` has exactly one use (unless we can replace all uses, but usually this fold targets the specific add chain).\\n- Handle `Shl` by converting the shift amount to a multiplier constant `1 << K`.\\n- For signed division (`sdiv`/`srem`), be careful with `INT_MIN` / `-1` poison cases and negative coefficients. The unsigned case is safer and strictly requested here.\\n- When generating the new constant `C - D`, check if the result is 0 to simplify to `X` directly.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on the provided IR. Verify that `urem` is eliminated and replaced by `add` with the original value. Check that the constant math is correct (C - D). Verify vector operations are handled correctly.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Optimize `add (mul/shl (udiv X, D), C), (urem X, D)` to `add (mul (udiv X, D), C-D), X`. This eliminates the expensive `urem` instruction by utilizing the algebraic identity `X = D*(X/D) + (X%D)`, replacing the remainder term with the original value `X` and adjusting the coefficient of the division term.",
+    "before_after": "Transforms `add (shl (udiv %val, 10), 4), (urem %val, 10)` into `add (mul (udiv %val, 10), 6), %val`. (Note: `nuw` flags should propagate from the shift/mul if present, but should not be invented if the original was wrapping).",
+    "preconditions": [
+      "The `udiv` and `urem` instructions must operate on the same dividend value `%val` and the same constant divisor `D`.",
+      "The `mul` (or `shl`) instruction must have a constant operand `C`.",
+      "The `urem` instruction must have exactly one use (the `add` instruction), otherwise it cannot be eliminated.",
+      "The `mul`/`shl` instruction must have exactly one use (the `add` instruction) for a simple replacement.",
+      "The divisor `D` must be a constant.",
+      "If the `mul`/`shl` has `nuw`/`nsw` flags, the new constant `C-D` must allow those flags to be preserved (e.g., if `C` and `D` are positive and `C > D`, `nuw` can be preserved)."
+    ],
+    "pattern": "General Pattern: `add (mul (udiv X, D_const), C_const), (urem X, D_const)` -> `add (mul (udiv X, D_const), C_const - D_const), X`\n\nVariations:\n- `shl` is treated as `mul` where `C = 2^k`.\n- Commutative `add`: `add (urem...), (mul...)` matches as well.",
+    "testcases": [
+      {
+        "name": "Basic Fold (Shl + Urem)",
+        "ir": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+        "why": "Canonical case: 16*q + r -> 6*q + val."
+      },
+      {
+        "name": "Mul + Urem (non-power-of-2)",
+        "ir": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+        "why": "Uses mul instead of shl, 20*q + r -> 13*q + val."
+      },
+      {
+        "name": "Commutative Add (Urem first)",
+        "ir": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}",
+        "why": "Operands of add are commuted; pattern should still match."
+      },
+      {
+        "name": "C == D (Collapses to X)",
+        "ir": "define i32 @test_identity(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 10\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}",
+        "why": "10*q + r simplifies directly to val."
+      },
+      {
+        "name": "C < D (Negative Constant)",
+        "ir": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, -6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+        "why": "4*q + r -> -6*q + val."
+      },
+      {
+        "name": "Vector Type",
+        "ir": "define <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %shl = shl <4 x i32> %div, <i32 2, i32 2, i32 2, i32 2>\n  %rem = urem <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %add = add <4 x i32> %shl, %rem\n  ret <4 x i32> %add\n}",
+        "expected_optimized_ir": "define <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %mul = mul <4 x i32> %div, <i32 -6, i32 -6, i32 -6, i32 -6>\n  %add = add <4 x i32> %mul, %val\n  ret <4 x i32> %add\n}",
+        "why": "Applies to vectors. 4*q + r -> -6*q + val."
+      },
+      {
+        "name": "i8 Bitwidth",
+        "ir": "define i8 @test_i8(i8 %val) {\nentry:\n  %div = udiv i8 %val, 5\n  %shl = shl i8 %div, 3\n  %rem = urem i8 %val, 5\n  %add = add i8 %shl, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i8 @test_i8(i8 %val) {\nentry:\n  %div = udiv i8 %val, 5\n  %mul = mul i8 %div, 3\n  %add = add i8 %mul, %val\n  ret i8 %add\n}",
+        "why": "Test with smaller integer type (i8). 8*q + r -> 3*q + val."
+      },
+      {
+        "name": "Flag Propagation (nuw)",
+        "ir": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+        "why": "If shl is nuw, the new mul is also nuw because 6 < 16."
+      },
+      {
+        "name": "Negative: Urem Multiple Uses",
+        "ir": "define i32 @test_no_fold_urem_use(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  %use2 = add i32 %rem, 1\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_no_fold_urem_use(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  %use2 = add i32 %rem, 1\n  ret i32 %add\n}",
+        "why": "Cannot fold because %rem is used twice."
+      },
+      {
+        "name": "Negative: Divisor Mismatch",
+        "ir": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+        "expected_optimized_ir": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+        "why": "Divisors (10 vs 5) do not match."
+      }
+    ],
+    "implementation_notes": "Implement in `InstCombineAddSub.cpp`. Look for `Add` instructions where one operand is `Mul`/`Shl` and the other is `Urem` (or `Srem`). Check if `Mul`/`Shl` operand is `Udiv` (or `Sdiv`). Check that `Udiv`/`Urem` share the same dividend and constant divisor.\n\nPitfalls:\n- Ensure `Urem` has exactly one use.\n- Ensure `Mul`/`Shl` has exactly one use (unless we can replace all uses, but usually this fold targets the specific add chain).\n- Handle `Shl` by converting the shift amount to a multiplier constant `1 << K`.\n- For signed division (`sdiv`/`srem`), be careful with `INT_MIN` / `-1` poison cases and negative coefficients. The unsigned case is safer and strictly requested here.\n- When generating the new constant `C - D`, check if the result is 0 to simplify to `X` directly.",
+    "regression_test_notes": "Use `opt -instcombine -S` on the provided IR. Verify that `urem` is eliminated and replaced by `add` with the original value. Check that the constant math is correct (C - D). Verify vector operations are handled correctly.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "Basic Fold (Shl + Urem)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\n=>\ndefine i32 @test(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Mul + Urem (non-power-of-2)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 13\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\n=>\ndefine i32 @test_mul(i32 %val) {\nentry:\n  %div = udiv i32 %val, 7\n  %mul = mul i32 %div, 20\n  %rem = urem i32 %val, 7\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative Add (Urem first)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = add i32 %rem, %shl\n  ret i32 %add\n}\n=>\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = or disjoint i32 %rem, %shl\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = or disjoint i32 %rem, %shl\n  ret i32 %add\n}\n=>\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = or disjoint i32 %rem, %shl\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 6\n  %add = add i32 %val, %mul\n  ret i32 %add\n}\n=>\ndefine i32 @test_commute(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %rem = urem i32 %val, 10\n  %shl = shl i32 %div, 4\n  %add = or disjoint i32 %rem, %shl\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "C == D (Collapses to X)",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 24,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 24\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_identity(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 10\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_identity(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 10\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_identity(i32 %val) {\nentry:\n  %val.fr = freeze i32 %val\n  %0 = urem i32 %val.fr, 10\n  %mul = sub nuw i32 %val.fr, %0\n  %rem = urem i32 %val.fr, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_identity(i32 %val) {\nentry:\n  %val.fr = freeze i32 %val\n  %#0 = urem i32 %val.fr, 10\n  %mul = sub nuw i32 %val.fr, %#0\n  %rem = urem i32 %val.fr, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %val = poison\n\nSource:\ni32 %val.fr = #x00000003 (3)\ni32 %#0 = #x00000003 (3)\ni32 %mul = #x00000000 (0)\ni32 %rem = #x00000003 (3)\ni32 %add = #x00000003 (3)\n\nTarget:\nSource value: #x00000003 (3)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_identity(i32 %val) {\nentry:\n  %val.fr = freeze i32 %val\n  %0 = urem i32 %val.fr, 10\n  %mul = sub nuw i32 %val.fr, %0\n  %rem = urem i32 %val.fr, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_identity(i32 %val) {\nentry:\n  ret i32 %val\n}\n=>\ndefine i32 @test_identity(i32 %val) {\nentry:\n  %val.fr = freeze i32 %val\n  %#0 = urem i32 %val.fr, 10\n  %mul = sub nuw i32 %val.fr, %#0\n  %rem = urem i32 %val.fr, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "C < D (Negative Constant)",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, -6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4294967290\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = shl nuw nsw i32 %div, 2\n  %rem = urem i32 %val, 10\n  %add = add nuw i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, -6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = shl nsw nuw i32 %div, 2\n  %rem = urem i32 %val, 10\n  %add = add nuw i32 %mul, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4294967290\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, -6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = shl nuw nsw i32 %div, 2\n  %rem = urem i32 %val, 10\n  %add = add nuw i32 %mul, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul i32 %div, 4294967290\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\n=>\ndefine i32 @test_neg_const(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = shl nsw nuw i32 %div, 2\n  %rem = urem i32 %val, 10\n  %add = add nuw i32 %mul, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector Type",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %shl = shl <4 x i32> %div, <i32 2, i32 2, i32 2, i32 2>\n  %rem = urem <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %add = add <4 x i32> %shl, %rem\n  ret <4 x i32> %add\n}",
+          "tgt": "define <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, <i32 10, i32 10, i32 10, i32 10>\n  %mul = mul <4 x i32> %div, <i32 -6, i32 -6, i32 -6, i32 -6>\n  %add = add <4 x i32> %mul, %val\n  ret <4 x i32> %add\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, { 10, 10, 10, 10 }\n  %shl = shl <4 x i32> %div, { 2, 2, 2, 2 }\n  %rem = urem <4 x i32> %val, { 10, 10, 10, 10 }\n  %add = add <4 x i32> %shl, %rem\n  ret <4 x i32> %add\n}\n=>\ndefine <4 x i32> @test_vec(<4 x i32> %val) {\nentry:\n  %div = udiv <4 x i32> %val, { 10, 10, 10, 10 }\n  %mul = mul <4 x i32> %div, { 4294967290, 4294967290, 4294967290, 4294967290 }\n  %add = add <4 x i32> %mul, %val\n  ret <4 x i32> %add\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "i8 Bitwidth",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "Flag Propagation (nuw)",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 13,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %mul = mul nuw i32 %div, 6\n  %add = add i32 %mul, %val\n  ret i32 %add\n}\n=>\ndefine i32 @test_nuw(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl nuw i32 %div, 4\n  %rem = urem i32 %val, 10\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %val = #xaae5a678 (2867177080, -1427790216)\n\nSource:\ni32 %div = #x1116f70c (286717708)\ni32 %mul = #x6689ca48 (1720306248)\ni32 %add = #x116f70c0 (292516032)\n\nTarget:\ni32 %div = #x1116f70c (286717708)\ni32 %shl = poison\ni32 %rem = #x00000000 (0)\ni32 %add = poison\nSource value: #x116f70c0 (292516032)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative: Urem Multiple Uses",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 24,
+        "current_opt": 23,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 24\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Negative: Divisor Mismatch",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 23,
+        "current_opt": 23,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 23\n",
+        "current_opt_log": "Cost: 23\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "tgt": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "tgt": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = add i32 %shl, %rem\n  ret i32 %add\n}\n=>\ndefine i32 @test_no_fold_div_mismatch(i32 %val) {\nentry:\n  %div = udiv i32 %val, 10\n  %shl = shl i32 %div, 4\n  %rem = urem i32 %val, 5\n  %add = or disjoint i32 %shl, %rem\n  ret i32 %add\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Found Python3: /data/btguan/miniconda3/bin/python3 (found suitable version \"3.13.5\", minimum required is \"3.6\") found components: Interpreter \n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

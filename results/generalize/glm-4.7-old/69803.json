@@ -1,0 +1,441 @@
+{
+  "issue_id": "69803",
+  "dataset_file": "69803.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test_sle_xor(i32 %x, i32 %y) {\n  %xor1 = xor i32 %y, -1\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\n\ndefine i1 @test_sle_xor(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses the optimization to fold comparisons involving `xor` with `-1` (bitwise NOT). Specifically, `icmp Pred (xor (xor X, -1), Y), (xor X, -1)` can be simplified to `icmp swap_pred(Pred) (xor X, Y), X`. This removes the redundant NOT operation from both operands of the comparison.\",\n  \"before_after\": {\n    \"input_pattern\": \"icmp P (xor (xor X, -1), Y), (xor X, -1)\",\n    \"output_pattern\": \"icmp swap(P) (xor X, Y), X\"\n  },\n  \"preconditions\": [\n    \"The comparison must be an `icmp` instruction.\",\n    \"The operands of the `icmp` must be `xor` instructions.\",\n    \"One `xor` operand must be of the form `xor (Val, -1)`.\",\n    \"The other `xor` operand must be of the form `xor (Val, OtherVal)`.\",\n    \"The constant must be the ALL_ONES value (-1 for the type, e.g., 255 for i8).\",\n    \"The transformation is valid for all signed and unsigned predicates (swapping direction) and equality predicates (no swap).\"\n  ],\n  \"pattern\": \"Match `icmp P (A, B)` where `A` and `B` are `xor`. Identify a common sub-expression `Z = xor (X, -1)`. If the other operand is `xor (Z, Y)`, replace with `icmp swap(P) (xor X, Y), X`. Handle commutativity of `xor` operands and `icmp` operands.\",\n  \"testcases\": [\n    {\n      \"name\": \"test_sle_i32\",\n      \"ir\": \"define i1 @test_sle_i32(i32 %x, i32 %y) {\\n  %xor1 = xor i32 %y, -1\\n  %xor2 = xor i32 %xor1, %x\\n  %r = icmp sle i32 %xor2, %xor1\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_sle_i32(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp sge i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Basic case for signed less-than-or-equal predicate.\"\n    },\n    {\n      \"name\": \"test_slt_i32\",\n      \"ir\": \"define i1 @test_slt_i32(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp slt i32 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_slt_i32(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp sgt i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Signed less-than becomes greater-than.\"\n    },\n    {\n      \"name\": \"test_ult_i32\",\n      \"ir\": \"define i1 @test_ult_i32(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp ult i32 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_ult_i32(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp ugt i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Unsigned less-than becomes unsigned greater-than.\"\n    },\n    {\n      \"name\": \"test_eq_i32\",\n      \"ir\": \"define i1 @test_eq_i32(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp eq i32 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_eq_i32(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp eq i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Equality predicate remains equality (though could further simplify to x==0, this fold is the general pattern).\"\n    },\n    {\n      \"name\": \"test_i8\",\n      \"ir\": \"define i1 @test_i8(i8 %x, i8 %y) {\\n  %noty = xor i8 %y, 255\\n  %t = xor i8 %noty, %x\\n  %r = icmp sle i8 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_i8(i8 %x, i8 %y) {\\n  %1 = xor i8 %y, %x\\n  %r = icmp sge i8 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Verifies pattern works with different bitwidth (i8, const 255).\"\n    },\n    {\n      \"name\": \"test_vector\",\n      \"ir\": \"define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\\n  %noty = xor <4 x i32> %y, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %t = xor <4 x i32> %noty, %x\\n  %r = icmp sle <4 x i32> %t, %noty\\n  ret <4 x i1> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\\n  %1 = xor <4 x i32> %y, %x\\n  %r = icmp sge <4 x i32> %1, %y\\n  ret <4 x i1> %r\\n}\",\n      \"why\": \"Verifies pattern works with vectors.\"\n    },\n    {\n      \"name\": \"test_commuted_xor_operands\",\n      \"ir\": \"define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\\n  %noty = xor i32 -1, %y\\n  %t = xor i32 %x, %noty\\n  %r = icmp sle i32 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp sge i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Xor is commutative; matcher should find -1 regardless of operand order.\"\n    },\n    {\n      \"name\": \"test_swapped_icmp_operands\",\n      \"ir\": \"define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp sge i32 %noty, %t\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp sle i32 %y, %1\\n  ret i1 %r\\n}\",\n      \"why\": \"Icmp operands are swapped; predicate swap logic must account for this (A >= B becomes B <= A).\"\n    },\n    {\n      \"name\": \"test_multiple_uses_of_not\",\n      \"ir\": \"declare void @use(i32)\\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp sle i32 %t, %noty\\n  call void @use(i32 %noty)\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i32)\\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %1 = xor i32 %y, %x\\n  %r = icmp sge i32 %1, %y\\n  call void @use(i32 %noty)\\n  ret i1 %r\\n}\",\n      \"why\": \"Ensure the transformation is applied even if the intermediate 'not' value is used elsewhere (should not be DCE'd aggressively in the same step if it prevents the fold, though InstCombine typically replaces the icmp and lets DCE clean up).\"\n    },\n    {\n      \"name\": \"test_negative_non_all_ones\",\n      \"ir\": \"define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\\n  %mask = xor i32 %y, 5\\n  %t = xor i32 %mask, %x\\n  %r = icmp sle i32 %t, %mask\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\\n  %mask = xor i32 %y, 5\\n  %t = xor i32 %mask, %x\\n  %r = icmp sle i32 %t, %mask\\n  ret i1 %r\\n}\",\n      \"why\": \"Pattern should NOT fire if the constant is not ALL_ONES. Logic is not valid for arbitrary masks.\"\n    },\n    {\n      \"name\": \"test_nuw_nsw_flags\",\n      \"ir\": \"define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\\n  %noty = xor i32 %y, -1\\n  %t = xor i32 %noty, %x\\n  %r = icmp sle i32 %t, %noty\\n  ret i1 %r\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\\n  %1 = xor i32 %y, %x\\n  %r = icmp sge i32 %1, %y\\n  ret i1 %r\\n}\",\n      \"why\": \"Xor operations don't carry nuw/nsw, but verifying the fold works in the presence of other flags (on add/sub leading into this) is implied by the general structure.\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstCombineCompares.cpp\",\n    \"function\": \"visitICmpInstWithInstAndIntCst or a helper in visitICmpInst\",\n    \"logic\": \"1. Check if both operands of ICmp are BinaryOps (XOR).\\n2. Check if one operand is `XOR(X, -1)`.\\n3. Check if the other operand is `XOR(ResultOfStep2, Y)`.\\n4. If matched, create new XOR `XOR(X, Y)`.\\n5. Compute new predicate: if Pred is signed/unsigned, swap it (slt<->sgt, etc.). If eq/ne, keep it.\\n6. Handle the case where the `XOR(X, -1)` is on the LHS or RHS of the ICMP, adjusting the predicate accordingly.\\n7. Replace ICmp.\",\n    \"pitfalls\": [\n      \"Must match Constant::getAllOnesValue() for the specific type width.\",\n      \"Xor is commutative, so the matcher must check all permutations of operands.\",\n      \"Ensure `swapPredicate` logic correctly handles the case where the 'Not' operand is the RHS of the ICMP (e.g. `icmp sge NotX, NotX^Y` -> `icmp sle X, X^Y`).\",\n      \"Be careful with 'Eq' predicate; while the general fold works, a more aggressive fold to `icmp eq Y, 0` might be preferred, but `icmp eq (xor X, Y), X` is a valid intermediate step.\"\n    ]\n  },\n  \"regression_test_notes\": \"Use `opt -instcombine -S`. Check that `test_sle_i32` produces `icmp sge`. Check that `test_negative_non_all_ones` remains unchanged.\",\n  \"clarifying_questions\": [\n    \"Should this fold be extended to handle cases where the constant is NOT -1, but the comparison is against a constant that effectively cancels out (unlikely to be generalizable)?\",\n    \"For the `eq` case, is it preferred to implement the direct fold to `icmp eq Y, 0` immediately, or rely on the subsequent canonicalization of `icmp eq (xor X, Y), X`?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses the optimization to fold comparisons involving `xor` with `-1` (bitwise NOT). Specifically, `icmp Pred (xor (xor X, -1), Y), (xor X, -1)` can be simplified to `icmp swap_pred(Pred) (xor X, Y), X`. This removes the redundant NOT operation from both operands of the comparison.",
+    "before_after": {
+      "input_pattern": "icmp P (xor (xor X, -1), Y), (xor X, -1)",
+      "output_pattern": "icmp swap(P) (xor X, Y), X"
+    },
+    "preconditions": [
+      "The comparison must be an `icmp` instruction.",
+      "The operands of the `icmp` must be `xor` instructions.",
+      "One `xor` operand must be of the form `xor (Val, -1)`.",
+      "The other `xor` operand must be of the form `xor (Val, OtherVal)`.",
+      "The constant must be the ALL_ONES value (-1 for the type, e.g., 255 for i8).",
+      "The transformation is valid for all signed and unsigned predicates (swapping direction) and equality predicates (no swap)."
+    ],
+    "pattern": "Match `icmp P (A, B)` where `A` and `B` are `xor`. Identify a common sub-expression `Z = xor (X, -1)`. If the other operand is `xor (Z, Y)`, replace with `icmp swap(P) (xor X, Y), X`. Handle commutativity of `xor` operands and `icmp` operands.",
+    "testcases": [
+      {
+        "name": "test_sle_i32",
+        "ir": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %xor1 = xor i32 %y, -1\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Basic case for signed less-than-or-equal predicate."
+      },
+      {
+        "name": "test_slt_i32",
+        "ir": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sgt i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Signed less-than becomes greater-than."
+      },
+      {
+        "name": "test_ult_i32",
+        "ir": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp ugt i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Unsigned less-than becomes unsigned greater-than."
+      },
+      {
+        "name": "test_eq_i32",
+        "ir": "define i1 @test_eq_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp eq i32 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_eq_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp eq i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Equality predicate remains equality (though could further simplify to x==0, this fold is the general pattern)."
+      },
+      {
+        "name": "test_i8",
+        "ir": "define i1 @test_i8(i8 %x, i8 %y) {\n  %noty = xor i8 %y, 255\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_i8(i8 %x, i8 %y) {\n  %1 = xor i8 %y, %x\n  %r = icmp sge i8 %1, %y\n  ret i1 %r\n}",
+        "why": "Verifies pattern works with different bitwidth (i8, const 255)."
+      },
+      {
+        "name": "test_vector",
+        "ir": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %noty = xor <4 x i32> %y, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}",
+        "expected_optimized_ir": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %1, %y\n  ret <4 x i1> %r\n}",
+        "why": "Verifies pattern works with vectors."
+      },
+      {
+        "name": "test_commuted_xor_operands",
+        "ir": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %noty = xor i32 -1, %y\n  %t = xor i32 %x, %noty\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Xor is commutative; matcher should find -1 regardless of operand order."
+      },
+      {
+        "name": "test_swapped_icmp_operands",
+        "ir": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sge i32 %noty, %t\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %1\n  ret i1 %r\n}",
+        "why": "Icmp operands are swapped; predicate swap logic must account for this (A >= B becomes B <= A)."
+      },
+      {
+        "name": "test_multiple_uses_of_not",
+        "ir": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+        "expected_optimized_ir": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+        "why": "Ensure the transformation is applied even if the intermediate 'not' value is used elsewhere (should not be DCE'd aggressively in the same step if it prevents the fold, though InstCombine typically replaces the icmp and lets DCE clean up)."
+      },
+      {
+        "name": "test_negative_non_all_ones",
+        "ir": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+        "why": "Pattern should NOT fire if the constant is not ALL_ONES. Logic is not valid for arbitrary masks."
+      },
+      {
+        "name": "test_nuw_nsw_flags",
+        "ir": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}",
+        "expected_optimized_ir": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+        "why": "Xor operations don't carry nuw/nsw, but verifying the fold works in the presence of other flags (on add/sub leading into this) is implied by the general structure."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstCombineCompares.cpp",
+      "function": "visitICmpInstWithInstAndIntCst or a helper in visitICmpInst",
+      "logic": "1. Check if both operands of ICmp are BinaryOps (XOR).\n2. Check if one operand is `XOR(X, -1)`.\n3. Check if the other operand is `XOR(ResultOfStep2, Y)`.\n4. If matched, create new XOR `XOR(X, Y)`.\n5. Compute new predicate: if Pred is signed/unsigned, swap it (slt<->sgt, etc.). If eq/ne, keep it.\n6. Handle the case where the `XOR(X, -1)` is on the LHS or RHS of the ICMP, adjusting the predicate accordingly.\n7. Replace ICmp.",
+      "pitfalls": [
+        "Must match Constant::getAllOnesValue() for the specific type width.",
+        "Xor is commutative, so the matcher must check all permutations of operands.",
+        "Ensure `swapPredicate` logic correctly handles the case where the 'Not' operand is the RHS of the ICMP (e.g. `icmp sge NotX, NotX^Y` -> `icmp sle X, X^Y`).",
+        "Be careful with 'Eq' predicate; while the general fold works, a more aggressive fold to `icmp eq Y, 0` might be preferred, but `icmp eq (xor X, Y), X` is a valid intermediate step."
+      ]
+    },
+    "regression_test_notes": "Use `opt -instcombine -S`. Check that `test_sle_i32` produces `icmp sge`. Check that `test_negative_non_all_ones` remains unchanged.",
+    "clarifying_questions": [
+      "Should this fold be extended to handle cases where the constant is NOT -1, but the comparison is against a constant that effectively cancels out (unlikely to be generalizable)?",
+      "For the `eq` case, is it preferred to implement the direct fold to `icmp eq Y, 0` immediately, or rely on the subsequent canonicalization of `icmp eq (xor X, Y), X`?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "test_sle_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %xor1 = xor i32 %y, -1\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %xor1 = xor i32 %y, 4294967295\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\n=>\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n  %xor1 = xor i32 %y, -1\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %xor1 = xor i32 %y, 4294967295\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\n=>\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_sle_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n  %xor1 = xor i32 %y, -1\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_sle_i32(i32 %x, i32 %y) {\n#0:\n  %xor1 = xor i32 %y, 4294967295\n  %xor2 = xor i32 %xor1, %x\n  %r = icmp sle i32 %xor2, %xor1\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_slt_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sgt i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sgt i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sgt i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sgt i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_slt_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sgt i32 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sgt i32 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_slt_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp slt i32 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_ult_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp ugt i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp ugt i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp ugt i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp ugt i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_ult_i32(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp ugt i32 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp ugt i32 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_ult_i32(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp ult i32 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_eq_i32",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "test_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i8(i8 %x, i8 %y) {\n  %noty = xor i8 %y, 255\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_i8(i8 %x, i8 %y) {\n  %1 = xor i8 %y, %x\n  %r = icmp sge i8 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %noty = xor i8 %y, 255\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %#1 = xor i8 %y, %x\n  %r = icmp sge i8 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8(i8 %x, i8 %y) {\n  %noty = xor i8 %y, -1\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_i8(i8 %x, i8 %y) {\n  %1 = xor i8 %y, %x\n  %r = icmp sge i8 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %noty = xor i8 %y, 255\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %#1 = xor i8 %y, %x\n  %r = icmp sge i8 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i8(i8 %x, i8 %y) {\n  %1 = xor i8 %y, %x\n  %r = icmp sge i8 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8(i8 %x, i8 %y) {\n  %noty = xor i8 %y, -1\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %#1 = xor i8 %y, %x\n  %r = icmp sge i8 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_i8(i8 %x, i8 %y) {\n#0:\n  %noty = xor i8 %y, 255\n  %t = xor i8 %noty, %x\n  %r = icmp sle i8 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_vector",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %noty = xor <4 x i32> %y, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}",
+          "tgt": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %1, %y\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %noty = xor <4 x i32> %y, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %#1, %y\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %noty = xor <4 x i32> %y, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %1, %y\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %noty = xor <4 x i32> %y, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %#1, %y\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %1, %y\n  ret <4 x i1> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n  %noty = xor <4 x i32> %y, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = xor <4 x i32> %y, %x\n  %r = icmp sge <4 x i32> %#1, %y\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @test_vector(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %noty = xor <4 x i32> %y, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %t = xor <4 x i32> %noty, %x\n  %r = icmp sle <4 x i32> %t, %noty\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_commuted_xor_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %noty = xor i32 -1, %y\n  %t = xor i32 %x, %noty\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 4294967295, %y\n  %t = xor i32 %x, %noty\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_commuted_xor_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_swapped_icmp_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sge i32 %noty, %t\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %1\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sge i32 %noty, %t\n  ret i1 %r\n}\n=>\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %#1\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %1\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %#1\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %1\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sle i32 %y, %#1\n  ret i1 %r\n}\n=>\ndefine i1 @test_swapped_icmp_operands(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_multiple_uses_of_not",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+          "tgt": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}\n=>\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}\n",
+          "tgt": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}\n=>\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i32)\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  call void @use(i32 %noty)\n  ret i1 %r\n}\n=>\ndeclare void @use(i32)\n\ndefine i1 @test_multiple_uses_of_not(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  call void @use(i32 %noty)\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_negative_non_all_ones",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\n=>\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\n=>\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\n=>\ndefine i1 @test_negative_non_all_ones(i32 %x, i32 %y) {\n#0:\n  %mask = xor i32 %y, 5\n  %t = xor i32 %mask, %x\n  %r = icmp sle i32 %t, %mask\n  ret i1 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "test_nuw_nsw_flags",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}",
+          "tgt": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n=>\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %1 = xor i32 %y, %x\n  %r = icmp sge i32 %1, %y\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n  %noty = xor i32 %y, -1\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %#1 = xor i32 %y, %x\n  %r = icmp sge i32 %#1, %y\n  ret i1 %r\n}\n=>\ndefine i1 @test_nuw_nsw_flags(i32 %x, i32 %y) {\n#0:\n  %noty = xor i32 %y, 4294967295\n  %t = xor i32 %noty, %x\n  %r = icmp sle i32 %t, %noty\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.5s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

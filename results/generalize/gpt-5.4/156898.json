@@ -1,0 +1,1195 @@
+{
+  "issue_id": "156898",
+  "dataset_file": "156898.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue was a very specific bit-test hidden as `trunc i8 (lshr i8 4, %x) to i1`. Since `4` is a power of two, shifting it right by `%x` leaves bit 0 set iff `%x == log2(4) == 2`. So the motivating case is really an equality/range test on the shift amount, not a meaningful shift result.\n\nThe patch generalizes that into a `visitTrunc()` fold for `trunc (...shr C, V) to i1`, where the source is either `lshr` or `ashr` (`m_Shr` matches both). It recognizes two constant classes:\n- `C` is a power of 2:  \n  `trunc (shr C, V) to i1  -->  icmp eq V, log2(C)`\n- `C` is a low-bit mask (`2^n - 1`):  \n  `trunc (shr C, V) to i1  -->  icmp ult V, n`\n\nThat captures both “exact one shift amount produces low bit 1” and “any shift below a threshold preserves low bit 1”. The implementation uses `m_Power2`, `m_LowBitMask`, and derives the compare RHS via `countr_zero()` / `countr_one()`.\n\nThe dev tests broaden coverage beyond the single motivating case by checking:\n- both `lshr` and `ashr`;\n- both constant families: `2^n` and `2^n-1`;\n- positive and negative examples (`9` should not fold);\n- multi-use shift results, ensuring only the `trunc` is rewritten;\n- interaction with larger expressions/users (`test1`, `test5`) so downstream simplification still works.\n\nThis is a good template: identify a hidden bit predicate, replace it with a direct compare, then test operator variants, constant classes, non-matches, and multi-use safety.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n\ndefine i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Fold a hidden bit-test of the form `trunc (shr C, X) to i1` into a direct compare on the shift amount when the constant `C` has a recognizable low-bit structure.\",\n    \"match\": {\n      \"root\": \"trunc SrcTy %shr to i1\",\n      \"source\": \"%shr = lshr SrcTy C, X  OR  %shr = ashr SrcTy C, X\",\n      \"requirements\": [\n        \"C is a nonzero integer constant of the shift source type\",\n        \"The fold is based on the low bit of `(C >> X)`\",\n        \"Valid for both logical and arithmetic right shift because the shifted value operand is constant\"\n      ]\n    },\n    \"recognized_constant_families\": [\n      {\n        \"class\": \"power_of_two\",\n        \"form\": \"C = 2^k\",\n        \"rewrite\": \"trunc (shr C, X) to i1  ->  icmp eq X, k\",\n        \"reason\": \"After shifting a single set bit right by X, bit 0 is set iff X equals the bit position k.\"\n      },\n      {\n        \"class\": \"low_bit_mask\",\n        \"form\": \"C = 2^n - 1\",\n        \"rewrite\": \"trunc (shr C, X) to i1  ->  icmp ult X, n\",\n        \"reason\": \"A suffix of n ones keeps bit 0 set exactly when shifted right by fewer than n positions.\"\n      }\n    ],\n    \"notes\": [\n      \"This is naturally implemented in InstCombine's `visitTrunc()` by matching a shift feeding `trunc ... to i1`.\",\n      \"The fold should only replace the trunc user; if the shift has other uses, preserve the shift for those uses.\",\n      \"The compare type should match the shift amount type.\",\n      \"This exposes a direct equality/range predicate on the shift amount, enabling further canonicalization.\",\n      \"Corner cases worth covering include `k = 0`, `n = 1`, wide integer types, vector-free scalar forms, and both `lshr`/`ashr`.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"pow2_lshr_i8_basic\",\n      \"ir\": \"define i1 @pow2_lshr_i8_basic(i8 %x) {\\n  %shr = lshr i8 4, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i8_basic(i8 %x) {\\n  %cmp = icmp eq i8 %x, 2\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i8_basic\",\n      \"ir\": \"define i1 @pow2_ashr_i8_basic(i8 %x) {\\n  %shr = ashr i8 4, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i8_basic(i8 %x) {\\n  %cmp = icmp eq i8 %x, 2\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_i8_bit0\",\n      \"ir\": \"define i1 @pow2_lshr_i8_bit0(i8 %x) {\\n  %shr = lshr i8 1, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i8_bit0(i8 %x) {\\n  %cmp = icmp eq i8 %x, 0\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i8_bit0\",\n      \"ir\": \"define i1 @pow2_ashr_i8_bit0(i8 %x) {\\n  %shr = ashr i8 1, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i8_bit0(i8 %x) {\\n  %cmp = icmp eq i8 %x, 0\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_i8_highbit\",\n      \"ir\": \"define i1 @pow2_lshr_i8_highbit(i8 %x) {\\n  %shr = lshr i8 128, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i8_highbit(i8 %x) {\\n  %cmp = icmp eq i8 %x, 7\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i8_highbit_negative_const\",\n      \"ir\": \"define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\\n  %shr = ashr i8 -128, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\\n  %cmp = icmp eq i8 %x, 7\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_i16\",\n      \"ir\": \"define i1 @pow2_lshr_i16(i16 %x) {\\n  %shr = lshr i16 1024, %x\\n  %t = trunc i16 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i16(i16 %x) {\\n  %cmp = icmp eq i16 %x, 10\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i16\",\n      \"ir\": \"define i1 @pow2_ashr_i16(i16 %x) {\\n  %shr = ashr i16 1024, %x\\n  %t = trunc i16 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i16(i16 %x) {\\n  %cmp = icmp eq i16 %x, 10\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_i32\",\n      \"ir\": \"define i1 @pow2_lshr_i32(i32 %x) {\\n  %shr = lshr i32 1073741824, %x\\n  %t = trunc i32 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i32(i32 %x) {\\n  %cmp = icmp eq i32 %x, 30\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i32\",\n      \"ir\": \"define i1 @pow2_ashr_i32(i32 %x) {\\n  %shr = ashr i32 1073741824, %x\\n  %t = trunc i32 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i32(i32 %x) {\\n  %cmp = icmp eq i32 %x, 30\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_i64\",\n      \"ir\": \"define i1 @pow2_lshr_i64(i64 %x) {\\n  %shr = lshr i64 1125899906842624, %x\\n  %t = trunc i64 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_lshr_i64(i64 %x) {\\n  %cmp = icmp eq i64 %x, 50\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_i64\",\n      \"ir\": \"define i1 @pow2_ashr_i64(i64 %x) {\\n  %shr = ashr i64 1125899906842624, %x\\n  %t = trunc i64 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_i64(i64 %x) {\\n  %cmp = icmp eq i64 %x, 50\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i8_three_ones\",\n      \"ir\": \"define i1 @mask_lshr_i8_three_ones(i8 %x) {\\n  %shr = lshr i8 7, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i8_three_ones(i8 %x) {\\n  %cmp = icmp ult i8 %x, 3\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i8_three_ones\",\n      \"ir\": \"define i1 @mask_ashr_i8_three_ones(i8 %x) {\\n  %shr = ashr i8 7, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i8_three_ones(i8 %x) {\\n  %cmp = icmp ult i8 %x, 3\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i8_one\",\n      \"ir\": \"define i1 @mask_lshr_i8_one(i8 %x) {\\n  %shr = lshr i8 1, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i8_one(i8 %x) {\\n  %cmp = icmp ult i8 %x, 1\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i8_one\",\n      \"ir\": \"define i1 @mask_ashr_i8_one(i8 %x) {\\n  %shr = ashr i8 1, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i8_one(i8 %x) {\\n  %cmp = icmp ult i8 %x, 1\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i8_seven_ones\",\n      \"ir\": \"define i1 @mask_lshr_i8_seven_ones(i8 %x) {\\n  %shr = lshr i8 127, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i8_seven_ones(i8 %x) {\\n  %cmp = icmp ult i8 %x, 7\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i8_seven_ones\",\n      \"ir\": \"define i1 @mask_ashr_i8_seven_ones(i8 %x) {\\n  %shr = ashr i8 127, %x\\n  %t = trunc i8 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i8_seven_ones(i8 %x) {\\n  %cmp = icmp ult i8 %x, 7\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i16\",\n      \"ir\": \"define i1 @mask_lshr_i16(i16 %x) {\\n  %shr = lshr i16 31, %x\\n  %t = trunc i16 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i16(i16 %x) {\\n  %cmp = icmp ult i16 %x, 5\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i16\",\n      \"ir\": \"define i1 @mask_ashr_i16(i16 %x) {\\n  %shr = ashr i16 31, %x\\n  %t = trunc i16 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i16(i16 %x) {\\n  %cmp = icmp ult i16 %x, 5\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i32\",\n      \"ir\": \"define i1 @mask_lshr_i32(i32 %x) {\\n  %shr = lshr i32 255, %x\\n  %t = trunc i32 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i32(i32 %x) {\\n  %cmp = icmp ult i32 %x, 8\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i32\",\n      \"ir\": \"define i1 @mask_ashr_i32(i32 %x) {\\n  %shr = ashr i32 255, %x\\n  %t = trunc i32 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i32(i32 %x) {\\n  %cmp = icmp ult i32 %x, 8\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_i64\",\n      \"ir\": \"define i1 @mask_lshr_i64(i64 %x) {\\n  %shr = lshr i64 4095, %x\\n  %t = trunc i64 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_i64(i64 %x) {\\n  %cmp = icmp ult i64 %x, 12\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_i64\",\n      \"ir\": \"define i1 @mask_ashr_i64(i64 %x) {\\n  %shr = ashr i64 4095, %x\\n  %t = trunc i64 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_ashr_i64(i64 %x) {\\n  %cmp = icmp ult i64 %x, 12\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_shift_has_other_use\",\n      \"ir\": \"define i8 @pow2_lshr_shift_has_other_use(i8 %x) {\\n  %shr = lshr i8 4, %x\\n  %t = trunc i8 %shr to i1\\n  %z = zext i1 %t to i8\\n  %r = or i8 %shr, %z\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i8 @pow2_lshr_shift_has_other_use(i8 %x) {\\n  %shr = lshr i8 4, %x\\n  %cmp = icmp eq i8 %x, 2\\n  %z = zext i1 %cmp to i8\\n  %r = or i8 %shr, %z\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_ashr_shift_has_other_use\",\n      \"ir\": \"define i16 @mask_ashr_shift_has_other_use(i16 %x) {\\n  %shr = ashr i16 31, %x\\n  %t = trunc i16 %shr to i1\\n  %z = zext i1 %t to i16\\n  %r = add i16 %shr, %z\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i16 @mask_ashr_shift_has_other_use(i16 %x) {\\n  %shr = ashr i16 31, %x\\n  %cmp = icmp ult i16 %x, 5\\n  %z = zext i1 %cmp to i16\\n  %r = add i16 %shr, %z\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_lshr_used_in_select\",\n      \"ir\": \"define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\\n  %shr = lshr i32 16, %x\\n  %t = trunc i32 %shr to i1\\n  %r = select i1 %t, i32 %a, i32 %b\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\\n  %cmp = icmp eq i32 %x, 4\\n  %r = select i1 %cmp, i32 %a, i32 %b\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_used_in_select\",\n      \"ir\": \"define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\\n  %shr = lshr i32 15, %x\\n  %t = trunc i32 %shr to i1\\n  %r = select i1 %t, i32 %a, i32 %b\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\\n  %cmp = icmp ult i32 %x, 4\\n  %r = select i1 %cmp, i32 %a, i32 %b\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"pow2_ashr_with_large_shift_type_match\",\n      \"ir\": \"define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\\n  %shr = ashr i64 32, %x\\n  %t = trunc i64 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\\n  %cmp = icmp eq i64 %x, 5\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"mask_lshr_maximal_lowmask_minus_onebit\",\n      \"ir\": \"define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\\n  %shr = lshr i16 255, %x\\n  %t = trunc i16 %shr to i1\\n  ret i1 %t\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\\n  %cmp = icmp ult i16 %x, 8\\n  ret i1 %cmp\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold a hidden bit-test of the form `trunc (shr C, X) to i1` into a direct compare on the shift amount when the constant `C` has a recognizable low-bit structure.",
+      "match": {
+        "root": "trunc SrcTy %shr to i1",
+        "source": "%shr = lshr SrcTy C, X  OR  %shr = ashr SrcTy C, X",
+        "requirements": [
+          "C is a nonzero integer constant of the shift source type",
+          "The fold is based on the low bit of `(C >> X)`",
+          "Valid for both logical and arithmetic right shift because the shifted value operand is constant"
+        ]
+      },
+      "recognized_constant_families": [
+        {
+          "class": "power_of_two",
+          "form": "C = 2^k",
+          "rewrite": "trunc (shr C, X) to i1  ->  icmp eq X, k",
+          "reason": "After shifting a single set bit right by X, bit 0 is set iff X equals the bit position k."
+        },
+        {
+          "class": "low_bit_mask",
+          "form": "C = 2^n - 1",
+          "rewrite": "trunc (shr C, X) to i1  ->  icmp ult X, n",
+          "reason": "A suffix of n ones keeps bit 0 set exactly when shifted right by fewer than n positions."
+        }
+      ],
+      "notes": [
+        "This is naturally implemented in InstCombine's `visitTrunc()` by matching a shift feeding `trunc ... to i1`.",
+        "The fold should only replace the trunc user; if the shift has other uses, preserve the shift for those uses.",
+        "The compare type should match the shift amount type.",
+        "This exposes a direct equality/range predicate on the shift amount, enabling further canonicalization.",
+        "Corner cases worth covering include `k = 0`, `n = 1`, wide integer types, vector-free scalar forms, and both `lshr`/`ashr`."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "pow2_lshr_i8_basic",
+        "ir": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i8_basic",
+        "ir": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %shr = ashr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_i8_bit0",
+        "ir": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i8_bit0",
+        "ir": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_i8_highbit",
+        "ir": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %shr = lshr i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i8_highbit_negative_const",
+        "ir": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %shr = ashr i8 -128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_i16",
+        "ir": "define i1 @pow2_lshr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i16",
+        "ir": "define i1 @pow2_ashr_i16(i16 %x) {\n  %shr = ashr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_i32",
+        "ir": "define i1 @pow2_lshr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i32",
+        "ir": "define i1 @pow2_ashr_i32(i32 %x) {\n  %shr = ashr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_i64",
+        "ir": "define i1 @pow2_lshr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_lshr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_ashr_i64",
+        "ir": "define i1 @pow2_ashr_i64(i64 %x) {\n  %shr = ashr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i8_three_ones",
+        "ir": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i8_three_ones",
+        "ir": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %shr = ashr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i8_one",
+        "ir": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i8_one",
+        "ir": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i8_seven_ones",
+        "ir": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i8_seven_ones",
+        "ir": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %shr = ashr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i16",
+        "ir": "define i1 @mask_lshr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i16",
+        "ir": "define i1 @mask_ashr_i16(i16 %x) {\n  %shr = ashr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i32",
+        "ir": "define i1 @mask_lshr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i32",
+        "ir": "define i1 @mask_ashr_i32(i32 %x) {\n  %shr = ashr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_i64",
+        "ir": "define i1 @mask_lshr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_ashr_i64",
+        "ir": "define i1 @mask_ashr_i64(i64 %x) {\n  %shr = ashr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_ashr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "pow2_lshr_shift_has_other_use",
+        "ir": "define i8 @pow2_lshr_shift_has_other_use(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  %z = zext i1 %t to i8\n  %r = or i8 %shr, %z\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "define i8 @pow2_lshr_shift_has_other_use(i8 %x) {\n  %shr = lshr i8 4, %x\n  %cmp = icmp eq i8 %x, 2\n  %z = zext i1 %cmp to i8\n  %r = or i8 %shr, %z\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "mask_ashr_shift_has_other_use",
+        "ir": "define i16 @mask_ashr_shift_has_other_use(i16 %x) {\n  %shr = ashr i16 31, %x\n  %t = trunc i16 %shr to i1\n  %z = zext i1 %t to i16\n  %r = add i16 %shr, %z\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "define i16 @mask_ashr_shift_has_other_use(i16 %x) {\n  %shr = ashr i16 31, %x\n  %cmp = icmp ult i16 %x, 5\n  %z = zext i1 %cmp to i16\n  %r = add i16 %shr, %z\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "pow2_lshr_used_in_select",
+        "ir": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "mask_lshr_used_in_select",
+        "ir": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "pow2_ashr_with_large_shift_type_match",
+        "ir": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %shr = ashr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "mask_lshr_maximal_lowmask_minus_onebit",
+        "ir": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+        "expected_optimized_ir": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "pow2_lshr_i8_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i8_basic(i8 %x) {\n#0:\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i8_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %shr = ashr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %shr = ashr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i8_basic(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i8_basic(i8 %x) {\n#0:\n  %shr = lshr i8 4, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_i8_bit0",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i8_bit0(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i8_bit0",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i8_bit0(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_i8_highbit",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %shr = lshr i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %shr = lshr i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %shr = lshr exact i8 -128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %shr = lshr exact i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n  %shr = lshr exact i8 -128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i8_highbit(i8 %x) {\n#0:\n  %shr = lshr exact i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i8_highbit_negative_const",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %shr = ashr i8 -128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %shr = ashr i8 128, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %shr1 = lshr exact i8 -128, %x\n  %t = trunc i8 %shr1 to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %shr1 = lshr exact i8 128, %x\n  %t = trunc i8 %shr1 to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n  %shr1 = lshr exact i8 -128, %x\n  %t = trunc i8 %shr1 to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 7\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i8_highbit_negative_const(i8 %x) {\n#0:\n  %shr1 = lshr exact i8 128, %x\n  %t = trunc i8 %shr1 to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr1 = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %x = #x0010 (16)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni16 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i16(i16 %x) {\n  %shr = ashr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %shr = ashr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i16(i16 %x) {\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i16(i16 %x) {\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp eq i16 %x, 10\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 1024, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %x = #x0010 (16)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni16 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i32(i32 %x) {\n  %shr = ashr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %shr = ashr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i32(i32 %x) {\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i32(i32 %x) {\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 30\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 1073741824, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_lshr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_lshr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_lshr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_lshr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_i64(i64 %x) {\n  %shr = ashr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %shr = ashr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_i64(i64 %x) {\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_i64(i64 %x) {\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 50\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 1125899906842624, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i8_three_ones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i8_three_ones(i8 %x) {\n#0:\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i8_three_ones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %shr = ashr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %shr = ashr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 3\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i8_three_ones(i8 %x) {\n#0:\n  %shr = lshr i8 7, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i8_one",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i8_one(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i8_one",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %shr = ashr i8 1, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i8_one(i8 %x) {\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 1\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i8_one(i8 %x) {\n#0:\n  %shr = lshr i8 1, %x\n  %t = trunc nuw i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i8_seven_ones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i8_seven_ones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %shr = ashr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = ashr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %cmp = icmp ult i8 %x, 7\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i8_seven_ones(i8 %x) {\n#0:\n  %shr = lshr i8 127, %x\n  %t = trunc i8 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %x = #x0010 (16)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni16 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i16(i16 %x) {\n  %shr = ashr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %shr = ashr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i16(i16 %x) {\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i16(i16 %x) {\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i16(i16 %x) {\n#0:\n  %shr = lshr i16 31, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %x = #x0010 (16)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni16 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i32(i32 %x) {\n  %shr = ashr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %shr = ashr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i32(i32 %x) {\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i32(i32 %x) {\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %cmp = icmp ult i32 %x, 8\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i32(i32 %x) {\n#0:\n  %shr = lshr i32 255, %x\n  %t = trunc i32 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_ashr_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_ashr_i64(i64 %x) {\n  %shr = ashr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %shr = ashr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_ashr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_ashr_i64(i64 %x) {\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_ashr_i64(i64 %x) {\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %cmp = icmp ult i64 %x, 12\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_ashr_i64(i64 %x) {\n#0:\n  %shr = lshr i64 4095, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_lshr_shift_has_other_use",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "mask_ashr_shift_has_other_use",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 4,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "pow2_lshr_used_in_select",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp eq i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @pow2_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 16, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\ni32 %a = #x00000003 (3)\ni32 %b = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %r = #x00000003 (3)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\ni32 %r = poison\nSource value: #x00000003 (3)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_used_in_select",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %cmp = icmp ult i32 %x, 4\n  %r = select i1 %cmp, i32 %a, i32 %b\n  ret i32 %r\n}\n=>\ndefine i32 @mask_lshr_used_in_select(i32 %x, i32 %a, i32 %b) {\n#0:\n  %shr = lshr i32 15, %x\n  %t = trunc i32 %shr to i1\n  %r = select i1 %t, i32 %a, i32 %b\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\ni32 %a = #x00000003 (3)\ni32 %b = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %r = #x00000003 (3)\n\nTarget:\ni32 %shr = poison\ni1 %t = poison\ni32 %r = poison\nSource value: #x00000003 (3)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "pow2_ashr_with_large_shift_type_match",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %shr = ashr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %shr = ashr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %shr = lshr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %shr = lshr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n  %shr = lshr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @pow2_ashr_with_large_shift_type_match(i64 %x) {\n#0:\n  %shr = lshr i64 32, %x\n  %t = trunc i64 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "mask_lshr_maximal_lowmask_minus_onebit",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "tgt": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n=>\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %cmp = icmp ult i16 %x, 8\n  ret i1 %cmp\n}\n=>\ndefine i1 @mask_lshr_maximal_lowmask_minus_onebit(i16 %x) {\n#0:\n  %shr = lshr i16 255, %x\n  %t = trunc i16 %shr to i1\n  ret i1 %t\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %x = #x0010 (16)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni16 %shr = poison\ni1 %t = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (1.1s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

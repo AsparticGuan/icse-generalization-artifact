@@ -1,0 +1,1039 @@
+{
+  "issue_id": "157315",
+  "dataset_file": "157315.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue showed a missed fold for a clamp-identity test: after computing some value `%v1`, LLVM formed `smin(smax(%v1, Lo), Hi)` and then checked `icmp eq %v1, clamp(%v1)`. Semantically, that asks whether `%v1` is already inside the clamp range, so it should become a range test rather than comparing against the clamped value.\n\nThe patch generalizes this into `foldICmpWithClamp()` for equality predicates over min/max intrinsics. It matches:\n\n- `icmp eq/ne X, min(max(X, Lo), Hi)`\n- signed: `smin(smax(...))`\n- unsigned: `umin(umax(...))`\n\nKey constraints:\n- only `eq/ne`\n- outer op must be `min`, inner op must be one-use `max`\n- bounds must be constants\n- range must be valid (`Lo < Hi` in signed/unsigned sense)\n\nIt then converts the clamp to a `ConstantRange` and asks for the equivalent `icmp`, producing the canonical unsigned range check:\n- `eq` → membership in `[Lo, Hi+1)`\n- `ne` → membership in the inverse range\npossibly with an add/offset when needed.\n\nThe dev tests broaden coverage well beyond the motivating case:\n- direct/non-add source values (`test_i32_eq_no_add`)\n- `eq` and `ne`\n- signed and unsigned clamps\n- operand-commuted compare\n- multiple scalar widths: i8/i16/i32/i64\n- vectors: splat, non-splat, poison lanes\n- edge bounds at type min/max\n- negative cases: not a clamp pattern, invalid range, wrong predicate\n- use-count restrictions: multi-use max/min should not match\n\nThis is a good template: recognize “value equals its normalized form” and lower it to a canonical range predicate with explicit legality tests.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\ndefine i1 @test(i32 %arg0, i32 %arg1) {\n  %sum = add i32 %arg0, 95\n  %1 = add i32 %sum, %arg1\n  %result = icmp ult i32 %1, 256\n  ret i1 %result\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Recognize equality/inequality between a value X and its clamped form min(max(X, Lo), Hi) or max(min(X, Hi), Lo), and replace it with an equivalent range test on X.\",\n    \"match\": {\n      \"predicates\": [\"eq\", \"ne\"],\n      \"forms\": [\n        \"icmp eq/ne Ty X, smin(smax(X, CLo), CHi)\",\n        \"icmp eq/ne Ty X, smin(CHi, smax(X, CLo))\",\n        \"icmp eq/ne Ty X, smax(smin(X, CHi), CLo)\",\n        \"icmp eq/ne Ty X, smax(CLo, smin(X, CHi))\",\n        \"icmp eq/ne Ty X, umin(umax(X, CLo), CHi)\",\n        \"icmp eq/ne Ty X, umin(CHi, umax(X, CLo))\",\n        \"icmp eq/ne Ty X, umax(umin(X, CHi), CLo)\",\n        \"icmp eq/ne Ty X, umax(CLo, umin(X, CHi))\",\n        \"icmp eq/ne Ty smin(smax(X, CLo), CHi), X\",\n        \"icmp eq/ne Ty umin(umax(X, CLo), CHi), X\"\n      ],\n      \"requirements\": [\n        \"Lo/Hi are constants or splat constant vectors\",\n        \"Inner min/max is one-use if required by the implementation strategy\",\n        \"Clamp kind is consistent: signed with smin/smax, unsigned with umin/umax\",\n        \"Range is valid: signed Lo < Hi for signed clamp; unsigned Lo < Hi for unsigned clamp\",\n        \"Type is integer scalar or integer vector\"\n      ]\n    },\n    \"semantics\": {\n      \"eq\": \"X == clamp(X, Lo, Hi) iff X is in the closed interval [Lo, Hi]\",\n      \"ne\": \"X != clamp(X, Lo, Hi) iff X is outside [Lo, Hi]\"\n    },\n    \"canonical_lowering\": {\n      \"signed\": {\n        \"eq\": \"lower to a canonical signed range check, typically via offset-and-unsigned-compare: (X - Lo) u< (Hi - Lo + 1)\",\n        \"ne\": \"negation of the above, typically (X - Lo) u>= (Hi - Lo + 1)\"\n      },\n      \"unsigned\": {\n        \"eq\": \"lower to (X - Lo) u< (Hi - Lo + 1), often simplifying further when Lo == 0\",\n        \"ne\": \"lower to (X - Lo) u>= (Hi - Lo + 1)\"\n      }\n    },\n    \"notes\": [\n      \"The motivating example smin(smax(X, -155), 100) becomes (X + 155) u< 256.\",\n      \"Equivalent source shapes with commuted compare operands or commuted min/max operands should also match.\",\n      \"For vector types, perform lane-wise when bounds are constant/splat-compatible.\",\n      \"If the implementation uses ConstantRange, result may appear as a direct signed compare pair or as canonical add/sub plus icmp ult/uge.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"scalar_s32_eq_motivating_case\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\\n  %v0 = add i32 %arg1, -60\\n  %v1 = add i32 %v0, %arg0\\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\\n  %v4 = icmp eq i32 %v1, %v3\\n  ret i1 %v4\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\\n  %v0 = add i32 %arg1, -60\\n  %v1 = add i32 %v0, %arg0\\n  %off = add i32 %v1, 155\\n  %cmp = icmp ult i32 %off, 256\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_ne_motivating_case\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\\n  %v0 = add i32 %arg1, -60\\n  %v1 = add i32 %v0, %arg0\\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\\n  %v4 = icmp ne i32 %v1, %v3\\n  ret i1 %v4\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\\n  %v0 = add i32 %arg1, -60\\n  %v1 = add i32 %v0, %arg0\\n  %off = add i32 %v1, 155\\n  %cmp = icmp uge i32 %off, 256\\n  ret i1 %cmp\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_commuted_icmp\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\\n  %m0 = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\\n  %m1 = tail call i32 @llvm.smin.i32(i32 %m0, i32 20)\\n  %c = icmp eq i32 %m1, %x\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\\n  %off = add i32 %x, 10\\n  %c = icmp ult i32 %off, 31\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_direct_source\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -7)\\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 12)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_direct_source(i32 %x) {\\n  %off = add i32 %x, 7\\n  %c = icmp ult i32 %off, 20\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_reversed_clamp_order\",\n      \"ir\": \"declare i32 @llvm.smin.i32(i32, i32)\\ndeclare i32 @llvm.smax.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\\n  %a = tail call i32 @llvm.smin.i32(i32 %x, i32 12)\\n  %b = tail call i32 @llvm.smax.i32(i32 %a, i32 -7)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\\n  %off = add i32 %x, 7\\n  %c = icmp ult i32 %off, 20\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_eq_lo_zero\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_eq_lo_zero(i32 %x) {\\n  %c = icmp ult i32 %x, 256\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_ne_lo_zero\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\\n  %c = icmp ne i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_ne_lo_zero(i32 %x) {\\n  %c = icmp uge i32 %x, 256\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_eq_nonzero_lo\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\\n  %off = add i32 %x, -100\\n  %c = icmp ult i32 %off, 100\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_ne_nonzero_lo\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\\n  %c = icmp ne i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\\n  %off = add i32 %x, -100\\n  %c = icmp uge i32 %off, 100\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s8_eq_full_nontrivial\",\n      \"ir\": \"declare i8 @llvm.smax.i8(i8, i8)\\ndeclare i8 @llvm.smin.i8(i8, i8)\\n\\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\\n  %a = tail call i8 @llvm.smax.i8(i8 %x, i8 -5)\\n  %b = tail call i8 @llvm.smin.i8(i8 %a, i8 10)\\n  %c = icmp eq i8 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\\n  %off = add i8 %x, 5\\n  %c = icmp ult i8 %off, 16\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s16_eq\",\n      \"ir\": \"declare i16 @llvm.smax.i16(i16, i16)\\ndeclare i16 @llvm.smin.i16(i16, i16)\\n\\ndefine i1 @scalar_s16_eq(i16 %x) {\\n  %a = tail call i16 @llvm.smax.i16(i16 %x, i16 -300)\\n  %b = tail call i16 @llvm.smin.i16(i16 %a, i16 700)\\n  %c = icmp eq i16 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s16_eq(i16 %x) {\\n  %off = add i16 %x, 300\\n  %c = icmp ult i16 %off, 1001\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u16_eq\",\n      \"ir\": \"declare i16 @llvm.umax.i16(i16, i16)\\ndeclare i16 @llvm.umin.i16(i16, i16)\\n\\ndefine i1 @scalar_u16_eq(i16 %x) {\\n  %a = tail call i16 @llvm.umax.i16(i16 %x, i16 5)\\n  %b = tail call i16 @llvm.umin.i16(i16 %a, i16 500)\\n  %c = icmp eq i16 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u16_eq(i16 %x) {\\n  %off = add i16 %x, -5\\n  %c = icmp ult i16 %off, 496\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s64_eq\",\n      \"ir\": \"declare i64 @llvm.smax.i64(i64, i64)\\ndeclare i64 @llvm.smin.i64(i64, i64)\\n\\ndefine i1 @scalar_s64_eq(i64 %x) {\\n  %a = tail call i64 @llvm.smax.i64(i64 %x, i64 -1000)\\n  %b = tail call i64 @llvm.smin.i64(i64 %a, i64 4095)\\n  %c = icmp eq i64 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s64_eq(i64 %x) {\\n  %off = add i64 %x, 1000\\n  %c = icmp ult i64 %off, 5096\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u64_eq\",\n      \"ir\": \"declare i64 @llvm.umax.i64(i64, i64)\\ndeclare i64 @llvm.umin.i64(i64, i64)\\n\\ndefine i1 @scalar_u64_eq(i64 %x) {\\n  %a = tail call i64 @llvm.umax.i64(i64 %x, i64 1024)\\n  %b = tail call i64 @llvm.umin.i64(i64 %a, i64 8191)\\n  %c = icmp eq i64 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u64_eq(i64 %x) {\\n  %off = add i64 %x, -1024\\n  %c = icmp ult i64 %off, 7168\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_upper_at_smax\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 2147483647)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\\n  %c = icmp sge i32 %x, -10\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_lower_at_smin\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 123)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\\n  %c = icmp sle i32 %x, 123\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_eq_upper_at_umax\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 77)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 4294967295)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\\n  %c = icmp uge i32 %x, 77\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u32_eq_lower_at_umin\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.umin.i32(i32, i32)\\n\\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 123)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\\n  %c = icmp ule i32 %x, 123\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_splat_bounds_s32_eq_v4\",\n      \"ir\": \"declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\\n\\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -8, i32 -8, i32 -8, i32 -8>)\\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 7, i32 7, i32 7, i32 7>)\\n  %c = icmp eq <4 x i32> %x, %b\\n  ret <4 x i1> %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\\n  %off = add <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\\n  %c = icmp ult <4 x i32> %off, <i32 16, i32 16, i32 16, i32 16>\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_splat_bounds_u16_ne_v8\",\n      \"ir\": \"declare <8 x i16> @llvm.umax.v8i16(<8 x i16>, <8 x i16>)\\ndeclare <8 x i16> @llvm.umin.v8i16(<8 x i16>, <8 x i16>)\\n\\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\\n  %a = tail call <8 x i16> @llvm.umax.v8i16(<8 x i16> %x, <8 x i16> <i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10>)\\n  %b = tail call <8 x i16> @llvm.umin.v8i16(<8 x i16> %a, <8 x i16> <i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20>)\\n  %c = icmp ne <8 x i16> %x, %b\\n  ret <8 x i1> %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\\n  %off = add <8 x i16> %x, <i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10>\\n  %c = icmp uge <8 x i16> %off, <i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11>\\n  ret <8 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_nonsplat_bounds_u32_eq_v2\",\n      \"ir\": \"declare <2 x i32> @llvm.umax.v2i32(<2 x i32>, <2 x i32>)\\ndeclare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>)\\n\\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\\n  %a = tail call <2 x i32> @llvm.umax.v2i32(<2 x i32> %x, <2 x i32> <i32 5, i32 100>)\\n  %b = tail call <2 x i32> @llvm.umin.v2i32(<2 x i32> %a, <2 x i32> <i32 9, i32 200>)\\n  %c = icmp eq <2 x i32> %x, %b\\n  ret <2 x i1> %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\\n  %off = add <2 x i32> %x, <i32 -5, i32 -100>\\n  %c = icmp ult <2 x i32> %off, <i32 5, i32 101>\\n  ret <2 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_nonsplat_bounds_s8_eq_v4\",\n      \"ir\": \"declare <4 x i8> @llvm.smax.v4i8(<4 x i8>, <4 x i8>)\\ndeclare <4 x i8> @llvm.smin.v4i8(<4 x i8>, <4 x i8>)\\n\\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\\n  %a = tail call <4 x i8> @llvm.smax.v4i8(<4 x i8> %x, <4 x i8> <i8 -2, i8 -3, i8 -4, i8 -5>)\\n  %b = tail call <4 x i8> @llvm.smin.v4i8(<4 x i8> %a, <4 x i8> <i8 2, i8 3, i8 4, i8 5>)\\n  %c = icmp eq <4 x i8> %x, %b\\n  ret <4 x i1> %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\\n  %off = add <4 x i8> %x, <i8 2, i8 3, i8 4, i8 5>\\n  %c = icmp ult <4 x i8> %off, <i8 5, i8 7, i8 9, i8 11>\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_with_poison_lane_constants_s32_eq_v4\",\n      \"ir\": \"declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\\n\\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -1, i32 poison, i32 -10, i32 0>)\\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 1, i32 poison, i32 10, i32 0>)\\n  %c = icmp eq <4 x i32> %x, %b\\n  ret <4 x i1> %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\\n  %off = add <4 x i32> %x, <i32 1, i32 poison, i32 10, i32 0>\\n  %c = icmp ult <4 x i32> %off, <i32 3, i32 poison, i32 21, i32 1>\\n  ret <4 x i1> %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_s32_eq_commuted_outer_inner_operands\",\n      \"ir\": \"declare i32 @llvm.smax.i32(i32, i32)\\ndeclare i32 @llvm.smin.i32(i32, i32)\\n\\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\\n  %a = tail call i32 @llvm.smax.i32(i32 -20, i32 %x)\\n  %b = tail call i32 @llvm.smin.i32(i32 30, i32 %a)\\n  %c = icmp eq i32 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\\n  %off = add i32 %x, 20\\n  %c = icmp ult i32 %off, 51\\n  ret i1 %c\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_u8_eq_small_range\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.umin.i8(i8, i8)\\n\\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\\n  %a = tail call i8 @llvm.umax.i8(i8 %x, i8 3)\\n  %b = tail call i8 @llvm.umin.i8(i8 %a, i8 6)\\n  %c = icmp eq i8 %x, %b\\n  ret i1 %c\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_u8_eq_small_range(i8 %x) {\\n  %off = add i8 %x, -3\\n  %c = icmp ult i8 %off, 4\\n  ret i1 %c\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Recognize equality/inequality between a value X and its clamped form min(max(X, Lo), Hi) or max(min(X, Hi), Lo), and replace it with an equivalent range test on X.",
+      "match": {
+        "predicates": [
+          "eq",
+          "ne"
+        ],
+        "forms": [
+          "icmp eq/ne Ty X, smin(smax(X, CLo), CHi)",
+          "icmp eq/ne Ty X, smin(CHi, smax(X, CLo))",
+          "icmp eq/ne Ty X, smax(smin(X, CHi), CLo)",
+          "icmp eq/ne Ty X, smax(CLo, smin(X, CHi))",
+          "icmp eq/ne Ty X, umin(umax(X, CLo), CHi)",
+          "icmp eq/ne Ty X, umin(CHi, umax(X, CLo))",
+          "icmp eq/ne Ty X, umax(umin(X, CHi), CLo)",
+          "icmp eq/ne Ty X, umax(CLo, umin(X, CHi))",
+          "icmp eq/ne Ty smin(smax(X, CLo), CHi), X",
+          "icmp eq/ne Ty umin(umax(X, CLo), CHi), X"
+        ],
+        "requirements": [
+          "Lo/Hi are constants or splat constant vectors",
+          "Inner min/max is one-use if required by the implementation strategy",
+          "Clamp kind is consistent: signed with smin/smax, unsigned with umin/umax",
+          "Range is valid: signed Lo < Hi for signed clamp; unsigned Lo < Hi for unsigned clamp",
+          "Type is integer scalar or integer vector"
+        ]
+      },
+      "semantics": {
+        "eq": "X == clamp(X, Lo, Hi) iff X is in the closed interval [Lo, Hi]",
+        "ne": "X != clamp(X, Lo, Hi) iff X is outside [Lo, Hi]"
+      },
+      "canonical_lowering": {
+        "signed": {
+          "eq": "lower to a canonical signed range check, typically via offset-and-unsigned-compare: (X - Lo) u< (Hi - Lo + 1)",
+          "ne": "negation of the above, typically (X - Lo) u>= (Hi - Lo + 1)"
+        },
+        "unsigned": {
+          "eq": "lower to (X - Lo) u< (Hi - Lo + 1), often simplifying further when Lo == 0",
+          "ne": "lower to (X - Lo) u>= (Hi - Lo + 1)"
+        }
+      },
+      "notes": [
+        "The motivating example smin(smax(X, -155), 100) becomes (X + 155) u< 256.",
+        "Equivalent source shapes with commuted compare operands or commuted min/max operands should also match.",
+        "For vector types, perform lane-wise when bounds are constant/splat-compatible.",
+        "If the implementation uses ConstantRange, result may appear as a direct signed compare pair or as canonical add/sub plus icmp ult/uge."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "scalar_s32_eq_motivating_case",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "scalar_s32_ne_motivating_case",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_commuted_icmp",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %m0 = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %m1 = tail call i32 @llvm.smin.i32(i32 %m0, i32 20)\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_direct_source",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_reversed_clamp_order",
+        "ir": "declare i32 @llvm.smin.i32(i32, i32)\ndeclare i32 @llvm.smax.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %a = tail call i32 @llvm.smin.i32(i32 %x, i32 12)\n  %b = tail call i32 @llvm.smax.i32(i32 %a, i32 -7)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_eq_lo_zero",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_ne_lo_zero",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_eq_nonzero_lo",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_ne_nonzero_lo",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s8_eq_full_nontrivial",
+        "ir": "declare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)\n\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %a = tail call i8 @llvm.smax.i8(i8 %x, i8 -5)\n  %b = tail call i8 @llvm.smin.i8(i8 %a, i8 10)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s16_eq",
+        "ir": "declare i16 @llvm.smax.i16(i16, i16)\ndeclare i16 @llvm.smin.i16(i16, i16)\n\ndefine i1 @scalar_s16_eq(i16 %x) {\n  %a = tail call i16 @llvm.smax.i16(i16 %x, i16 -300)\n  %b = tail call i16 @llvm.smin.i16(i16 %a, i16 700)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s16_eq(i16 %x) {\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u16_eq",
+        "ir": "declare i16 @llvm.umax.i16(i16, i16)\ndeclare i16 @llvm.umin.i16(i16, i16)\n\ndefine i1 @scalar_u16_eq(i16 %x) {\n  %a = tail call i16 @llvm.umax.i16(i16 %x, i16 5)\n  %b = tail call i16 @llvm.umin.i16(i16 %a, i16 500)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u16_eq(i16 %x) {\n  %off = add i16 %x, -5\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s64_eq",
+        "ir": "declare i64 @llvm.smax.i64(i64, i64)\ndeclare i64 @llvm.smin.i64(i64, i64)\n\ndefine i1 @scalar_s64_eq(i64 %x) {\n  %a = tail call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %b = tail call i64 @llvm.smin.i64(i64 %a, i64 4095)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s64_eq(i64 %x) {\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u64_eq",
+        "ir": "declare i64 @llvm.umax.i64(i64, i64)\ndeclare i64 @llvm.umin.i64(i64, i64)\n\ndefine i1 @scalar_u64_eq(i64 %x) {\n  %a = tail call i64 @llvm.umax.i64(i64 %x, i64 1024)\n  %b = tail call i64 @llvm.umin.i64(i64 %a, i64 8191)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u64_eq(i64 %x) {\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_upper_at_smax",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 2147483647)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sge i32 %x, -10\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_lower_at_smin",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 123)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_eq_upper_at_umax",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 77)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 4294967295)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u32_eq_lower_at_umin",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 123)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "vector_splat_bounds_s32_eq_v4",
+        "ir": "declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -8, i32 -8, i32 -8, i32 -8>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 7, i32 7, i32 7, i32 7>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c = icmp ult <4 x i32> %off, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_splat_bounds_u16_ne_v8",
+        "ir": "declare <8 x i16> @llvm.umax.v8i16(<8 x i16>, <8 x i16>)\ndeclare <8 x i16> @llvm.umin.v8i16(<8 x i16>, <8 x i16>)\n\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %a = tail call <8 x i16> @llvm.umax.v8i16(<8 x i16> %x, <8 x i16> <i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10>)\n  %b = tail call <8 x i16> @llvm.umin.v8i16(<8 x i16> %a, <8 x i16> <i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20>)\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n",
+        "expected_optimized_ir": "define <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %off = add <8 x i16> %x, <i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10>\n  %c = icmp uge <8 x i16> %off, <i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11>\n  ret <8 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_nonsplat_bounds_u32_eq_v2",
+        "ir": "declare <2 x i32> @llvm.umax.v2i32(<2 x i32>, <2 x i32>)\ndeclare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>)\n\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %a = tail call <2 x i32> @llvm.umax.v2i32(<2 x i32> %x, <2 x i32> <i32 5, i32 100>)\n  %b = tail call <2 x i32> @llvm.umin.v2i32(<2 x i32> %a, <2 x i32> <i32 9, i32 200>)\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %off = add <2 x i32> %x, <i32 -5, i32 -100>\n  %c = icmp ult <2 x i32> %off, <i32 5, i32 101>\n  ret <2 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_nonsplat_bounds_s8_eq_v4",
+        "ir": "declare <4 x i8> @llvm.smax.v4i8(<4 x i8>, <4 x i8>)\ndeclare <4 x i8> @llvm.smin.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %a = tail call <4 x i8> @llvm.smax.v4i8(<4 x i8> %x, <4 x i8> <i8 -2, i8 -3, i8 -4, i8 -5>)\n  %b = tail call <4 x i8> @llvm.smin.v4i8(<4 x i8> %a, <4 x i8> <i8 2, i8 3, i8 4, i8 5>)\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %off = add <4 x i8> %x, <i8 2, i8 3, i8 4, i8 5>\n  %c = icmp ult <4 x i8> %off, <i8 5, i8 7, i8 9, i8 11>\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "vector_with_poison_lane_constants_s32_eq_v4",
+        "ir": "declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -1, i32 poison, i32 -10, i32 0>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 1, i32 poison, i32 10, i32 0>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 1, i32 poison, i32 10, i32 0>\n  %c = icmp ult <4 x i32> %off, <i32 3, i32 poison, i32 21, i32 1>\n  ret <4 x i1> %c\n}\n"
+      },
+      {
+        "name": "scalar_s32_eq_commuted_outer_inner_operands",
+        "ir": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 -20, i32 %x)\n  %b = tail call i32 @llvm.smin.i32(i32 30, i32 %a)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\n"
+      },
+      {
+        "name": "scalar_u8_eq_small_range",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\n\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n  %a = tail call i8 @llvm.umax.i8(i8 %x, i8 3)\n  %b = tail call i8 @llvm.umin.i8(i8 %a, i8 6)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_u8_eq_small_range(i8 %x) {\n  %off = add i8 %x, -3\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_s32_eq_motivating_case",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 5,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n=>\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n=>\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp ult i32 %off, 256\n  ret i1 %cmp\n}\n=>\ndefine i1 @scalar_s32_eq_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp eq i32 %v1, %v3\n  ret i1 %v4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_ne_motivating_case",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 5,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n",
+          "tgt": "define i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n=>\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n=>\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n  %v0 = add i32 %arg1, -60\n  %v1 = add i32 %v0, %arg0\n  %v2 = tail call i32 @llvm.smax.i32(i32 %v1, i32 -155)\n  %v3 = tail call i32 @llvm.smin.i32(i32 %v2, i32 100)\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %off = add i32 %v1, 155\n  %cmp = icmp uge i32 %off, 256\n  ret i1 %cmp\n}\n=>\ndefine i1 @scalar_s32_ne_motivating_case(i32 %arg0, i32 %arg1) {\n#0:\n  %v0 = add i32 %arg1, 4294967236\n  %v1 = add i32 %v0, %arg0\n  %v2 = smax i32 %v1, 4294967141\n  %v3 = smin i32 %v2, 100\n  %v4 = icmp ne i32 %v1, %v3\n  ret i1 %v4\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_commuted_icmp",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %m0 = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %m1 = tail call i32 @llvm.smin.i32(i32 %m0, i32 20)\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %m0 = smax i32 %x, 4294967286\n  %m1 = smin i32 %m0, 20\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %m0 = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %m1 = tail call i32 @llvm.smin.i32(i32 %m0, i32 20)\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %m0 = smax i32 %x, 4294967286\n  %m1 = smin i32 %m0, 20\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n  %m0 = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %m1 = tail call i32 @llvm.smin.i32(i32 %m0, i32 20)\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %off = add i32 %x, 10\n  %c = icmp ult i32 %off, 31\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_icmp(i32 %x) {\n#0:\n  %m0 = smax i32 %x, 4294967286\n  %m1 = smin i32 %m0, 20\n  %c = icmp eq i32 %m1, %x\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_direct_source",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967289\n  %b = smin i32 %a, 12\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967289\n  %b = smin i32 %a, 12\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_direct_source(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967289\n  %b = smin i32 %a, 12\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_reversed_clamp_order",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smin.i32(i32, i32)\ndeclare i32 @llvm.smax.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %a = tail call i32 @llvm.smin.i32(i32 %x, i32 12)\n  %b = tail call i32 @llvm.smax.i32(i32 %a, i32 -7)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %a = smin i32 %x, 12\n  %b = smax i32 %a, 4294967289\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %1 = call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = call i32 @llvm.smin.i32(i32 %1, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %#1 = smax i32 %x, 4294967289\n  %b = smin i32 %#1, 12\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n  %1 = call i32 @llvm.smax.i32(i32 %x, i32 -7)\n  %b = call i32 @llvm.smin.i32(i32 %1, i32 12)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %off = add i32 %x, 7\n  %c = icmp ult i32 %off, 20\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_reversed_clamp_order(i32 %x) {\n#0:\n  %#1 = smax i32 %x, 4294967289\n  %b = smin i32 %#1, 12\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_eq_lo_zero",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %a = umax i32 %x, 0\n  %b = umin i32 %a, 255\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lo_zero(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 256\n  ret i1 %c\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_ne_lo_zero",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 255)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %a = umax i32 %x, 0\n  %b = umin i32 %a, 255\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp ugt i32 %x, 255\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %c = icmp ugt i32 %x, 255\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n  %c = icmp ugt i32 %x, 255\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 256\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_lo_zero(i32 %x) {\n#0:\n  %c = icmp ugt i32 %x, 255\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_eq_nonzero_lo",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp ult i32 %off, 100\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_ne_nonzero_lo",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %off = add i32 %x, -100\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 100)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 199)\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %off = add i32 %x, 4294967196\n  %c = icmp uge i32 %off, 100\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_ne_nonzero_lo(i32 %x) {\n#0:\n  %a = umax i32 %x, 100\n  %b = umin i32 %a, 199\n  %c = icmp ne i32 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s8_eq_full_nontrivial",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.smax.i8(i8, i8)\ndeclare i8 @llvm.smin.i8(i8, i8)\n\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %a = tail call i8 @llvm.smax.i8(i8 %x, i8 -5)\n  %b = tail call i8 @llvm.smin.i8(i8 %a, i8 10)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %a = smax i8 %x, 251\n  %b = smin i8 %a, 10\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %a = tail call i8 @llvm.smax.i8(i8 %x, i8 -5)\n  %b = tail call i8 @llvm.smin.i8(i8 %a, i8 10)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %a = smax i8 %x, 251\n  %b = smin i8 %a, 10\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n  %a = tail call i8 @llvm.smax.i8(i8 %x, i8 -5)\n  %b = tail call i8 @llvm.smin.i8(i8 %a, i8 10)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %off = add i8 %x, 5\n  %c = icmp ult i8 %off, 16\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s8_eq_full_nontrivial(i8 %x) {\n#0:\n  %a = smax i8 %x, 251\n  %b = smin i8 %a, 10\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s16_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i16 @llvm.smax.i16(i16, i16)\ndeclare i16 @llvm.smin.i16(i16, i16)\n\ndefine i1 @scalar_s16_eq(i16 %x) {\n  %a = tail call i16 @llvm.smax.i16(i16 %x, i16 -300)\n  %b = tail call i16 @llvm.smin.i16(i16 %a, i16 700)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s16_eq(i16 %x) {\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %a = smax i16 %x, 65236\n  %b = smin i16 %a, 700\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smax.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\ndefine i1 @scalar_s16_eq(i16 %x) {\n  %a = tail call i16 @llvm.smax.i16(i16 %x, i16 -300)\n  %b = tail call i16 @llvm.smin.i16(i16 %a, i16 700)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s16_eq(i16 %x) {\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %a = smax i16 %x, 65236\n  %b = smin i16 %a, 700\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s16_eq(i16 %x) {\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smax.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\ndefine i1 @scalar_s16_eq(i16 %x) {\n  %a = tail call i16 @llvm.smax.i16(i16 %x, i16 -300)\n  %b = tail call i16 @llvm.smin.i16(i16 %a, i16 700)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 300\n  %c = icmp ult i16 %off, 1001\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s16_eq(i16 %x) {\n#0:\n  %a = smax i16 %x, 65236\n  %b = smin i16 %a, 700\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u16_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i16 @llvm.umax.i16(i16, i16)\ndeclare i16 @llvm.umin.i16(i16, i16)\n\ndefine i1 @scalar_u16_eq(i16 %x) {\n  %a = tail call i16 @llvm.umax.i16(i16 %x, i16 5)\n  %b = tail call i16 @llvm.umin.i16(i16 %a, i16 500)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u16_eq(i16 %x) {\n  %off = add i16 %x, -5\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %a = umax i16 %x, 5\n  %b = umin i16 %a, 500\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 65531\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umax.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umin.i16(i16, i16) #0\n\ndefine i1 @scalar_u16_eq(i16 %x) {\n  %a = tail call i16 @llvm.umax.i16(i16 %x, i16 5)\n  %b = tail call i16 @llvm.umin.i16(i16 %a, i16 500)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u16_eq(i16 %x) {\n  %off = add i16 %x, -5\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %a = umax i16 %x, 5\n  %b = umin i16 %a, 500\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 65531\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u16_eq(i16 %x) {\n  %off = add i16 %x, -5\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umax.i16(i16, i16) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umin.i16(i16, i16) #0\n\ndefine i1 @scalar_u16_eq(i16 %x) {\n  %a = tail call i16 @llvm.umax.i16(i16 %x, i16 5)\n  %b = tail call i16 @llvm.umin.i16(i16 %a, i16 500)\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %off = add i16 %x, 65531\n  %c = icmp ult i16 %off, 496\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u16_eq(i16 %x) {\n#0:\n  %a = umax i16 %x, 5\n  %b = umin i16 %a, 500\n  %c = icmp eq i16 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s64_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i64 @llvm.smax.i64(i64, i64)\ndeclare i64 @llvm.smin.i64(i64, i64)\n\ndefine i1 @scalar_s64_eq(i64 %x) {\n  %a = tail call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %b = tail call i64 @llvm.smin.i64(i64 %a, i64 4095)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s64_eq(i64 %x) {\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %a = smax i64 %x, -1000\n  %b = smin i64 %a, 4095\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i1 @scalar_s64_eq(i64 %x) {\n  %a = tail call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %b = tail call i64 @llvm.smin.i64(i64 %a, i64 4095)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s64_eq(i64 %x) {\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %a = smax i64 %x, -1000\n  %b = smin i64 %a, 4095\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s64_eq(i64 %x) {\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.smin.i64(i64, i64) #0\n\ndefine i1 @scalar_s64_eq(i64 %x) {\n  %a = tail call i64 @llvm.smax.i64(i64 %x, i64 -1000)\n  %b = tail call i64 @llvm.smin.i64(i64 %a, i64 4095)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, 1000\n  %c = icmp ult i64 %off, 5096\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s64_eq(i64 %x) {\n#0:\n  %a = smax i64 %x, -1000\n  %b = smin i64 %a, 4095\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u64_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i64 @llvm.umax.i64(i64, i64)\ndeclare i64 @llvm.umin.i64(i64, i64)\n\ndefine i1 @scalar_u64_eq(i64 %x) {\n  %a = tail call i64 @llvm.umax.i64(i64 %x, i64 1024)\n  %b = tail call i64 @llvm.umin.i64(i64 %a, i64 8191)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u64_eq(i64 %x) {\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %a = umax i64 %x, 1024\n  %b = umin i64 %a, 8191\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i1 @scalar_u64_eq(i64 %x) {\n  %a = tail call i64 @llvm.umax.i64(i64 %x, i64 1024)\n  %b = tail call i64 @llvm.umin.i64(i64 %a, i64 8191)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u64_eq(i64 %x) {\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %a = umax i64 %x, 1024\n  %b = umin i64 %a, 8191\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u64_eq(i64 %x) {\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\ndefine i1 @scalar_u64_eq(i64 %x) {\n  %a = tail call i64 @llvm.umax.i64(i64 %x, i64 1024)\n  %b = tail call i64 @llvm.umin.i64(i64 %a, i64 8191)\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %off = add i64 %x, -1024\n  %c = icmp ult i64 %off, 7168\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u64_eq(i64 %x) {\n#0:\n  %a = umax i64 %x, 1024\n  %b = umin i64 %a, 8191\n  %c = icmp eq i64 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_upper_at_smax",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -10)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 2147483647)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sge i32 %x, -10\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967286\n  %b = smin i32 %a, 2147483647\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %c = icmp sge i32 %x, 4294967286\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sgt i32 %x, -11\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sge i32 %x, -10\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %c = icmp sgt i32 %x, 4294967285\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %c = icmp sge i32 %x, 4294967286\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sge i32 %x, -10\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n  %c = icmp sgt i32 %x, -11\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %c = icmp sge i32 %x, 4294967286\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_upper_at_smax(i32 %x) {\n#0:\n  %c = icmp sgt i32 %x, 4294967285\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_lower_at_smin",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -2147483648)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 123)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %a = smax i32 %x, 2147483648\n  %b = smin i32 %a, 123\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp slt i32 %x, 124\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %c = icmp slt i32 %x, 124\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n  %c = icmp slt i32 %x, 124\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %c = icmp sle i32 %x, 123\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_lower_at_smin(i32 %x) {\n#0:\n  %c = icmp slt i32 %x, 124\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_eq_upper_at_umax",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 77)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 4294967295)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %a = umax i32 %x, 77\n  %b = umin i32 %a, 4294967295\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp ugt i32 %x, 76\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %c = icmp ugt i32 %x, 76\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n  %c = icmp ugt i32 %x, 76\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %c = icmp uge i32 %x, 77\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_upper_at_umax(i32 %x) {\n#0:\n  %c = icmp ugt i32 %x, 76\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u32_eq_lower_at_umin",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.umin.i32(i32, i32)\n\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %a = tail call i32 @llvm.umax.i32(i32 %x, i32 0)\n  %b = tail call i32 @llvm.umin.i32(i32 %a, i32 123)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %a = umax i32 %x, 0\n  %b = umin i32 %a, 123\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ult i32 %x, 124\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 124\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n  %c = icmp ult i32 %x, 124\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %c = icmp ule i32 %x, 123\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u32_eq_lower_at_umin(i32 %x) {\n#0:\n  %c = icmp ult i32 %x, 124\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_splat_bounds_s32_eq_v4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -8, i32 -8, i32 -8, i32 -8>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 7, i32 7, i32 7, i32 7>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n",
+          "tgt": "define <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c = icmp ult <4 x i32> %off, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %b = smin <4 x i32> %a, { 7, 7, 7, 7 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 8, 8, 8, 8 }\n  %c = icmp ult <4 x i32> %off, { 16, 16, 16, 16 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> splat (i32 -8))\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> splat (i32 7))\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c = icmp ult <4 x i32> %off, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %b = smin <4 x i32> %a, { 7, 7, 7, 7 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 8, 8, 8, 8 }\n  %c = icmp ult <4 x i32> %off, { 16, 16, 16, 16 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c = icmp ult <4 x i32> %off, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> splat (i32 -8))\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> splat (i32 7))\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 8, 8, 8, 8 }\n  %c = icmp ult <4 x i32> %off, { 16, 16, 16, 16 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_splat_bounds_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967288, 4294967288, 4294967288, 4294967288 }\n  %b = smin <4 x i32> %a, { 7, 7, 7, 7 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_splat_bounds_u16_ne_v8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <8 x i16> @llvm.umax.v8i16(<8 x i16>, <8 x i16>)\ndeclare <8 x i16> @llvm.umin.v8i16(<8 x i16>, <8 x i16>)\n\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %a = tail call <8 x i16> @llvm.umax.v8i16(<8 x i16> %x, <8 x i16> <i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10, i16 10>)\n  %b = tail call <8 x i16> @llvm.umin.v8i16(<8 x i16> %a, <8 x i16> <i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20, i16 20>)\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n",
+          "tgt": "define <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %off = add <8 x i16> %x, <i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10>\n  %c = icmp uge <8 x i16> %off, <i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11>\n  ret <8 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %a = umax <8 x i16> %x, { 10, 10, 10, 10, 10, 10, 10, 10 }\n  %b = umin <8 x i16> %a, { 20, 20, 20, 20, 20, 20, 20, 20 }\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n=>\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %off = add <8 x i16> %x, { 65526, 65526, 65526, 65526, 65526, 65526, 65526, 65526 }\n  %c = icmp uge <8 x i16> %off, { 11, 11, 11, 11, 11, 11, 11, 11 }\n  ret <8 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <8 x i16> @llvm.umax.v8i16(<8 x i16>, <8 x i16>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <8 x i16> @llvm.umin.v8i16(<8 x i16>, <8 x i16>) #0\n\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %a = tail call <8 x i16> @llvm.umax.v8i16(<8 x i16> %x, <8 x i16> splat (i16 10))\n  %b = tail call <8 x i16> @llvm.umin.v8i16(<8 x i16> %a, <8 x i16> splat (i16 20))\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %off = add <8 x i16> %x, <i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10>\n  %c = icmp uge <8 x i16> %off, <i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11>\n  ret <8 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %a = umax <8 x i16> %x, { 10, 10, 10, 10, 10, 10, 10, 10 }\n  %b = umin <8 x i16> %a, { 20, 20, 20, 20, 20, 20, 20, 20 }\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n=>\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %off = add <8 x i16> %x, { 65526, 65526, 65526, 65526, 65526, 65526, 65526, 65526 }\n  %c = icmp uge <8 x i16> %off, { 11, 11, 11, 11, 11, 11, 11, 11 }\n  ret <8 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %off = add <8 x i16> %x, <i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10, i16 -10>\n  %c = icmp uge <8 x i16> %off, <i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11, i16 11>\n  ret <8 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <8 x i16> @llvm.umax.v8i16(<8 x i16>, <8 x i16>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <8 x i16> @llvm.umin.v8i16(<8 x i16>, <8 x i16>) #0\n\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n  %a = tail call <8 x i16> @llvm.umax.v8i16(<8 x i16> %x, <8 x i16> splat (i16 10))\n  %b = tail call <8 x i16> @llvm.umin.v8i16(<8 x i16> %a, <8 x i16> splat (i16 20))\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %off = add <8 x i16> %x, { 65526, 65526, 65526, 65526, 65526, 65526, 65526, 65526 }\n  %c = icmp uge <8 x i16> %off, { 11, 11, 11, 11, 11, 11, 11, 11 }\n  ret <8 x i1> %c\n}\n=>\ndefine <8 x i1> @vector_splat_bounds_u16_ne_v8(<8 x i16> %x) {\n#0:\n  %a = umax <8 x i16> %x, { 10, 10, 10, 10, 10, 10, 10, 10 }\n  %b = umin <8 x i16> %a, { 20, 20, 20, 20, 20, 20, 20, 20 }\n  %c = icmp ne <8 x i16> %x, %b\n  ret <8 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_nonsplat_bounds_u32_eq_v2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <2 x i32> @llvm.umax.v2i32(<2 x i32>, <2 x i32>)\ndeclare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>)\n\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %a = tail call <2 x i32> @llvm.umax.v2i32(<2 x i32> %x, <2 x i32> <i32 5, i32 100>)\n  %b = tail call <2 x i32> @llvm.umin.v2i32(<2 x i32> %a, <2 x i32> <i32 9, i32 200>)\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n",
+          "tgt": "define <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %off = add <2 x i32> %x, <i32 -5, i32 -100>\n  %c = icmp ult <2 x i32> %off, <i32 5, i32 101>\n  ret <2 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %a = umax <2 x i32> %x, { 5, 100 }\n  %b = umin <2 x i32> %a, { 9, 200 }\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %off = add <2 x i32> %x, { 4294967291, 4294967196 }\n  %c = icmp ult <2 x i32> %off, { 5, 101 }\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i32> @llvm.umax.v2i32(<2 x i32>, <2 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>) #0\n\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %a = tail call <2 x i32> @llvm.umax.v2i32(<2 x i32> %x, <2 x i32> <i32 5, i32 100>)\n  %b = tail call <2 x i32> @llvm.umin.v2i32(<2 x i32> %a, <2 x i32> <i32 9, i32 200>)\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %off = add <2 x i32> %x, <i32 -5, i32 -100>\n  %c = icmp ult <2 x i32> %off, <i32 5, i32 101>\n  ret <2 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %a = umax <2 x i32> %x, { 5, 100 }\n  %b = umin <2 x i32> %a, { 9, 200 }\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %off = add <2 x i32> %x, { 4294967291, 4294967196 }\n  %c = icmp ult <2 x i32> %off, { 5, 101 }\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %off = add <2 x i32> %x, <i32 -5, i32 -100>\n  %c = icmp ult <2 x i32> %off, <i32 5, i32 101>\n  ret <2 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i32> @llvm.umax.v2i32(<2 x i32>, <2 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>) #0\n\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n  %a = tail call <2 x i32> @llvm.umax.v2i32(<2 x i32> %x, <2 x i32> <i32 5, i32 100>)\n  %b = tail call <2 x i32> @llvm.umin.v2i32(<2 x i32> %a, <2 x i32> <i32 9, i32 200>)\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %off = add <2 x i32> %x, { 4294967291, 4294967196 }\n  %c = icmp ult <2 x i32> %off, { 5, 101 }\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_nonsplat_bounds_u32_eq_v2(<2 x i32> %x) {\n#0:\n  %a = umax <2 x i32> %x, { 5, 100 }\n  %b = umin <2 x i32> %a, { 9, 200 }\n  %c = icmp eq <2 x i32> %x, %b\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_nonsplat_bounds_s8_eq_v4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <4 x i8> @llvm.smax.v4i8(<4 x i8>, <4 x i8>)\ndeclare <4 x i8> @llvm.smin.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %a = tail call <4 x i8> @llvm.smax.v4i8(<4 x i8> %x, <4 x i8> <i8 -2, i8 -3, i8 -4, i8 -5>)\n  %b = tail call <4 x i8> @llvm.smin.v4i8(<4 x i8> %a, <4 x i8> <i8 2, i8 3, i8 4, i8 5>)\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n",
+          "tgt": "define <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %off = add <4 x i8> %x, <i8 2, i8 3, i8 4, i8 5>\n  %c = icmp ult <4 x i8> %off, <i8 5, i8 7, i8 9, i8 11>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %a = smax <4 x i8> %x, { 254, 253, 252, 251 }\n  %b = smin <4 x i8> %a, { 2, 3, 4, 5 }\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %off = add <4 x i8> %x, { 2, 3, 4, 5 }\n  %c = icmp ult <4 x i8> %off, { 5, 7, 9, 11 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.smax.v4i8(<4 x i8>, <4 x i8>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.smin.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %a = tail call <4 x i8> @llvm.smax.v4i8(<4 x i8> %x, <4 x i8> <i8 -2, i8 -3, i8 -4, i8 -5>)\n  %b = tail call <4 x i8> @llvm.smin.v4i8(<4 x i8> %a, <4 x i8> <i8 2, i8 3, i8 4, i8 5>)\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %off = add <4 x i8> %x, <i8 2, i8 3, i8 4, i8 5>\n  %c = icmp ult <4 x i8> %off, <i8 5, i8 7, i8 9, i8 11>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %a = smax <4 x i8> %x, { 254, 253, 252, 251 }\n  %b = smin <4 x i8> %a, { 2, 3, 4, 5 }\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %off = add <4 x i8> %x, { 2, 3, 4, 5 }\n  %c = icmp ult <4 x i8> %off, { 5, 7, 9, 11 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %off = add <4 x i8> %x, <i8 2, i8 3, i8 4, i8 5>\n  %c = icmp ult <4 x i8> %off, <i8 5, i8 7, i8 9, i8 11>\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.smax.v4i8(<4 x i8>, <4 x i8>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.smin.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n  %a = tail call <4 x i8> @llvm.smax.v4i8(<4 x i8> %x, <4 x i8> <i8 -2, i8 -3, i8 -4, i8 -5>)\n  %b = tail call <4 x i8> @llvm.smin.v4i8(<4 x i8> %a, <4 x i8> <i8 2, i8 3, i8 4, i8 5>)\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %off = add <4 x i8> %x, { 2, 3, 4, 5 }\n  %c = icmp ult <4 x i8> %off, { 5, 7, 9, 11 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_nonsplat_bounds_s8_eq_v4(<4 x i8> %x) {\n#0:\n  %a = smax <4 x i8> %x, { 254, 253, 252, 251 }\n  %b = smin <4 x i8> %a, { 2, 3, 4, 5 }\n  %c = icmp eq <4 x i8> %x, %b\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_with_poison_lane_constants_s32_eq_v4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -1, i32 poison, i32 -10, i32 0>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 1, i32 poison, i32 10, i32 0>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n",
+          "tgt": "define <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 1, i32 poison, i32 10, i32 0>\n  %c = icmp ult <4 x i32> %off, <i32 3, i32 poison, i32 21, i32 1>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967295, poison, 4294967286, 0 }\n  %b = smin <4 x i32> %a, { 1, poison, 10, 0 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 1, poison, 10, 0 }\n  %c = icmp ult <4 x i32> %off, { 3, poison, 21, 1 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -1, i32 poison, i32 -10, i32 0>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 1, i32 poison, i32 10, i32 0>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 1, i32 poison, i32 10, i32 0>\n  %c = icmp ult <4 x i32> %off, <i32 3, i32 poison, i32 21, i32 1>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967295, poison, 4294967286, 0 }\n  %b = smin <4 x i32> %a, { 1, poison, 10, 0 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 1, poison, 10, 0 }\n  %c = icmp ult <4 x i32> %off, { 3, poison, 21, 1 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %off = add <4 x i32> %x, <i32 1, i32 poison, i32 10, i32 0>\n  %c = icmp ult <4 x i32> %off, <i32 3, i32 poison, i32 21, i32 1>\n  ret <4 x i1> %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smin.v4i32(<4 x i32>, <4 x i32>) #0\n\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n  %a = tail call <4 x i32> @llvm.smax.v4i32(<4 x i32> %x, <4 x i32> <i32 -1, i32 poison, i32 -10, i32 0>)\n  %b = tail call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> <i32 1, i32 poison, i32 10, i32 0>)\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %off = add <4 x i32> %x, { 1, poison, 10, 0 }\n  %c = icmp ult <4 x i32> %off, { 3, poison, 21, 1 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_with_poison_lane_constants_s32_eq_v4(<4 x i32> %x) {\n#0:\n  %a = smax <4 x i32> %x, { 4294967295, poison, 4294967286, 0 }\n  %b = smin <4 x i32> %a, { 1, poison, 10, 0 }\n  %c = icmp eq <4 x i32> %x, %b\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_s32_eq_commuted_outer_inner_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.smax.i32(i32, i32)\ndeclare i32 @llvm.smin.i32(i32, i32)\n\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 -20, i32 %x)\n  %b = tail call i32 @llvm.smin.i32(i32 30, i32 %a)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %a = smax i32 4294967276, %x\n  %b = smin i32 30, %a\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -20)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 30)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967276\n  %b = smin i32 %a, 30\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n  %a = tail call i32 @llvm.smax.i32(i32 %x, i32 -20)\n  %b = tail call i32 @llvm.smin.i32(i32 %a, i32 30)\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %off = add i32 %x, 20\n  %c = icmp ult i32 %off, 51\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_s32_eq_commuted_outer_inner_operands(i32 %x) {\n#0:\n  %a = smax i32 %x, 4294967276\n  %b = smin i32 %a, 30\n  %c = icmp eq i32 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_u8_eq_small_range",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\n\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n  %a = tail call i8 @llvm.umax.i8(i8 %x, i8 3)\n  %b = tail call i8 @llvm.umin.i8(i8 %a, i8 6)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @scalar_u8_eq_small_range(i8 %x) {\n  %off = add i8 %x, -3\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %a = umax i8 %x, 3\n  %b = umin i8 %a, 6\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %off = add i8 %x, 253\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n  %a = tail call i8 @llvm.umax.i8(i8 %x, i8 3)\n  %b = tail call i8 @llvm.umin.i8(i8 %a, i8 6)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_u8_eq_small_range(i8 %x) {\n  %off = add i8 %x, -3\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %a = umax i8 %x, 3\n  %b = umin i8 %a, 6\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %off = add i8 %x, 253\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_u8_eq_small_range(i8 %x) {\n  %off = add i8 %x, -3\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n  %a = tail call i8 @llvm.umax.i8(i8 %x, i8 3)\n  %b = tail call i8 @llvm.umin.i8(i8 %a, i8 6)\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %off = add i8 %x, 253\n  %c = icmp ult i8 %off, 4\n  ret i1 %c\n}\n=>\ndefine i1 @scalar_u8_eq_small_range(i8 %x) {\n#0:\n  %a = umax i8 %x, 3\n  %b = umin i8 %a, 6\n  %c = icmp eq i8 %x, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

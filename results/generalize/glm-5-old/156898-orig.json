@@ -1,0 +1,449 @@
+{
+  "issue_id": "156898-orig",
+  "dataset_file": "156898-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n\ndefine i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Truncating the result of a logical (or arithmetic) right shift of a power-of-two constant to i1 is equivalent to checking if the shift amount equals the log2 of the constant. This optimization simplifies bit-extraction patterns into equality comparisons.\",\n  \"before_after\": \"trunc (lshr C, V) to i1  -->  icmp eq V, log2(C) (where C is a power of 2)\",\n  \"preconditions\": [\n    \"The source of the truncation must be a binary operator (lshr or ashr) of a constant and a variable.\",\n    \"The constant (C) must be a power of 2 (population count == 1).\",\n    \"The truncation destination type must be i1 (extracting the LSB).\",\n    \"If the operator is ashr, the constant C must be positive (or treated as unsigned equivalent) to ensure the sign bit doesn't interfere with the LSB logic for shift amounts > log2(C). Note: For powers of 2, ashr and lshr behave identically with respect to the LSB result.\",\n    \"The shift amount V and constant C must have the same type (standard shift requirement).\"\n  ],\n  \"pattern\": \"Match a `trunc` instruction to `i1` where the operand is a `lshr` (or `ashr`). The first operand of the shift must be a `ConstantInt` `C`. Check if `C` is a power of two. If so, compute `K = log2(C)`. Replace the sequence with `icmp eq V, K`.\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_Example_i8\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 4, %x\\n  %trunc = trunc i8 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %cmp = icmp eq i8 %x, 2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Basic case: 4 is 1<<2. Checking if bit 2 moves to position 0.\"\n    },\n    {\n      \"name\": \"i32_PowerOfTwo\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %lshr = lshr i32 1024, %x\\n  %trunc = trunc i32 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp eq i32 %x, 10\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Standard 32-bit integer. 1024 is 1<<10.\"\n    },\n    {\n      \"name\": \"Vector_Basic\",\n      \"ir\": \"define <2 x i1> @test(<2 x i8> %x) {\\n  %lshr = lshr <2 x i8> <i8 4, i8 16>, %x\\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\\n  ret <2 x i1> %trunc\\n}\",\n      \"expected_optimized_ir\": \"define <2 x i1> @test(<2 x i8> %x) {\\n  %cmp = icmp eq <2 x i8> %x, <i8 2, i8 4>\\n  ret <2 x i1> %cmp\\n}\",\n      \"why\": \"Vector equivalence. Elements 4 (1<<2) and 16 (1<<4).\"\n    },\n    {\n      \"name\": \"ASHR_Equivalent\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %ashr = ashr i8 32, %x\\n  %trunc = trunc i8 %ashr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %cmp = icmp eq i8 %x, 5\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Arithmetic shift right of a positive power-of-two behaves identically to logical shift right regarding the LSB.\"\n    },\n    {\n      \"name\": \"AND_Instead_Of_Trunc\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 8, %x\\n  %and = and i8 %lshr, 1\\n  ret i8 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %cmp = icmp eq i8 %x, 3\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Structural variant: `and X, 1` is semantically identical to `trunc X to i1` for extracting LSB.\"\n    },\n    {\n      \"name\": \"Shift_By_Zero_Const\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 1, %x\\n  %trunc = trunc i8 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %cmp = icmp eq i8 %x, 0\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Boundary case: Constant is 1 (1<<0). Result is 1 only if shifted by 0.\"\n    },\n    {\n      \"name\": \"Zero_Constant\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 0, %x\\n  %trunc = trunc i8 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  ret i1 false\\n}\",\n      \"why\": \"Boundary case: Constant is 0. Log2(0) is undefined, but result is always 0.\"\n    },\n    {\n      \"name\": \"Non_Power_Of_Two_No_Fold\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 6, %x\\n  %trunc = trunc i8 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %lshr = lshr i8 6, %x\\n  %trunc = trunc i8 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"why\": \"Negative case: 6 is not a power of 2. The result depends on multiple bits (1 and 2), cannot be single equality check.\"\n    },\n    {\n      \"name\": \"Trunc_To_i2_No_Fold\",\n      \"ir\": \"define i2 @test(i8 %x) {\\n  %lshr = lshr i8 4, %x\\n  %trunc = trunc i8 %lshr to i2\\n  ret i2 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i2 @test(i8 %x) {\\n  %lshr = lshr i8 4, %x\\n  %trunc = trunc i8 %lshr to i2\\n  ret i2 %trunc\\n}\",\n      \"why\": \"Negative case: Truncating to i2 extracts bits 0 and 1. The optimization only targets i1.\"\n    },\n    {\n      \"name\": \"Shift_Amount_Zext\",\n      \"ir\": \"define i1 @test(i8 %x) {\\n  %zext = zext i8 %x to i32\\n  %lshr = lshr i32 16, %zext\\n  %trunc = trunc i32 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %x) {\\n  %cmp = icmp eq i8 %x, 4\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Context variation: Shift amount is zero-extended. The comparison constant (4) fits in i8, allowing the fold to propagate back.\"\n    },\n    {\n      \"name\": \"Max_Bitwidth_i64\",\n      \"ir\": \"define i1 @test(i64 %x) {\\n  %lshr = lshr i64 9223372036854775808, %x\\n  %trunc = trunc i64 %lshr to i1\\n  ret i1 %trunc\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  %cmp = icmp eq i64 %x, 63\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Boundary case: i64, shifting the sign bit (1<<63).\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstructionCombining::visitTrunc (or a helper called by it).\",\n    \"logic\": \"1. Check if `SrcTy` is integer and `DestTy` is i1. 2. Check if `SrcOp` is `LShr` or `AShr`. 3. Check if `Op0` of shift is `ConstantInt` `C`. 4. Check if `C` is exactly a power of 2. 5. If `C == 0`, return `ConstantInt::getFalse`. 6. Calculate `K = C->logBase2()`. 7. Return `new ICmpInst(ICmpInst::ICMP_EQ, Shift->getOperand(1), ConstantInt::get(Shift->getType(), K))`.\",\n    \"pitfalls\": [\n      \"Ensure the shift amount operand type matches the constant type before creating the ICmp.\",\n      \"Handle the `C == 0` case separately to avoid log2(0).\",\n      \"For `AShr`, ensure `C` is positive. If `C` is negative (e.g., `INT_MIN`), `ASHR` fills with 1s. `trunc` to i1 checks LSB. `ashr(INT_MIN, K)`. If `K=bitwidth-1`, result is -1 (LSB 1). If `K>bitwidth-1`, result is -1 (LSB 1). This behaves differently than `lshr` for large shifts. However, shifts >= bitwidth are UB. So for defined behavior (`K < BW`), `ashr(INT_MIN, K)` is negative (even) for `K < BW-1` (LSB 0), and -1 (LSB 1) for `K = BW-1`. So `ashr` works for `INT_MIN` too.\",\n      \"Beware of `nsw`/`nuw` flags on the shift if they were to exist (though shifts don't usually carry them in a way that breaks this logic).\"\n    ]\n  },\n  \"regression_test_notes\": \"Use `opt -instcombine -S`. Verify that the `lshr` and `trunc` instructions are replaced by an `icmp`. Check that vectors are handled element-wise. Ensure that non-power-of-two constants remain unchanged.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Truncating the result of a logical (or arithmetic) right shift of a power-of-two constant to i1 is equivalent to checking if the shift amount equals the log2 of the constant. This optimization simplifies bit-extraction patterns into equality comparisons.",
+    "before_after": "trunc (lshr C, V) to i1  -->  icmp eq V, log2(C) (where C is a power of 2)",
+    "preconditions": [
+      "The source of the truncation must be a binary operator (lshr or ashr) of a constant and a variable.",
+      "The constant (C) must be a power of 2 (population count == 1).",
+      "The truncation destination type must be i1 (extracting the LSB).",
+      "If the operator is ashr, the constant C must be positive (or treated as unsigned equivalent) to ensure the sign bit doesn't interfere with the LSB logic for shift amounts > log2(C). Note: For powers of 2, ashr and lshr behave identically with respect to the LSB result.",
+      "The shift amount V and constant C must have the same type (standard shift requirement)."
+    ],
+    "pattern": "Match a `trunc` instruction to `i1` where the operand is a `lshr` (or `ashr`). The first operand of the shift must be a `ConstantInt` `C`. Check if `C` is a power of two. If so, compute `K = log2(C)`. Replace the sequence with `icmp eq V, K`.",
+    "testcases": [
+      {
+        "name": "Original_Example_i8",
+        "ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}",
+        "why": "Basic case: 4 is 1<<2. Checking if bit 2 moves to position 0."
+      },
+      {
+        "name": "i32_PowerOfTwo",
+        "ir": "define i1 @test(i32 %x) {\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}",
+        "why": "Standard 32-bit integer. 1024 is 1<<10."
+      },
+      {
+        "name": "Vector_Basic",
+        "ir": "define <2 x i1> @test(<2 x i8> %x) {\n  %lshr = lshr <2 x i8> <i8 4, i8 16>, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}",
+        "expected_optimized_ir": "define <2 x i1> @test(<2 x i8> %x) {\n  %cmp = icmp eq <2 x i8> %x, <i8 2, i8 4>\n  ret <2 x i1> %cmp\n}",
+        "why": "Vector equivalence. Elements 4 (1<<2) and 16 (1<<4)."
+      },
+      {
+        "name": "ASHR_Equivalent",
+        "ir": "define i1 @test(i8 %x) {\n  %ashr = ashr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}",
+        "why": "Arithmetic shift right of a positive power-of-two behaves identically to logical shift right regarding the LSB."
+      },
+      {
+        "name": "AND_Instead_Of_Trunc",
+        "ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 8, %x\n  %and = and i8 %lshr, 1\n  ret i8 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 3\n  ret i1 %cmp\n}",
+        "why": "Structural variant: `and X, 1` is semantically identical to `trunc X to i1` for extracting LSB."
+      },
+      {
+        "name": "Shift_By_Zero_Const",
+        "ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 1, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}",
+        "why": "Boundary case: Constant is 1 (1<<0). Result is 1 only if shifted by 0."
+      },
+      {
+        "name": "Zero_Constant",
+        "ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 0, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  ret i1 false\n}",
+        "why": "Boundary case: Constant is 0. Log2(0) is undefined, but result is always 0."
+      },
+      {
+        "name": "Non_Power_Of_Two_No_Fold",
+        "ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+        "why": "Negative case: 6 is not a power of 2. The result depends on multiple bits (1 and 2), cannot be single equality check."
+      },
+      {
+        "name": "Trunc_To_i2_No_Fold",
+        "ir": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+        "expected_optimized_ir": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+        "why": "Negative case: Truncating to i2 extracts bits 0 and 1. The optimization only targets i1."
+      },
+      {
+        "name": "Shift_Amount_Zext",
+        "ir": "define i1 @test(i8 %x) {\n  %zext = zext i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}",
+        "why": "Context variation: Shift amount is zero-extended. The comparison constant (4) fits in i8, allowing the fold to propagate back."
+      },
+      {
+        "name": "Max_Bitwidth_i64",
+        "ir": "define i1 @test(i64 %x) {\n  %lshr = lshr i64 9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}",
+        "why": "Boundary case: i64, shifting the sign bit (1<<63)."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstructionCombining::visitTrunc (or a helper called by it).",
+      "logic": "1. Check if `SrcTy` is integer and `DestTy` is i1. 2. Check if `SrcOp` is `LShr` or `AShr`. 3. Check if `Op0` of shift is `ConstantInt` `C`. 4. Check if `C` is exactly a power of 2. 5. If `C == 0`, return `ConstantInt::getFalse`. 6. Calculate `K = C->logBase2()`. 7. Return `new ICmpInst(ICmpInst::ICMP_EQ, Shift->getOperand(1), ConstantInt::get(Shift->getType(), K))`.",
+      "pitfalls": [
+        "Ensure the shift amount operand type matches the constant type before creating the ICmp.",
+        "Handle the `C == 0` case separately to avoid log2(0).",
+        "For `AShr`, ensure `C` is positive. If `C` is negative (e.g., `INT_MIN`), `ASHR` fills with 1s. `trunc` to i1 checks LSB. `ashr(INT_MIN, K)`. If `K=bitwidth-1`, result is -1 (LSB 1). If `K>bitwidth-1`, result is -1 (LSB 1). This behaves differently than `lshr` for large shifts. However, shifts >= bitwidth are UB. So for defined behavior (`K < BW`), `ashr(INT_MIN, K)` is negative (even) for `K < BW-1` (LSB 0), and -1 (LSB 1) for `K = BW-1`. So `ashr` works for `INT_MIN` too.",
+        "Beware of `nsw`/`nuw` flags on the shift if they were to exist (though shifts don't usually carry them in a way that breaks this logic)."
+      ]
+    },
+    "regression_test_notes": "Use `opt -instcombine -S`. Verify that the `lshr` and `trunc` instructions are replaced by an `icmp`. Check that vectors are handled element-wise. Ensure that non-power-of-two constants remain unchanged.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "Original_Example_i8",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %lshr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_PowerOfTwo",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp eq i32 %x, 10\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %lshr = lshr i32 1024, %x\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #x00000020 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %lshr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector_Basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @test(<2 x i8> %x) {\n  %lshr = lshr <2 x i8> <i8 4, i8 16>, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}",
+          "tgt": "define <2 x i1> @test(<2 x i8> %x) {\n  %cmp = icmp eq <2 x i8> %x, <i8 2, i8 4>\n  ret <2 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %lshr = lshr <2 x i8> { 4, 16 }, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %cmp = icmp eq <2 x i8> %x, { 2, 4 }\n  ret <2 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i8> %x) {\n  %lshr = lshr <2 x i8> <i8 4, i8 16>, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}\n",
+          "tgt": "define <2 x i1> @test(<2 x i8> %x) {\n  %cmp = icmp eq <2 x i8> %x, <i8 2, i8 4>\n  ret <2 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %lshr = lshr <2 x i8> { 4, 16 }, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %cmp = icmp eq <2 x i8> %x, { 2, 4 }\n  ret <2 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @test(<2 x i8> %x) {\n  %cmp = icmp eq <2 x i8> %x, <i8 2, i8 4>\n  ret <2 x i1> %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i8> %x) {\n  %lshr = lshr <2 x i8> <i8 4, i8 16>, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %cmp = icmp eq <2 x i8> %x, { 2, 4 }\n  ret <2 x i1> %cmp\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x) {\n#0:\n  %lshr = lshr <2 x i8> { 4, 16 }, %x\n  %trunc = trunc <2 x i8> %lshr to <2 x i1>\n  ret <2 x i1> %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<2 x i8> %x = < #x00 (0), #x08 (8) >\n\nSource:\n<2 x i1> %cmp = < #x0 (0), #x0 (0) >\n\nTarget:\n<2 x i8> %lshr = < #x04 (4), poison >\n<2 x i1> %trunc = < #x0 (0), poison >\nSource value: < #x0 (0), #x0 (0) >\nTarget value: < #x0 (0), poison >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ASHR_Equivalent",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %ashr = ashr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %ashr = ashr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %ashr = lshr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %ashr = lshr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %ashr = lshr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %ashr = lshr i8 32, %x\n  %trunc = trunc i8 %ashr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %ashr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "AND_Instead_Of_Trunc",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "Shift_By_Zero_Const",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 1, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 1, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 1, %x\n  %trunc = trunc nuw i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 1, %x\n  %trunc = trunc nuw i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 1, %x\n  %trunc = trunc nuw i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 1, %x\n  %trunc = trunc nuw i8 %lshr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x08 (8)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni8 %lshr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Zero_Constant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 0, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 0, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Non_Power_Of_Two_No_Fold",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 6, %x\n  %trunc = trunc i8 %lshr to i1\n  ret i1 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Trunc_To_i2_No_Fold",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+          "tgt": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+          "log": "\n----------------------------------------\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\n=>\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\n",
+          "tgt": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+          "log": "\n----------------------------------------\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\n=>\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i2 @test(i8 %x) {\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\n=>\ndefine i2 @test(i8 %x) {\n#0:\n  %lshr = lshr i8 4, %x\n  %trunc = trunc i8 %lshr to i2\n  ret i2 %trunc\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Shift_Amount_Zext",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %x) {\n  %zext = zext i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %zext = zext i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %zext = zext nneg i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %zext = zext nneg i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %x) {\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %x) {\n  %zext = zext nneg i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %x) {\n#0:\n  %cmp = icmp eq i8 %x, 4\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %x) {\n#0:\n  %zext = zext nneg i8 %x to i32\n  %lshr = lshr i32 16, %zext\n  %trunc = trunc i32 %lshr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x20 (32)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni32 %zext = #x00000020 (32)\ni32 %lshr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Max_Bitwidth_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  %lshr = lshr i64 9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %lshr = lshr i64 -9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\n  %lshr = lshr exact i64 -9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "tgt": "define i1 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %lshr = lshr exact i64 -9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\n  %lshr = lshr exact i64 -9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp eq i64 %x, 63\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %lshr = lshr exact i64 -9223372036854775808, %x\n  %trunc = trunc i64 %lshr to i1\n  ret i1 %trunc\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni64 %x = #x0000000000000040 (64)\n\nSource:\ni1 %cmp = #x0 (0)\n\nTarget:\ni64 %lshr = poison\ni1 %trunc = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,341 @@
+{
+  "issue_id": "142593",
+  "dataset_file": "142593.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @not_d_allSignBits(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n\ndefine i32 @not_d_allSignBits(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine fails to recognize a specific idiom where a 'select' is implemented using an arithmetic shift-right mask (to generate 0 or -1), combined with bitwise AND/OR/XOR logic. Specifically, the pattern `(T & Mask) | (~(Mask | F))` where `Mask = ashr Cond, 31` simplifies to `select (Cond < 0) T, ~F`.\",\n  \"before_after\": {\n    \"before\": \"%mask = ashr i32 %cond, 31\\n%t = and i32 %tval, %mask\\n%f = xor i32 (or i32 %mask, %fval), -1\\n%r = or i32 %t, %f\",\n    \"after\": \"%cmp = icmp slt i32 %cond, 0\\n%inv_f = xor i32 %fval, -1\\n%r = select i1 %cmp, i32 %tval, i32 %inv_f\"\n  },\n  \"preconditions\": [\n    \"The mask generation must be `ashr X, (BitWidth - 1)`. This guarantees the mask is either 0 (all bits zero) or -1 (all bits one).\",\n    \"The 'True' path must be `and(Value, Mask)`.\",\n    \"The 'False' path must be `not(or(Mask, Value))` (implemented as `xor (or Mask, Val), -1`).\",\n    \"The merge operation must be `or` (or `xor`, given the disjoint nature of the results).\",\n    \"The rewrite is valid for vectors and scalars.\",\n    \"No `nsw`/`nuw` flags are required on the arithmetic shift for this specific bitwise logic, as `ashr` by bitwidth-1 is well-defined.\"\n  ],\n  \"pattern\": \"Let `BW` be the bitwidth of the integer type.\\nLet `M = ashr %Cond, BW-1`. (M is 0 if Cond >= 0, -1 if Cond < 0).\\nLet `T_True = and %T, M`.\\nLet `T_False = xor (or M, %F), -1`. (Equivalent to `not(M or %F)`).\\nLet `Res = or T_True, T_False`.\\n\\nRewrite:\\n`Res = select (icmp slt %Cond, 0), %T, xor(%F, -1)`\",\n  \"testcases\": [\n    {\n      \"name\": \"original_example_i32\",\n      \"ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = ashr i32 %cond, 31\\n  %a1 = and i32 %tval, %bitmask\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %1 = icmp slt i32 %cond, 0\\n  %2 = xor i32 %fval, -1\\n  %sel = select i1 %1, i32 %tval, i32 %2\\n  ret i32 %sel\\n}\",\n      \"why\": \"The base case provided by the user.\"\n    },\n    {\n      \"name\": \"variant_i64\",\n      \"ir\": \"define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\\n  %bitmask = ashr i64 %cond, 63\\n  %a1 = and i64 %tval, %bitmask\\n  %or = or i64 %bitmask, %fval\\n  %a2 = xor i64 %or, -1\\n  %sel = or i64 %a1, %a2\\n  ret i64 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\\n  %1 = icmp slt i64 %cond, 0\\n  %2 = xor i64 %fval, -1\\n  %sel = select i1 %1, i64 %tval, i64 %2\\n  ret i64 %sel\\n}\",\n      \"why\": \"Tests bitwidth generalization (i64).\"\n    },\n    {\n      \"name\": \"variant_i8\",\n      \"ir\": \"define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\\n  %bitmask = ashr i8 %cond, 7\\n  %a1 = and i8 %tval, %bitmask\\n  %or = or i8 %bitmask, %fval\\n  %a2 = xor i8 %or, -1\\n  %sel = or i8 %a1, %a2\\n  ret i8 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\\n  %1 = icmp slt i8 %cond, 0\\n  %2 = xor i8 %fval, -1\\n  %sel = select i1 %1, i8 %tval, i8 %2\\n  ret i8 %sel\\n}\",\n      \"why\": \"Tests bitwidth generalization (i8).\"\n    },\n    {\n      \"name\": \"variant_vector_v4i32\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\\n  %bitmask = ashr <4 x i32> %cond, <i32 31, i32 31, i32 31, i32 31>\\n  %a1 = and <4 x i32> %tval, %bitmask\\n  %or = or <4 x i32> %bitmask, %fval\\n  %a2 = xor <4 x i32> %or, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %sel = or <4 x i32> %a1, %a2\\n  ret <4 x i32> %sel\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\\n  %1 = icmp slt <4 x i32> %cond, zeroinitializer\\n  %2 = xor <4 x i32> %fval, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %sel = select <4 x i1> %1, <4 x i32> %tval, <4 x i32> %2\\n  ret <4 x i32> %sel\\n}\",\n      \"why\": \"Tests vectorization support.\"\n    },\n    {\n      \"name\": \"variant_commuted_and\",\n      \"ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = ashr i32 %cond, 31\\n  %a1 = and i32 %bitmask, %tval\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %1 = icmp slt i32 %cond, 0\\n  %2 = xor i32 %fval, -1\\n  %sel = select i1 %1, i32 %tval, i32 %2\\n  ret i32 %sel\\n}\",\n      \"why\": \"Tests commutativity of the AND instruction in the true path.\"\n    },\n    {\n      \"name\": \"variant_demorgan_false_path\",\n      \"ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = ashr i32 %cond, 31\\n  %a1 = and i32 %tval, %bitmask\\n  %not_mask = xor i32 %bitmask, -1\\n  %not_f = xor i32 %fval, -1\\n  %a2 = and i32 %not_mask, %not_f\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %1 = icmp slt i32 %cond, 0\\n  %2 = xor i32 %fval, -1\\n  %sel = select i1 %1, i32 %tval, i32 %2\\n  ret i32 %sel\\n}\",\n      \"why\": \"Tests the equivalent DeMorgan's Law form for the false path: (~M) & (~F).\"\n    },\n    {\n      \"name\": \"negative_wrong_shift_amount\",\n      \"ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = ashr i32 %cond, 30\\n  %a1 = and i32 %tval, %bitmask\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = ashr i32 %cond, 30\\n  %a1 = and i32 %tval, %bitmask\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"why\": \"Shift amount must be bitwidth-1. 30 does not guarantee a 0 or -1 mask, so no fold.\"\n    },\n    {\n      \"name\": \"negative_lshr\",\n      \"ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = lshr i32 %cond, 31\\n  %a1 = and i32 %tval, %bitmask\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\\n  %bitmask = lshr i32 %cond, 31\\n  %a1 = and i32 %tval, %bitmask\\n  %or = or i32 %bitmask, %fval\\n  %a2 = xor i32 %or, -1\\n  %sel = or i32 %a1, %a2\\n  ret i32 %sel\\n}\",\n      \"why\": \"Logical shift right creates mask 0 or 1, not 0 or -1. The logic does not simplify to a standard select.\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstCombine::visitOr (or similar binary operator visitor)\",\n    \"strategy\": \"1. Match the final `or` instruction.\\n2. Check if one operand is `and(X, Mask)` and the other is `xor(or(Mask, Y), -1)` (or the DeMorgan equivalent).\\n3. Verify `Mask` is an `ashr` of a value `C` by `BitWidth - 1`.\\n4. Construct `icmp slt C, 0`.\\n5. Construct `not(Y)` (i.e., `xor Y, -1`).\\n6. Replace `or` with `select`.\",\n    \"pitfalls\": [\n      \"Ensure the `Mask` is used consistently. If the `and` uses `Mask1` and the `xor` uses `Mask2`, verify `Mask1 == Mask2`.\",\n      \"Be careful with `Vector` types—ensure the shift amount constant is a splat or matches the vector element count.\",\n      \"The fold `xor (or M, F), -1` -> `and (not M) (not F)` might already happen via DeMorgan's laws pass, but we should match both forms to be robust regardless of other pass ordering.\",\n      \"Check for Poison: In the original IR, `or(M, F)` is evaluated even if `M` is -1. If `F` is poison, the original code might be undefined (if M is 0) or safe (if M is -1, `or` with -1 is -1, ignoring poison bits in F? No, `or` with poison is poison). Wait, if M=-1, `or(-1, poison)` is poison. So if F is poison, the input IR is always poison. The output IR `xor F, -1` computes `not F` (poison) outside the select. So the semantics match.\"\n    ]\n  },\n  \"regression_test_notes\": \"Run `opt -passes=instcombine -S < test.ll | FileCheck test.ll`. Check for the conversion of the `ashr`/`and`/`or`/`xor` chain into `icmp`/`select`.\",\n  \"clarifying_questions\": [\n    \"Should the implementation also handle the case where the final merge is `add` instead of `or`? (Given the disjoint bitmasks, they are equivalent, but `add` is less common for select lowering).\",\n    \"Should we match the pattern where the True value is `or(T, Mask)` instead of `and(T, Mask)`? (This would imply `T | -1` which is always -1, so unlikely to be a useful pattern, but good to confirm boundaries).\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine fails to recognize a specific idiom where a 'select' is implemented using an arithmetic shift-right mask (to generate 0 or -1), combined with bitwise AND/OR/XOR logic. Specifically, the pattern `(T & Mask) | (~(Mask | F))` where `Mask = ashr Cond, 31` simplifies to `select (Cond < 0) T, ~F`.",
+    "before_after": {
+      "before": "%mask = ashr i32 %cond, 31\n%t = and i32 %tval, %mask\n%f = xor i32 (or i32 %mask, %fval), -1\n%r = or i32 %t, %f",
+      "after": "%cmp = icmp slt i32 %cond, 0\n%inv_f = xor i32 %fval, -1\n%r = select i1 %cmp, i32 %tval, i32 %inv_f"
+    },
+    "preconditions": [
+      "The mask generation must be `ashr X, (BitWidth - 1)`. This guarantees the mask is either 0 (all bits zero) or -1 (all bits one).",
+      "The 'True' path must be `and(Value, Mask)`.",
+      "The 'False' path must be `not(or(Mask, Value))` (implemented as `xor (or Mask, Val), -1`).",
+      "The merge operation must be `or` (or `xor`, given the disjoint nature of the results).",
+      "The rewrite is valid for vectors and scalars.",
+      "No `nsw`/`nuw` flags are required on the arithmetic shift for this specific bitwise logic, as `ashr` by bitwidth-1 is well-defined."
+    ],
+    "pattern": "Let `BW` be the bitwidth of the integer type.\nLet `M = ashr %Cond, BW-1`. (M is 0 if Cond >= 0, -1 if Cond < 0).\nLet `T_True = and %T, M`.\nLet `T_False = xor (or M, %F), -1`. (Equivalent to `not(M or %F)`).\nLet `Res = or T_True, T_False`.\n\nRewrite:\n`Res = select (icmp slt %Cond, 0), %T, xor(%F, -1)`",
+    "testcases": [
+      {
+        "name": "original_example_i32",
+        "ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+        "why": "The base case provided by the user."
+      },
+      {
+        "name": "variant_i64",
+        "ir": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %bitmask = ashr i64 %cond, 63\n  %a1 = and i64 %tval, %bitmask\n  %or = or i64 %bitmask, %fval\n  %a2 = xor i64 %or, -1\n  %sel = or i64 %a1, %a2\n  ret i64 %sel\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = icmp slt i64 %cond, 0\n  %2 = xor i64 %fval, -1\n  %sel = select i1 %1, i64 %tval, i64 %2\n  ret i64 %sel\n}",
+        "why": "Tests bitwidth generalization (i64)."
+      },
+      {
+        "name": "variant_i8",
+        "ir": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %bitmask = ashr i8 %cond, 7\n  %a1 = and i8 %tval, %bitmask\n  %or = or i8 %bitmask, %fval\n  %a2 = xor i8 %or, -1\n  %sel = or i8 %a1, %a2\n  ret i8 %sel\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = icmp slt i8 %cond, 0\n  %2 = xor i8 %fval, -1\n  %sel = select i1 %1, i8 %tval, i8 %2\n  ret i8 %sel\n}",
+        "why": "Tests bitwidth generalization (i8)."
+      },
+      {
+        "name": "variant_vector_v4i32",
+        "ir": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %bitmask = ashr <4 x i32> %cond, <i32 31, i32 31, i32 31, i32 31>\n  %a1 = and <4 x i32> %tval, %bitmask\n  %or = or <4 x i32> %bitmask, %fval\n  %a2 = xor <4 x i32> %or, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = or <4 x i32> %a1, %a2\n  ret <4 x i32> %sel\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = icmp slt <4 x i32> %cond, zeroinitializer\n  %2 = xor <4 x i32> %fval, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = select <4 x i1> %1, <4 x i32> %tval, <4 x i32> %2\n  ret <4 x i32> %sel\n}",
+        "why": "Tests vectorization support."
+      },
+      {
+        "name": "variant_commuted_and",
+        "ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %bitmask, %tval\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+        "why": "Tests commutativity of the AND instruction in the true path."
+      },
+      {
+        "name": "variant_demorgan_false_path",
+        "ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %not_mask = xor i32 %bitmask, -1\n  %not_f = xor i32 %fval, -1\n  %a2 = and i32 %not_mask, %not_f\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+        "why": "Tests the equivalent DeMorgan's Law form for the false path: (~M) & (~F)."
+      },
+      {
+        "name": "negative_wrong_shift_amount",
+        "ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "why": "Shift amount must be bitwidth-1. 30 does not guarantee a 0 or -1 mask, so no fold."
+      },
+      {
+        "name": "negative_lshr",
+        "ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+        "why": "Logical shift right creates mask 0 or 1, not 0 or -1. The logic does not simplify to a standard select."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstCombine::visitOr (or similar binary operator visitor)",
+      "strategy": "1. Match the final `or` instruction.\n2. Check if one operand is `and(X, Mask)` and the other is `xor(or(Mask, Y), -1)` (or the DeMorgan equivalent).\n3. Verify `Mask` is an `ashr` of a value `C` by `BitWidth - 1`.\n4. Construct `icmp slt C, 0`.\n5. Construct `not(Y)` (i.e., `xor Y, -1`).\n6. Replace `or` with `select`.",
+      "pitfalls": [
+        "Ensure the `Mask` is used consistently. If the `and` uses `Mask1` and the `xor` uses `Mask2`, verify `Mask1 == Mask2`.",
+        "Be careful with `Vector` types—ensure the shift amount constant is a splat or matches the vector element count.",
+        "The fold `xor (or M, F), -1` -> `and (not M) (not F)` might already happen via DeMorgan's laws pass, but we should match both forms to be robust regardless of other pass ordering.",
+        "Check for Poison: In the original IR, `or(M, F)` is evaluated even if `M` is -1. If `F` is poison, the original code might be undefined (if M is 0) or safe (if M is -1, `or` with -1 is -1, ignoring poison bits in F? No, `or` with poison is poison). Wait, if M=-1, `or(-1, poison)` is poison. So if F is poison, the input IR is always poison. The output IR `xor F, -1` computes `not F` (poison) outside the select. So the semantics match."
+      ]
+    },
+    "regression_test_notes": "Run `opt -passes=instcombine -S < test.ll | FileCheck test.ll`. Check for the conversion of the `ashr`/`and`/`or`/`xor` chain into `icmp`/`select`.",
+    "clarifying_questions": [
+      "Should the implementation also handle the case where the final merge is `add` instead of `or`? (Given the disjoint bitmasks, they are equivalent, but `add` is less common for select lowering).",
+      "Should we match the pattern where the True value is `or(T, Mask)` instead of `and(T, Mask)`? (This would imply `T | -1` which is always -1, so unlikely to be a useful pattern, but good to confirm boundaries)."
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_example_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variant_i64",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %bitmask = ashr i64 %cond, 63\n  %a1 = and i64 %tval, %bitmask\n  %or = or i64 %bitmask, %fval\n  %a2 = xor i64 %or, -1\n  %sel = or i64 %a1, %a2\n  ret i64 %sel\n}",
+          "tgt": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = icmp slt i64 %cond, 0\n  %2 = xor i64 %fval, -1\n  %sel = select i1 %1, i64 %tval, i64 %2\n  ret i64 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %bitmask = ashr i64 %cond, 63\n  %a1 = and i64 %tval, %bitmask\n  %or = or i64 %bitmask, %fval\n  %a2 = xor i64 %or, -1\n  %sel = or i64 %a1, %a2\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %#1 = icmp slt i64 %cond, 0\n  %#2 = xor i64 %fval, -1\n  %sel = select i1 %#1, i64 %tval, i64 %#2\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = xor i64 %fval, -1\n  %.not2 = icmp slt i64 %cond, 0\n  %sel = select i1 %.not2, i64 %tval, i64 %1\n  ret i64 %sel\n}\n",
+          "tgt": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = icmp slt i64 %cond, 0\n  %2 = xor i64 %fval, -1\n  %sel = select i1 %1, i64 %tval, i64 %2\n  ret i64 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %#1 = xor i64 %fval, -1\n  %.not2 = icmp slt i64 %cond, 0\n  %sel = select i1 %.not2, i64 %tval, i64 %#1\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %#1 = icmp slt i64 %cond, 0\n  %#2 = xor i64 %fval, -1\n  %sel = select i1 %#1, i64 %tval, i64 %#2\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = icmp slt i64 %cond, 0\n  %2 = xor i64 %fval, -1\n  %sel = select i1 %1, i64 %tval, i64 %2\n  ret i64 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n  %1 = xor i64 %fval, -1\n  %.not2 = icmp slt i64 %cond, 0\n  %sel = select i1 %.not2, i64 %tval, i64 %1\n  ret i64 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %#1 = icmp slt i64 %cond, 0\n  %#2 = xor i64 %fval, -1\n  %sel = select i1 %#1, i64 %tval, i64 %#2\n  ret i64 %sel\n}\n=>\ndefine i64 @test(i64 %cond, i64 %tval, i64 %fval) {\n#0:\n  %#1 = xor i64 %fval, -1\n  %.not2 = icmp slt i64 %cond, 0\n  %sel = select i1 %.not2, i64 %tval, i64 %#1\n  ret i64 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variant_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %bitmask = ashr i8 %cond, 7\n  %a1 = and i8 %tval, %bitmask\n  %or = or i8 %bitmask, %fval\n  %a2 = xor i8 %or, -1\n  %sel = or i8 %a1, %a2\n  ret i8 %sel\n}",
+          "tgt": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = icmp slt i8 %cond, 0\n  %2 = xor i8 %fval, -1\n  %sel = select i1 %1, i8 %tval, i8 %2\n  ret i8 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %bitmask = ashr i8 %cond, 7\n  %a1 = and i8 %tval, %bitmask\n  %or = or i8 %bitmask, %fval\n  %a2 = xor i8 %or, 255\n  %sel = or i8 %a1, %a2\n  ret i8 %sel\n}\n=>\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %#1 = icmp slt i8 %cond, 0\n  %#2 = xor i8 %fval, 255\n  %sel = select i1 %#1, i8 %tval, i8 %#2\n  ret i8 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = xor i8 %fval, -1\n  %.not2 = icmp slt i8 %cond, 0\n  %sel = select i1 %.not2, i8 %tval, i8 %1\n  ret i8 %sel\n}\n",
+          "tgt": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = icmp slt i8 %cond, 0\n  %2 = xor i8 %fval, -1\n  %sel = select i1 %1, i8 %tval, i8 %2\n  ret i8 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %#1 = xor i8 %fval, 255\n  %.not2 = icmp slt i8 %cond, 0\n  %sel = select i1 %.not2, i8 %tval, i8 %#1\n  ret i8 %sel\n}\n=>\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %#1 = icmp slt i8 %cond, 0\n  %#2 = xor i8 %fval, 255\n  %sel = select i1 %#1, i8 %tval, i8 %#2\n  ret i8 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = icmp slt i8 %cond, 0\n  %2 = xor i8 %fval, -1\n  %sel = select i1 %1, i8 %tval, i8 %2\n  ret i8 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n  %1 = xor i8 %fval, -1\n  %.not2 = icmp slt i8 %cond, 0\n  %sel = select i1 %.not2, i8 %tval, i8 %1\n  ret i8 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %#1 = icmp slt i8 %cond, 0\n  %#2 = xor i8 %fval, 255\n  %sel = select i1 %#1, i8 %tval, i8 %#2\n  ret i8 %sel\n}\n=>\ndefine i8 @test(i8 %cond, i8 %tval, i8 %fval) {\n#0:\n  %#1 = xor i8 %fval, 255\n  %.not2 = icmp slt i8 %cond, 0\n  %sel = select i1 %.not2, i8 %tval, i8 %#1\n  ret i8 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variant_vector_v4i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %bitmask = ashr <4 x i32> %cond, <i32 31, i32 31, i32 31, i32 31>\n  %a1 = and <4 x i32> %tval, %bitmask\n  %or = or <4 x i32> %bitmask, %fval\n  %a2 = xor <4 x i32> %or, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = or <4 x i32> %a1, %a2\n  ret <4 x i32> %sel\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = icmp slt <4 x i32> %cond, zeroinitializer\n  %2 = xor <4 x i32> %fval, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = select <4 x i1> %1, <4 x i32> %tval, <4 x i32> %2\n  ret <4 x i32> %sel\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %bitmask = ashr <4 x i32> %cond, { 31, 31, 31, 31 }\n  %a1 = and <4 x i32> %tval, %bitmask\n  %or = or <4 x i32> %bitmask, %fval\n  %a2 = xor <4 x i32> %or, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %sel = or <4 x i32> %a1, %a2\n  ret <4 x i32> %sel\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %#1 = icmp slt <4 x i32> %cond, { 0, 0, 0, 0 }\n  %#2 = xor <4 x i32> %fval, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %sel = select <4 x i1> %#1, <4 x i32> %tval, <4 x i32> %#2\n  ret <4 x i32> %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = xor <4 x i32> %fval, splat (i32 -1)\n  %.not2 = icmp slt <4 x i32> %cond, zeroinitializer\n  %sel = select <4 x i1> %.not2, <4 x i32> %tval, <4 x i32> %1\n  ret <4 x i32> %sel\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = icmp slt <4 x i32> %cond, zeroinitializer\n  %2 = xor <4 x i32> %fval, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = select <4 x i1> %1, <4 x i32> %tval, <4 x i32> %2\n  ret <4 x i32> %sel\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %#1 = xor <4 x i32> %fval, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %.not2 = icmp slt <4 x i32> %cond, { 0, 0, 0, 0 }\n  %sel = select <4 x i1> %.not2, <4 x i32> %tval, <4 x i32> %#1\n  ret <4 x i32> %sel\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %#1 = icmp slt <4 x i32> %cond, { 0, 0, 0, 0 }\n  %#2 = xor <4 x i32> %fval, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %sel = select <4 x i1> %#1, <4 x i32> %tval, <4 x i32> %#2\n  ret <4 x i32> %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = icmp slt <4 x i32> %cond, zeroinitializer\n  %2 = xor <4 x i32> %fval, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %sel = select <4 x i1> %1, <4 x i32> %tval, <4 x i32> %2\n  ret <4 x i32> %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n  %1 = xor <4 x i32> %fval, splat (i32 -1)\n  %.not2 = icmp slt <4 x i32> %cond, zeroinitializer\n  %sel = select <4 x i1> %.not2, <4 x i32> %tval, <4 x i32> %1\n  ret <4 x i32> %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %#1 = icmp slt <4 x i32> %cond, { 0, 0, 0, 0 }\n  %#2 = xor <4 x i32> %fval, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %sel = select <4 x i1> %#1, <4 x i32> %tval, <4 x i32> %#2\n  ret <4 x i32> %sel\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %cond, <4 x i32> %tval, <4 x i32> %fval) {\n#0:\n  %#1 = xor <4 x i32> %fval, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %.not2 = icmp slt <4 x i32> %cond, { 0, 0, 0, 0 }\n  %sel = select <4 x i1> %.not2, <4 x i32> %tval, <4 x i32> %#1\n  ret <4 x i32> %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variant_commuted_and",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %bitmask, %tval\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %bitmask, %tval\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "variant_demorgan_false_path",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %not_mask = xor i32 %bitmask, -1\n  %not_f = xor i32 %fval, -1\n  %a2 = and i32 %not_mask, %not_f\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %not_mask = xor i32 %bitmask, 4294967295\n  %not_f = xor i32 %fval, 4294967295\n  %a2 = and i32 %not_mask, %not_f\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = icmp slt i32 %cond, 0\n  %2 = xor i32 %fval, -1\n  %sel = select i1 %1, i32 %tval, i32 %2\n  ret i32 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %1 = xor i32 %fval, -1\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %1\n  ret i32 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = icmp slt i32 %cond, 0\n  %#2 = xor i32 %fval, 4294967295\n  %sel = select i1 %#1, i32 %tval, i32 %#2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %#1 = xor i32 %fval, 4294967295\n  %.not2 = icmp slt i32 %cond, 0\n  %sel = select i1 %.not2, i32 %tval, i32 %#1\n  ret i32 %sel\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_wrong_shift_amount",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 6,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = ashr i32 %cond, 30\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_lshr",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 6,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n",
+          "tgt": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, -1\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\n=>\ndefine i32 @test(i32 %cond, i32 %tval, i32 %fval) {\n#0:\n  %bitmask = lshr i32 %cond, 31\n  %a1 = and i32 %tval, %bitmask\n  %or = or i32 %bitmask, %fval\n  %a2 = xor i32 %or, 4294967295\n  %sel = or i32 %a1, %a2\n  ret i32 %sel\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

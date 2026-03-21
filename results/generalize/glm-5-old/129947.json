@@ -1,0 +1,347 @@
+{
+  "issue_id": "129947",
+  "dataset_file": "129947.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndeclare void @use(i8)\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @udiv_umin_extra_use(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  call void @use(i8 %m)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\ndeclare void @use(i8)\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @udiv_umin_extra_use(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %m = shl nuw i8 1, %1\n  call void @use(i8 %m)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses the optimization to distribute `umin` (or `umax`) over a `shl` with a power-of-two constant, specifically in the context where the result is used as a divisor. This prevents the conversion of `udiv` by a power-of-two into a logical right shift (`lshr`). The pattern `umin(shl(1, y), shl(1, z))` is mathematically equivalent to `shl(1, umin(y, z))` provided the shifts do not overflow. This condition is satisfied if the shifts have the `nuw` flag, or can be inferred from the context (e.g., the result is used by `udiv`, implying a non-zero divisor, which for `1 << k` implies `k < bitwidth`).\",\n  \"before_after\": \"Transforms:\\n\\nBefore:\\n%y2 = shl nuw i8 1, %y\\n%z2 = shl nuw i8 1, %z\\n%m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n%d = udiv i8 %x, %m\\n\\nAfter:\\n%k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\\n%d = lshr i8 %x, %k\\n\\n(Note: The intermediate `shl` is eliminated because `udiv(x, 1<<k)` becomes `lshr(x, k)`)\",\n  \"preconditions\": \"1. The `umin` (or `umax`) operands must be `shl` instructions with the same constant operand.\\n2. The constant operand of `shl` must be a power of two (usually 1).\\n3. The `shl` instructions must not overflow. This is guaranteed by the `nuw` flag, or can be inferred if the result is known to be non-zero (e.g., used as a `udiv` divisor) and the constant is 1.\\n4. For the `udiv` -> `lshr` conversion, the divisor must be exactly `1 << k`.\",\n  \"pattern\": \"Canonical form:\\n\\n`umin`(`shl` C, X, `nuw`), `shl` C, Y, `nuw`) -> `shl` C, `umin`(X, Y), `nuw`\\n\\nWhere C is a power-of-two constant.\\n\\nIf the result is used in `udiv`:\\n`udiv`(Val, `umin`(`shl` 1, X, `nuw`), `shl` 1, Y, `nuw`)) -> `lshr`(Val, `umin`(X, Y))\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_nuw_udiv\",\n      \"ir\": \"declare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl nuw i8 1, %y\\n  %z2 = shl nuw i8 1, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  %d = udiv i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\\n  %d = lshr i8 %x, %k\\n  ret i8 %d\\n}\",\n      \"why\": \"Standard case with explicit nuw flags, allowing direct distribution of umin over shl.\"\n    },\n    {\n      \"name\": \"inferred_nuw_from_udiv\",\n      \"ir\": \"declare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl i8 1, %y\\n  %z2 = shl i8 1, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  %d = udiv i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\\n  %d = lshr i8 %x, %k\\n  ret i8 %d\\n}\",\n      \"why\": \"Even without explicit nuw, udiv implies the divisor is non-zero, which for 1<<k implies no overflow, validating the optimization.\"\n    },\n    {\n      \"name\": \"with_extra_use\",\n      \"ir\": \"declare void @use(i8)\\ndeclare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl nuw i8 1, %y\\n  %z2 = shl nuw i8 1, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  call void @use(i8 %m)\\n  %d = udiv i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i8)\\ndeclare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\\n  %m = shl nuw i8 1, %k\\n  call void @use(i8 %m)\\n  %d = lshr i8 %x, %k\\n  ret i8 %d\\n}\",\n      \"why\": \"The intermediate shl(1, k) must be preserved for the extra use, but udiv is still optimized to lshr.\"\n    },\n    {\n      \"name\": \"umax_variant\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl nuw i8 1, %y\\n  %z2 = shl nuw i8 1, %z\\n  %m = call i8 @llvm.umax.i8(i8 %y2, i8 %z2)\\n  %d = udiv i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %k = call i8 @llvm.umax.i8(i8 %y, i8 %z)\\n  %d = lshr i8 %x, %k\\n  ret i8 %d\\n}\",\n      \"why\": \"The logic applies identically to umax (distributing over shl).\"\n    },\n    {\n      \"name\": \"i32_type\",\n      \"ir\": \"declare i32 @llvm.umin.i32(i32, i32)\\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %y2 = shl nuw i32 1, %y\\n  %z2 = shl nuw i32 1, %z\\n  %m = call i32 @llvm.umin.i32(i32 %y2, i32 %z2)\\n  %d = udiv i32 %x, %m\\n  ret i32 %d\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %k = call i32 @llvm.umin.i32(i32 %y, i32 %z)\\n  %d = lshr i32 %x, %k\\n  ret i32 %d\\n}\",\n      \"why\": \"Verifies the pattern works for different bit widths.\"\n    },\n    {\n      \"name\": \"vector_case\",\n      \"ir\": \"declare <4 x i8> @llvm.umin.v4i8(<4 x i8>, <4 x i8>)\\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\\n  %y2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %y\\n  %z2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %z\\n  %m = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y2, <4 x i8> %z2)\\n  %d = udiv <4 x i8> %x, %m\\n  ret <4 x i8> %d\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\\n  %k = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\\n  %d = lshr <4 x i8> %x, %k\\n  ret <4 x i8> %d\\n}\",\n      \"why\": \"Ensures the vector variant is handled correctly.\"\n    },\n    {\n      \"name\": \"power_of_two_constant_4\",\n      \"ir\": \"declare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl nuw i8 4, %y\\n  %z2 = shl nuw i8 4, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  %d = udiv i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\\n  %k.off = add nuw nsw i8 %k, 2\\n  %d = lshr i8 %x, %k.off\\n  ret i8 %d\\n}\",\n      \"why\": \"Generalizes to any power-of-two constant C. udiv(x, C<<k) -> lshr(x, k + log2(C)).\"\n    },\n    {\n      \"name\": \"negative_no_nuw_no_context\",\n      \"ir\": \"declare i8 @llvm.umin.i8(i8, i8)\\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl i8 1, %y\\n  %z2 = shl i8 1, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  %d = add i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y, i8 %z) {\\n  %y2 = shl i8 1, %y\\n  %z2 = shl i8 1, %z\\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\\n  %d = add i8 %x, %m\\n  ret i8 %d\\n}\",\n      \"why\": \"Should NOT optimize. Without nuw or a non-zero use (like udiv), the shift might overflow to 0, making min(1<<y, 1<<z) != 1<<min(y,z).\"\n    }\n  ],\n  \"implementation_notes\": \"The implementation should likely reside in `InstCombine` (or `AggressiveInstCombine` if complex context analysis is needed, but `InstCombine` prefers local patterns).\\n\\n1. When visiting `udiv`, check if the divisor is a `umin`/`umax` of two `shl` instructions.\\n2. Check that the `shl` constants are identical and power-of-two.\\n3. Check for `nuw` flags on the `shl`s. If missing, check if the `udiv` usage allows inferring non-zero (ValueTracking `isKnownNonZero`).\\n4. If valid, replace the divisor with `shl(C, umin(y, z))`. If the `umin` has multiple uses, this update effectively performs the distribution. If the `umin` has one use, it can be folded away.\\n5. After replacing the divisor, the `udiv` will likely match the existing `udiv` -> `lshr` power-of-two pattern in a subsequent iteration of the pass or immediately if the visitor recurses.\\n\\nAlternatively, add a specific fold for `umin(shl(C, x), shl(C, y))` -> `shl(C, umin(x, y))` that triggers if `nuw` is present or if the result is `KnownNonZero` and C is 1.\",\n  \"regression_test_notes\": \"Tests should be added to `llvm/test/Transforms/InstCombine/udiv.ll` or a new file `llvm/test/Transforms/InstCombine/min-max-shift.ll`. \\n\\nFileCheck directives should verify:\\n- The elimination of the intermediate `shl` instructions in the divisor calculation.\\n- The conversion of `udiv` to `lshr`.\\n- The preservation of the `shl` if there are extra uses.\\n- Correct handling of `nuw` flags.\",\n  \"clarifying_questions\": [\n    \"Should this optimization be limited to `C=1` (i.e., `1 << y`), or extended to any power-of-two constant `C` (which requires adding `log2(C)` to the shift amount)?\",\n    \"Is it safe to infer `nuw` solely from the `udiv` use-case, or should we restrict the optimization to cases where `nuw` is explicitly present on the `shl` instructions to be conservative?\",\n    \"Should this pattern handle `smin`/`smax` as well, or just unsigned variants (`umin`, `umax`)? (Signed behavior is trickier due to sign bits).\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses the optimization to distribute `umin` (or `umax`) over a `shl` with a power-of-two constant, specifically in the context where the result is used as a divisor. This prevents the conversion of `udiv` by a power-of-two into a logical right shift (`lshr`). The pattern `umin(shl(1, y), shl(1, z))` is mathematically equivalent to `shl(1, umin(y, z))` provided the shifts do not overflow. This condition is satisfied if the shifts have the `nuw` flag, or can be inferred from the context (e.g., the result is used by `udiv`, implying a non-zero divisor, which for `1 << k` implies `k < bitwidth`).",
+    "before_after": "Transforms:\n\nBefore:\n%y2 = shl nuw i8 1, %y\n%z2 = shl nuw i8 1, %z\n%m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n%d = udiv i8 %x, %m\n\nAfter:\n%k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n%d = lshr i8 %x, %k\n\n(Note: The intermediate `shl` is eliminated because `udiv(x, 1<<k)` becomes `lshr(x, k)`)",
+    "preconditions": "1. The `umin` (or `umax`) operands must be `shl` instructions with the same constant operand.\n2. The constant operand of `shl` must be a power of two (usually 1).\n3. The `shl` instructions must not overflow. This is guaranteed by the `nuw` flag, or can be inferred if the result is known to be non-zero (e.g., used as a `udiv` divisor) and the constant is 1.\n4. For the `udiv` -> `lshr` conversion, the divisor must be exactly `1 << k`.",
+    "pattern": "Canonical form:\n\n`umin`(`shl` C, X, `nuw`), `shl` C, Y, `nuw`) -> `shl` C, `umin`(X, Y), `nuw`\n\nWhere C is a power-of-two constant.\n\nIf the result is used in `udiv`:\n`udiv`(Val, `umin`(`shl` 1, X, `nuw`), `shl` 1, Y, `nuw`)) -> `lshr`(Val, `umin`(X, Y))",
+    "testcases": [
+      {
+        "name": "basic_nuw_udiv",
+        "ir": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+        "why": "Standard case with explicit nuw flags, allowing direct distribution of umin over shl."
+      },
+      {
+        "name": "inferred_nuw_from_udiv",
+        "ir": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+        "why": "Even without explicit nuw, udiv implies the divisor is non-zero, which for 1<<k implies no overflow, validating the optimization."
+      },
+      {
+        "name": "with_extra_use",
+        "ir": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  call void @use(i8 %m)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+        "why": "The intermediate shl(1, k) must be preserved for the extra use, but udiv is still optimized to lshr."
+      },
+      {
+        "name": "umax_variant",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umax.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+        "why": "The logic applies identically to umax (distributing over shl)."
+      },
+      {
+        "name": "i32_type",
+        "ir": "declare i32 @llvm.umin.i32(i32, i32)\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %y2 = shl nuw i32 1, %y\n  %z2 = shl nuw i32 1, %z\n  %m = call i32 @llvm.umin.i32(i32 %y2, i32 %z2)\n  %d = udiv i32 %x, %m\n  ret i32 %d\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %k = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}",
+        "why": "Verifies the pattern works for different bit widths."
+      },
+      {
+        "name": "vector_case",
+        "ir": "declare <4 x i8> @llvm.umin.v4i8(<4 x i8>, <4 x i8>)\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %y2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %y\n  %z2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %z\n  %m = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y2, <4 x i8> %z2)\n  %d = udiv <4 x i8> %x, %m\n  ret <4 x i8> %d\n}",
+        "expected_optimized_ir": "define <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %k = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}",
+        "why": "Ensures the vector variant is handled correctly."
+      },
+      {
+        "name": "power_of_two_constant_4",
+        "ir": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 4, %y\n  %z2 = shl nuw i8 4, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %k.off = add nuw nsw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}",
+        "why": "Generalizes to any power-of-two constant C. udiv(x, C<<k) -> lshr(x, k + log2(C))."
+      },
+      {
+        "name": "negative_no_nuw_no_context",
+        "ir": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+        "why": "Should NOT optimize. Without nuw or a non-zero use (like udiv), the shift might overflow to 0, making min(1<<y, 1<<z) != 1<<min(y,z)."
+      }
+    ],
+    "implementation_notes": "The implementation should likely reside in `InstCombine` (or `AggressiveInstCombine` if complex context analysis is needed, but `InstCombine` prefers local patterns).\n\n1. When visiting `udiv`, check if the divisor is a `umin`/`umax` of two `shl` instructions.\n2. Check that the `shl` constants are identical and power-of-two.\n3. Check for `nuw` flags on the `shl`s. If missing, check if the `udiv` usage allows inferring non-zero (ValueTracking `isKnownNonZero`).\n4. If valid, replace the divisor with `shl(C, umin(y, z))`. If the `umin` has multiple uses, this update effectively performs the distribution. If the `umin` has one use, it can be folded away.\n5. After replacing the divisor, the `udiv` will likely match the existing `udiv` -> `lshr` power-of-two pattern in a subsequent iteration of the pass or immediately if the visitor recurses.\n\nAlternatively, add a specific fold for `umin(shl(C, x), shl(C, y))` -> `shl(C, umin(x, y))` that triggers if `nuw` is present or if the result is `KnownNonZero` and C is 1.",
+    "regression_test_notes": "Tests should be added to `llvm/test/Transforms/InstCombine/udiv.ll` or a new file `llvm/test/Transforms/InstCombine/min-max-shift.ll`. \n\nFileCheck directives should verify:\n- The elimination of the intermediate `shl` instructions in the divisor calculation.\n- The conversion of `udiv` to `lshr`.\n- The preservation of the `shl` if there are extra uses.\n- Correct handling of `nuw` flags.",
+    "clarifying_questions": [
+      "Should this optimization be limited to `C=1` (i.e., `1 << y`), or extended to any power-of-two constant `C` (which requires adding `log2(C)` to the shift amount)?",
+      "Is it safe to infer `nuw` solely from the `udiv` use-case, or should we restrict the optimization to cases where `nuw` is explicitly present on the `shl` instructions to be conservative?",
+      "Should this pattern handle `smin`/`smax` as well, or just unsigned variants (`umin`, `umax`)? (Signed behavior is trickier due to sign bits)."
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_nuw_udiv",
+      "missed_optimization": true,
+      "cost": {
+        "source": 14,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umin i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umin i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "inferred_nuw_from_udiv",
+      "missed_optimization": true,
+      "cost": {
+        "source": 14,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umin i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umin i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_extra_use",
+      "missed_optimization": false,
+      "cost": {
+        "source": 14,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  call void @use(i8 %m)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  call void @use(i8 %m)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i8)\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  call void @use(i8 %m)\n  %1 = call range(i8 0, 9) i8 @llvm.cttz.i8(i8 %m, i1 true)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.cttz.i8(i8, i1 immarg) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  call void @use(i8 %m)\n  %#1 = cttz i8 %m, 1\n  %#range_0_%#1 = !range i8 %#1, i8 0, i8 9\n  %d1 = lshr i8 %x, %#range_0_%#1\n  ret i8 %d1\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i8)\ndeclare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i8)\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  call void @use(i8 %m)\n  %1 = call range(i8 0, 9) i8 @llvm.cttz.i8(i8 %m, i1 true)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.cttz.i8(i8, i1 immarg) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %m = shl nuw i8 1, %k\n  call void @use(i8 %m)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\n=>\ndeclare void @use(i8)\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  call void @use(i8 %m)\n  %#1 = cttz i8 %m, 1\n  %#range_0_%#1 = !range i8 %#1, i8 0, i8 9\n  %d1 = lshr i8 %x, %#range_0_%#1\n  ret i8 %d1\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = poison\ni8 %y = #x08 (8)\ni8 %z = #x00 (0)\n\nSource:\ni8 %k = #x00 (0)\ni8 %m = #x01 (1)\nvoid = function did not return!\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x1\n\nTarget:\ni8 %y2 = poison\ni8 %z2 = #x01 (1)\ni8 %m = poison\nvoid = function did not return!\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x1\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umax_variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 14,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umax.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umax.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umax i8 %y2, %z2\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umax i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umax i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umax i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = call i8 @llvm.umax.i8(i8 %y, i8 %z)\n  %d1 = lshr i8 %x, %1\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umax i8 %y, %z\n  %d = lshr i8 %x, %k\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = umax i8 %y, %z\n  %d1 = lshr i8 %x, %#1\n  ret i8 %d1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_type",
+      "missed_optimization": true,
+      "cost": {
+        "source": 14,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.umin.i32(i32, i32)\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %y2 = shl nuw i32 1, %y\n  %z2 = shl nuw i32 1, %z\n  %m = call i32 @llvm.umin.i32(i32 %y2, i32 %z2)\n  %d = udiv i32 %x, %m\n  ret i32 %d\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %k = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %y2 = shl nuw i32 1, %y\n  %z2 = shl nuw i32 1, %z\n  %m = umin i32 %y2, %z2\n  %d = udiv i32 %x, %m\n  ret i32 %d\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %k = umin i32 %y, %z\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %1 = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d1 = lshr i32 %x, %1\n  ret i32 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %k = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %#1 = umin i32 %y, %z\n  %d1 = lshr i32 %x, %#1\n  ret i32 %d1\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %k = umin i32 %y, %z\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %k = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %1 = call i32 @llvm.umin.i32(i32 %y, i32 %z)\n  %d1 = lshr i32 %x, %1\n  ret i32 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %k = umin i32 %y, %z\n  %d = lshr i32 %x, %k\n  ret i32 %d\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %#1 = umin i32 %y, %z\n  %d1 = lshr i32 %x, %#1\n  ret i32 %d1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_case",
+      "missed_optimization": true,
+      "cost": {
+        "source": 14,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare <4 x i8> @llvm.umin.v4i8(<4 x i8>, <4 x i8>)\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %y2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %y\n  %z2 = shl nuw <4 x i8> <i8 1, i8 1, i8 1, i8 1>, %z\n  %m = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y2, <4 x i8> %z2)\n  %d = udiv <4 x i8> %x, %m\n  ret <4 x i8> %d\n}",
+          "tgt": "define <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %k = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %y2 = shl nuw <4 x i8> { 1, 1, 1, 1 }, %y\n  %z2 = shl nuw <4 x i8> { 1, 1, 1, 1 }, %z\n  %m = umin <4 x i8> %y2, %z2\n  %d = udiv <4 x i8> %x, %m\n  ret <4 x i8> %d\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %k = umin <4 x i8> %y, %z\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.umin.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %1 = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d1 = lshr <4 x i8> %x, %1\n  ret <4 x i8> %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %k = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %#1 = umin <4 x i8> %y, %z\n  %d1 = lshr <4 x i8> %x, %#1\n  ret <4 x i8> %d1\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %k = umin <4 x i8> %y, %z\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %k = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i8> @llvm.umin.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n  %1 = call <4 x i8> @llvm.umin.v4i8(<4 x i8> %y, <4 x i8> %z)\n  %d1 = lshr <4 x i8> %x, %1\n  ret <4 x i8> %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %k = umin <4 x i8> %y, %z\n  %d = lshr <4 x i8> %x, %k\n  ret <4 x i8> %d\n}\n=>\ndefine <4 x i8> @test(<4 x i8> %x, <4 x i8> %y, <4 x i8> %z) {\n#0:\n  %#1 = umin <4 x i8> %y, %z\n  %d1 = lshr <4 x i8> %x, %#1\n  ret <4 x i8> %d1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "power_of_two_constant_4",
+      "missed_optimization": false,
+      "cost": {
+        "source": 14,
+        "expected": 4,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 14\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 4, %y\n  %z2 = shl nuw i8 4, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %k.off = add nuw nsw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 4, %y\n  %z2 = shl nuw i8 4, %z\n  %m = umin i8 %y2, %z2\n  %d = udiv i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %k.off = add nsw nuw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = add i8 %y, 2\n  %2 = add i8 %z, 2\n  %3 = call i8 @llvm.umin.i8(i8 %1, i8 %2)\n  %d1 = lshr i8 %x, %3\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %k.off = add nuw nsw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = add i8 %y, 2\n  %#2 = add i8 %z, 2\n  %#3 = umin i8 %#1, %#2\n  %d1 = lshr i8 %x, %#3\n  ret i8 %d1\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %k.off = add nsw nuw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %x = #x03 (3)\ni8 %y = #xfe (254, -2)\ni8 %z = #x08 (8)\n\nSource:\ni8 %#1 = #x00 (0)\ni8 %#2 = #x0a (10)\ni8 %#3 = #x00 (0)\ni8 %d1 = #x03 (3)\n\nTarget:\ni8 %k = #x08 (8)\ni8 %k.off = #x0a (10)\ni8 %d = poison\nSource value: #x03 (3)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %k = call i8 @llvm.umin.i8(i8 %y, i8 %z)\n  %k.off = add nuw nsw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %1 = add i8 %y, 2\n  %2 = add i8 %z, 2\n  %3 = call i8 @llvm.umin.i8(i8 %1, i8 %2)\n  %d1 = lshr i8 %x, %3\n  ret i8 %d1\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %k = umin i8 %y, %z\n  %k.off = add nsw nuw i8 %k, 2\n  %d = lshr i8 %x, %k.off\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %#1 = add i8 %y, 2\n  %#2 = add i8 %z, 2\n  %#3 = umin i8 %#1, %#2\n  %d1 = lshr i8 %x, %#3\n  ret i8 %d1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %x = #x06 (6)\ni8 %y = #xff (255, -1)\ni8 %z = #x00 (0)\n\nSource:\ni8 %k = #x00 (0)\ni8 %k.off = #x02 (2)\ni8 %d = #x01 (1)\n\nTarget:\ni8 %#1 = #x01 (1)\ni8 %#2 = #x02 (2)\ni8 %#3 = #x01 (1)\ni8 %d1 = #x03 (3)\nSource value: #x01 (1)\nTarget value: #x03 (3)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_no_nuw_no_context",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i8 @llvm.umin.i8(i8, i8)\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = call i8 @llvm.umin.i8(i8 %y2, i8 %z2)\n  %d = add i8 %x, %m\n  ret i8 %d\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl i8 1, %y\n  %z2 = shl i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\n=>\ndefine i8 @test(i8 %x, i8 %y, i8 %z) {\n#0:\n  %y2 = shl nuw i8 1, %y\n  %z2 = shl nuw i8 1, %z\n  %m = umin i8 %y2, %z2\n  %d = add i8 %x, %m\n  ret i8 %d\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

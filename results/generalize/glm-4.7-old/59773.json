@@ -1,0 +1,423 @@
+{
+  "issue_id": "59773",
+  "dataset_file": "59773.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndeclare void @use(i32)\n\ndefine i32 @and_not_sext_to_sel_commute(i32 %px, i1 %y) {\n  %x = mul i32 %px, %px\n  %sext = sext i1 %y to i32\n  call void @use(i32 %sext)\n  %not = xor i32 %sext, -1\n  call void @use(i32 %not)\n  %r = and i32 %x, %not\n  ret i32 %r\n}\n\ndeclare void @use(i32)\n\ndefine i32 @and_not_sext_to_sel_commute(i32 %px, i1 %y) {\n  %x = mul i32 %px, %px\n  %sext = sext i1 %y to i32\n  call void @use(i32 %sext)\n  %not = xor i32 %sext, -1\n  call void @use(i32 %not)\n  %r = select i1 %y, i32 0, i32 %x\n  ret i32 %r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize bitwise masking of sign-extended booleans into selects. Specifically, `and (Val, not (sext i1 Cond))` is equivalent to `select Cond, 0, Val`. Similarly, `and (Val, sext i1 Cond)` is `select Cond, Val, 0`.\",\n  \"before_after\": \"Transforms `and i32 %x, (xor i32 (sext i1 %y to i32), -1)` into `select i1 %y, i32 0, i32 %x`.\",\n  \"preconditions\": [\n    \"One operand of the `and` must be a bitwise NOT (xor with -1) of a sign-extend.\",\n    \"The sign-extend (`sext`) must source from an `i1` value.\",\n    \"The type of the `and` operands must match the destination type of the `sext`.\",\n    \"For vectors, the NOT constant (-1) must be a splat.\"\n  ],\n  \"pattern\": \"Pattern: `(and X, (xor (sext (i1 Cond)), -1))` -> `(select Cond, 0, X)`. Also handles commuted `and` operands. A related fold is `(and X, (sext (i1 Cond)))` -> `(select Cond, X, 0)`.\",\n  \"testcases\": [\n    {\n      \"name\": \"and_not_sext_i32_basic\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %res = select i1 %cond, i32 0, i32 %x\\n  ret i32 %res\\n}\",\n      \"why\": \"Canonical example of masking with inverted sext.\"\n    },\n    {\n      \"name\": \"and_not_sext_i32_commute\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = and i32 %not, %x\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %res = select i1 %cond, i32 0, i32 %x\\n  ret i32 %res\\n}\",\n      \"why\": \"Verifies fold works with commuted `and` operands.\"\n    },\n    {\n      \"name\": \"and_not_sext_i64\",\n      \"ir\": \"define i64 @test(i64 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i64\\n  %not = xor i64 %ext, -1\\n  %res = and i64 %x, %not\\n  ret i64 %res\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x, i1 %cond) {\\n  %res = select i1 %cond, i64 0, i64 %x\\n  ret i64 %res\\n}\",\n      \"why\": \"Tests different bitwidth (i64).\"\n    },\n    {\n      \"name\": \"and_not_sext_i8\",\n      \"ir\": \"define i8 @test(i8 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i8\\n  %not = xor i8 %ext, -1\\n  %res = and i8 %x, %not\\n  ret i8 %res\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i1 %cond) {\\n  %res = select i1 %cond, i8 0, i8 %x\\n  ret i8 %res\\n}\",\n      \"why\": \"Tests small bitwidth (i8).\"\n    },\n    {\n      \"name\": \"and_not_sext_vector\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\\n  %ext = sext <4 x i1> %cond to <4 x i32>\\n  %not = xor <4 x i32> %ext, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %res = and <4 x i32> %x, %not\\n  ret <4 x i32> %res\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\\n  ret <4 x i32> %res\\n}\",\n      \"why\": \"Tests vector types with splat constants.\"\n    },\n    {\n      \"name\": \"and_sext_i32_inverted\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %res = and i32 %x, %ext\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %res = select i1 %cond, i32 %x, i32 0\\n  ret i32 %res\\n}\",\n      \"why\": \"Tests the non-inverted pattern: `and(x, sext(c))` -> `select(c, x, 0)`.\"\n    },\n    {\n      \"name\": \"and_not_sext_multi_use\",\n      \"ir\": \"declare void @use(i32)\\ndefine i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  call void @use(i32 %ext)\\n  %not = xor i32 %ext, -1\\n  call void @use(i32 %not)\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i32)\\ndefine i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  call void @use(i32 %ext)\\n  %not = xor i32 %ext, -1\\n  call void @use(i32 %not)\\n  %res = select i1 %cond, i32 0, i32 %x\\n  ret i32 %res\\n}\",\n      \"why\": \"Ensures the fold applies even if the intermediate `sext` and `xor` have other uses (they are preserved, only the `and` user changes).\"\n    },\n    {\n      \"name\": \"and_not_sext_sub_form\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = sub i32 -1, %ext\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %res = select i1 %cond, i32 0, i32 %x\\n  ret i32 %res\\n}\",\n      \"why\": \"Tests `sub -1, x` as an alternative form of bitwise NOT.\"\n    },\n    {\n      \"name\": \"negative_zext\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = zext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = zext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"why\": \"Negative case: `zext` does not produce -1 for true, so the mask is not 0/-1. Fold should not happen.\"\n    },\n    {\n      \"name\": \"negative_wrong_const\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, 5\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, 5\\n  %res = and i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"why\": \"Negative case: `xor` constant is not -1. Fold should not happen.\"\n    },\n    {\n      \"name\": \"and_or_sext\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = or i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %cond) {\\n  %ext = sext i1 %cond to i32\\n  %not = xor i32 %ext, -1\\n  %res = or i32 %x, %not\\n  ret i32 %res\\n}\",\n      \"why\": \"Negative case: `or` instead of `and`. Semantics differ (should be `select cond, -1, x`), but strictly checking if the `and` logic bleeds incorrectly.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement in `InstCombineAndOrXor.cpp` in the `visitAnd` function. Use `m_And` and `m_Xor` matchers. The pattern to match is `m_And(m_Value(V), m_Xor(m_SExt(m_Value(C)), m_AllOnes()))`. Check that `C` is of type `i1`. If matched, replace with `SelectInst::Create(C, Constant::getNullValue(V->getType()), V)`. Also handle the commuted case `m_And(m_Xor(...), m_Value(V))` and the positive mask case `m_And(m_Value(V), m_SExt(m_Value(C)))` which maps to `SelectInst::Create(C, V, Null)`. Ensure that `m_AllOnes` matches both scalar -1 and vector splats of -1.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` to verify. Check for the elimination of `and` and `xor` (or `sub`) instructions and the introduction of `select`. Verify that intermediate values with other uses (like `@use`) are not eliminated.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Optimize bitwise masking of sign-extended booleans into selects. Specifically, `and (Val, not (sext i1 Cond))` is equivalent to `select Cond, 0, Val`. Similarly, `and (Val, sext i1 Cond)` is `select Cond, Val, 0`.",
+    "before_after": "Transforms `and i32 %x, (xor i32 (sext i1 %y to i32), -1)` into `select i1 %y, i32 0, i32 %x`.",
+    "preconditions": [
+      "One operand of the `and` must be a bitwise NOT (xor with -1) of a sign-extend.",
+      "The sign-extend (`sext`) must source from an `i1` value.",
+      "The type of the `and` operands must match the destination type of the `sext`.",
+      "For vectors, the NOT constant (-1) must be a splat."
+    ],
+    "pattern": "Pattern: `(and X, (xor (sext (i1 Cond)), -1))` -> `(select Cond, 0, X)`. Also handles commuted `and` operands. A related fold is `(and X, (sext (i1 Cond)))` -> `(select Cond, X, 0)`.",
+    "testcases": [
+      {
+        "name": "and_not_sext_i32_basic",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+        "why": "Canonical example of masking with inverted sext."
+      },
+      {
+        "name": "and_not_sext_i32_commute",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %not, %x\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+        "why": "Verifies fold works with commuted `and` operands."
+      },
+      {
+        "name": "and_not_sext_i64",
+        "ir": "define i64 @test(i64 %x, i1 %cond) {\n  %ext = sext i1 %cond to i64\n  %not = xor i64 %ext, -1\n  %res = and i64 %x, %not\n  ret i64 %res\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}",
+        "why": "Tests different bitwidth (i64)."
+      },
+      {
+        "name": "and_not_sext_i8",
+        "ir": "define i8 @test(i8 %x, i1 %cond) {\n  %ext = sext i1 %cond to i8\n  %not = xor i8 %ext, -1\n  %res = and i8 %x, %not\n  ret i8 %res\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}",
+        "why": "Tests small bitwidth (i8)."
+      },
+      {
+        "name": "and_not_sext_vector",
+        "ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %ext = sext <4 x i1> %cond to <4 x i32>\n  %not = xor <4 x i32> %ext, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %res = and <4 x i32> %x, %not\n  ret <4 x i32> %res\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}",
+        "why": "Tests vector types with splat constants."
+      },
+      {
+        "name": "and_sext_i32_inverted",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %res = and i32 %x, %ext\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}",
+        "why": "Tests the non-inverted pattern: `and(x, sext(c))` -> `select(c, x, 0)`."
+      },
+      {
+        "name": "and_not_sext_multi_use",
+        "ir": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+        "why": "Ensures the fold applies even if the intermediate `sext` and `xor` have other uses (they are preserved, only the `and` user changes)."
+      },
+      {
+        "name": "and_not_sext_sub_form",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = sub i32 -1, %ext\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+        "why": "Tests `sub -1, x` as an alternative form of bitwise NOT."
+      },
+      {
+        "name": "negative_zext",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "why": "Negative case: `zext` does not produce -1 for true, so the mask is not 0/-1. Fold should not happen."
+      },
+      {
+        "name": "negative_wrong_const",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+        "why": "Negative case: `xor` constant is not -1. Fold should not happen."
+      },
+      {
+        "name": "and_or_sext",
+        "ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = or i32 %x, %not\n  ret i32 %res\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = or i32 %x, %not\n  ret i32 %res\n}",
+        "why": "Negative case: `or` instead of `and`. Semantics differ (should be `select cond, -1, x`), but strictly checking if the `and` logic bleeds incorrectly."
+      }
+    ],
+    "implementation_notes": "Implement in `InstCombineAndOrXor.cpp` in the `visitAnd` function. Use `m_And` and `m_Xor` matchers. The pattern to match is `m_And(m_Value(V), m_Xor(m_SExt(m_Value(C)), m_AllOnes()))`. Check that `C` is of type `i1`. If matched, replace with `SelectInst::Create(C, Constant::getNullValue(V->getType()), V)`. Also handle the commuted case `m_And(m_Xor(...), m_Value(V))` and the positive mask case `m_And(m_Value(V), m_SExt(m_Value(C)))` which maps to `SelectInst::Create(C, V, Null)`. Ensure that `m_AllOnes` matches both scalar -1 and vector splats of -1.",
+    "regression_test_notes": "Use `opt -instcombine -S` to verify. Check for the elimination of `and` and `xor` (or `sub`) instructions and the introduction of `select`. Verify that intermediate values with other uses (like `@use`) are not eliminated.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "and_not_sext_i32_basic",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_i32_commute",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %not, %x\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_i64",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x, i1 %cond) {\n  %ext = sext i1 %cond to i64\n  %not = xor i64 %ext, -1\n  %res = and i64 %x, %not\n  ret i64 %res\n}",
+          "tgt": "define i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i64\n  %not = xor i64 %ext, -1\n  %res = and i64 %x, %not\n  ret i64 %res\n}\n=>\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\n",
+          "tgt": "define i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\n=>\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i1 %cond) {\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\n=>\ndefine i64 @test(i64 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i64 0, i64 %x\n  ret i64 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i1 %cond) {\n  %ext = sext i1 %cond to i8\n  %not = xor i8 %ext, -1\n  %res = and i8 %x, %not\n  ret i8 %res\n}",
+          "tgt": "define i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i8\n  %not = xor i8 %ext, 255\n  %res = and i8 %x, %not\n  ret i8 %res\n}\n=>\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\n",
+          "tgt": "define i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\n=>\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i1 %cond) {\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\n=>\ndefine i8 @test(i8 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i8 0, i8 %x\n  ret i8 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_vector",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %ext = sext <4 x i1> %cond to <4 x i32>\n  %not = xor <4 x i32> %ext, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %res = and <4 x i32> %x, %not\n  ret <4 x i32> %res\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %ext = sext <4 x i1> %cond to <4 x i32>\n  %not = xor <4 x i32> %ext, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %res = and <4 x i32> %x, %not\n  ret <4 x i32> %res\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %res = select <4 x i1> %cond, <4 x i32> { 0, 0, 0, 0 }, <4 x i32> %x\n  ret <4 x i32> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %res = select <4 x i1> %cond, <4 x i32> { 0, 0, 0, 0 }, <4 x i32> %x\n  ret <4 x i32> %res\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %res = select <4 x i1> %cond, <4 x i32> { 0, 0, 0, 0 }, <4 x i32> %x\n  ret <4 x i32> %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n  %res = select <4 x i1> %cond, <4 x i32> zeroinitializer, <4 x i32> %x\n  ret <4 x i32> %res\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %res = select <4 x i1> %cond, <4 x i32> { 0, 0, 0, 0 }, <4 x i32> %x\n  ret <4 x i32> %res\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i1> %cond) {\n#0:\n  %res = select <4 x i1> %cond, <4 x i32> { 0, 0, 0, 0 }, <4 x i32> %x\n  ret <4 x i32> %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_sext_i32_inverted",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %res = and i32 %x, %ext\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %res = and i32 %x, %ext\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 %x, i32 0\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_multi_use",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "tgt": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i32)\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, -1\n  call void @use(i32 %not)\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  call void @use(i32 %ext)\n  %not = xor i32 %ext, 4294967295\n  call void @use(i32 %not)\n  %res = and i32 %not, %x\n  ret i32 %res\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = poison\ni1 %cond = #x1 (1)\n\nSource:\ni32 %ext = #xffffffff (4294967295, -1)\nFunction @use returned\ni32 %not = #x00000000 (0)\nFunction @use returned\ni32 %res = #x00000000 (0)\n\nSOURCE MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x2\n\nTarget:\ni32 %ext = #xffffffff (4294967295, -1)\nFunction @use returned\ni32 %not = #x00000000 (0)\nFunction @use returned\ni32 %res = poison\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 0\talign: 1\talloc type: 0\talive: false\taddress: #x0\nBlock 1 >\tsize: 0\talign: 1\talloc type: 0\talive: true\taddress: #x2\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_not_sext_sub_form",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = sub i32 -1, %ext\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = sub i32 4294967295, %ext\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %res = select i1 %cond, i32 0, i32 %x\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_zext",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %x, %not\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %x, %not\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, -1\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = zext i1 %cond to i32\n  %not = xor i32 %ext, 4294967295\n  %res = and i32 %not, %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_wrong_const",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "tgt": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i1 %cond) {\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %not, %x\n  ret i32 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %x, %not\n  ret i32 %res\n}\n=>\ndefine i32 @test(i32 %x, i1 %cond) {\n#0:\n  %ext = sext i1 %cond to i32\n  %not = xor i32 %ext, 5\n  %res = and i32 %not, %x\n  ret i32 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "and_or_sext",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:13 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.4s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,503 @@
+{
+  "issue_id": "104772",
+  "dataset_file": "104772.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @test_icmp_sgt_and_negpow2_c(i32 %add) {\n  %and = and i32 %add, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n\ndefine i1 @test_icmp_sgt_and_negpow2_c(i32 %add) {\n  %cmp = icmp sgt i32 %add, 31\n  ret i1 %cmp\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize signed/unsigned comparisons of a value masked with a negated power-of-two against a constant. The mask clears the low K bits, so the result is a multiple of K. The comparison `(X & -K) pred C` can be simplified to `X pred' C'` where `C'` is adjusted to the next multiple of K (minus 1 for strict predicates) based on the predicate.\",\n  \"before_after\": \"icmp sgt (and i32 %x, -32), 16  -->  icmp sgt i32 %x, 31\\n(Note: -32 clears low 5 bits. The result is a multiple of 32. A multiple of 32 > 16 implies it is >= 32. Thus X must be >= 32, i.e., X > 31.)\",\n  \"preconditions\": \"1. The RHS of the `and` is a constant Mask of the form `~(K-1)` where `K` is a power of 2 (i.e., Mask is negative and has trailing zeros).\\n2. The `icmp` compares against a constant C.\\n3. The adjusted constant C' must not overflow/wrap in a way that invalidates the comparison (e.g., if C is MAX_INT, C' would wrap, making the optimization invalid or resulting in a constant false).\\n4. Safe for signed (`s*`) and unsigned (`u*`) predicates.\",\n  \"pattern\": \"Generic: `icmp Pred (and %x, -K), C` -> `icmp Pred' %x, C'`\\nLogic: The masked value `Y = X & -K` is a multiple of `K`.\\nFor `sgt` (Strict Greater Than): We need the smallest multiple of `K` strictly greater than `C`. Let `C_next` be that value. `Y > C` <=> `Y >= C_next`. Since `C_next` is a multiple of `K`, `Y >= C_next` <=> `X >= C_next` (for signed/unsigned). This is equivalent to `X > C_next - 1`.\\nFormula for C': `C' = RoundUp(C + 1, K) - 1`.\",\n  \"testcases\": [\n    {\n      \"name\": \"sgt_i32_basic\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -32\\n  %cmp = icmp sgt i32 %and, 16\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp sgt i32 %x, 31\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Original example. Mask -32 (K=32). C=16. Next multiple > 16 is 32. X > 31.\"\n    },\n    {\n      \"name\": \"sgt_i16_smaller\",\n      \"ir\": \"define i1 @test(i16 %x) {\\n  %and = and i16 %x, -8\\n  %cmp = icmp sgt i16 %and, 5\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i16 %x) {\\n  %cmp = icmp sgt i16 %x, 7\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Mask -8 (K=8). C=5. Next multiple > 5 is 8. X > 7.\"\n    },\n    {\n      \"name\": \"sgt_i64_large\",\n      \"ir\": \"define i1 @test(i64 %x) {\\n  %and = and i64 %x, -1024\\n  %cmp = icmp sgt i64 %and, 0\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %x) {\\n  %cmp = icmp sgt i64 %x, 1023\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Mask -1024 (K=1024). C=0. Next multiple > 0 is 1024. X > 1023.\"\n    },\n    {\n      \"name\": \"sgt_vector\",\n      \"ir\": \"define <4 x i1> @test(<4 x i32> %x) {\\n  %and = and <4 x i32> %x, <i32 -32, i32 -32, i32 -32, i32 -32>\\n  %cmp = icmp sgt <4 x i32> %and, <i32 16, i32 16, i32 16, i32 16>\\n  ret <4 x i1> %cmp\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i32> %x) {\\n  %cmp = icmp sgt <4 x i32> %x, <i32 31, i32 31, i32 31, i32 31>\\n  ret <4 x i1> %cmp\\n}\",\n      \"why\": \"Vector variant of the basic case.\"\n    },\n    {\n      \"name\": \"sgt_negative_constant\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -32\\n  %cmp = icmp sgt i32 %and, -50\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp sgt i32 %x, -33\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Mask -32. C=-50. Multiples of 32: ..., -64, -32, 0. Next > -50 is -32. X > -33.\"\n    },\n    {\n      \"name\": \"slt_swapped\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -32\\n  %cmp = icmp slt i32 %and, 16\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp slt i32 %x, 32\\n  ret i1 %cmp\\n}\",\n      \"why\": \"slt logic. Y < 16. Largest multiple < 16 is 0 (if we think about it differently). Actually Y < 16 implies Y <= 0 (since Y is multiple of 32). Y <= 0 implies X < 32. X < 32.\"\n    },\n    {\n      \"name\": \"ugt_unsigned\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -128\\n  %cmp = icmp ugt i32 %and, 100\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp ugt i32 %x, 127\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Unsigned ugt. Mask -128. C=100. Next multiple > 100 is 128. X > 127.\"\n    },\n    {\n      \"name\": \"sge_non_strict\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -32\\n  %cmp = icmp sge i32 %and, 32\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp sge i32 %x, 32\\n  ret i1 %cmp\\n}\",\n      \"why\": \"sge. C=32. 32 is a multiple of 32. Y >= 32 implies X >= 32.\"\n    },\n    {\n      \"name\": \"sge_non_strict_roundup\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -32\\n  %cmp = icmp sge i32 %and, 33\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp sge i32 %x, 64\\n  ret i1 %cmp\\n}\",\n      \"why\": \"sge. C=33. Next multiple >= 33 is 64. X >= 64.\"\n    },\n    {\n      \"name\": \"no_opt_mask_not_pow2\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -31\\n  %cmp = icmp sgt i32 %and, 16\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -31\\n  %cmp = icmp sgt i32 %and, 16\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Mask -31 is not of the form -(2^k). Optimization should not trigger.\"\n    },\n    {\n      \"name\": \"no_opt_overflow_case\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 %x, -2\\n  %cmp = icmp sgt i32 %and, 2147483647\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  ret i1 false\\n}\",\n      \"why\": \"C is MaxInt. (X & -2) is even. No even number > MaxInt. Should fold to false, not to X > C'.\"\n    },\n    {\n      \"name\": \"commuted_and\",\n      \"ir\": \"define i1 @test(i32 %x) {\\n  %and = and i32 -32, %x\\n  %cmp = icmp sgt i32 %and, 16\\n  ret i1 %cmp\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\n  %cmp = icmp sgt i32 %x, 31\\n  ret i1 %cmp\\n}\",\n      \"why\": \"And operands are commutative. Optimization should work regardless of order.\"\n    }\n  ],\n  \"implementation_notes\": \"In InstCombine, visitICmpInst:\\n1. Match `icmp Pred (and X, Mask), C`.\\n2. Check `Mask` is a ConstantInt.\\n3. Check if `Mask` is of the form `~(K-1)` (i.e., `Mask` is `0...111...000`). Calculate `K = -Mask`.\\n4. Check if `K` is a power of 2.\\n5. Compute `C_new`:\\n   - If `Pred` is `sgt`/`ugt` (strict greater): We want the smallest multiple of `K` strictly greater than `C`. Let `C_next = RoundUp(C + 1, K)`. If `C_next` overflows, handle (e.g. return false constant). The new comparison is `X > (C_next - 1)`.\\n   - If `Pred` is `sge`/`uge` (greater or equal): We want the smallest multiple of `K` greater or equal to `C`. Let `C_next = RoundUp(C, K)`. New comparison: `X >= C_next`.\\n   - Similar logic for `slt`/`sle` (swapping operands or using RoundDown).\\n6. Replace the instruction.\\n\\nPitfalls:\\n- Overflow in `C_next` calculation (e.g. C is near MAX_INT).\\n- Signed vs Unsigned rounding behavior for negative C (APInt handles this, but logic must be explicit).\\n- If `C_next` calculation wraps around (e.g. C = -2^31, K=2, signed), `C_next` becomes `0` or `MIN_INT`. Verify equivalence carefully.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` to verify. Check that the `and` instruction is removed and the `icmp` constant is updated. Ensure that for the 'no_opt' cases, the IR remains unchanged or simplifies differently.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Optimize signed/unsigned comparisons of a value masked with a negated power-of-two against a constant. The mask clears the low K bits, so the result is a multiple of K. The comparison `(X & -K) pred C` can be simplified to `X pred' C'` where `C'` is adjusted to the next multiple of K (minus 1 for strict predicates) based on the predicate.",
+    "before_after": "icmp sgt (and i32 %x, -32), 16  -->  icmp sgt i32 %x, 31\n(Note: -32 clears low 5 bits. The result is a multiple of 32. A multiple of 32 > 16 implies it is >= 32. Thus X must be >= 32, i.e., X > 31.)",
+    "preconditions": "1. The RHS of the `and` is a constant Mask of the form `~(K-1)` where `K` is a power of 2 (i.e., Mask is negative and has trailing zeros).\n2. The `icmp` compares against a constant C.\n3. The adjusted constant C' must not overflow/wrap in a way that invalidates the comparison (e.g., if C is MAX_INT, C' would wrap, making the optimization invalid or resulting in a constant false).\n4. Safe for signed (`s*`) and unsigned (`u*`) predicates.",
+    "pattern": "Generic: `icmp Pred (and %x, -K), C` -> `icmp Pred' %x, C'`\nLogic: The masked value `Y = X & -K` is a multiple of `K`.\nFor `sgt` (Strict Greater Than): We need the smallest multiple of `K` strictly greater than `C`. Let `C_next` be that value. `Y > C` <=> `Y >= C_next`. Since `C_next` is a multiple of `K`, `Y >= C_next` <=> `X >= C_next` (for signed/unsigned). This is equivalent to `X > C_next - 1`.\nFormula for C': `C' = RoundUp(C + 1, K) - 1`.",
+    "testcases": [
+      {
+        "name": "sgt_i32_basic",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+        "why": "Original example. Mask -32 (K=32). C=16. Next multiple > 16 is 32. X > 31."
+      },
+      {
+        "name": "sgt_i16_smaller",
+        "ir": "define i1 @test(i16 %x) {\n  %and = and i16 %x, -8\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i16 %x) {\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}",
+        "why": "Mask -8 (K=8). C=5. Next multiple > 5 is 8. X > 7."
+      },
+      {
+        "name": "sgt_i64_large",
+        "ir": "define i1 @test(i64 %x) {\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %x) {\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}",
+        "why": "Mask -1024 (K=1024). C=0. Next multiple > 0 is 1024. X > 1023."
+      },
+      {
+        "name": "sgt_vector",
+        "ir": "define <4 x i1> @test(<4 x i32> %x) {\n  %and = and <4 x i32> %x, <i32 -32, i32 -32, i32 -32, i32 -32>\n  %cmp = icmp sgt <4 x i32> %and, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %cmp\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i32> %x) {\n  %cmp = icmp sgt <4 x i32> %x, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i1> %cmp\n}",
+        "why": "Vector variant of the basic case."
+      },
+      {
+        "name": "sgt_negative_constant",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, -50\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, -33\n  ret i1 %cmp\n}",
+        "why": "Mask -32. C=-50. Multiples of 32: ..., -64, -32, 0. Next > -50 is -32. X > -33."
+      },
+      {
+        "name": "slt_swapped",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}",
+        "why": "slt logic. Y < 16. Largest multiple < 16 is 0 (if we think about it differently). Actually Y < 16 implies Y <= 0 (since Y is multiple of 32). Y <= 0 implies X < 32. X < 32."
+      },
+      {
+        "name": "ugt_unsigned",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -128\n  %cmp = icmp ugt i32 %and, 100\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}",
+        "why": "Unsigned ugt. Mask -128. C=100. Next multiple > 100 is 128. X > 127."
+      },
+      {
+        "name": "sge_non_strict",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sge i32 %and, 32\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}",
+        "why": "sge. C=32. 32 is a multiple of 32. Y >= 32 implies X >= 32."
+      },
+      {
+        "name": "sge_non_strict_roundup",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sge i32 %and, 33\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}",
+        "why": "sge. C=33. Next multiple >= 33 is 64. X >= 64."
+      },
+      {
+        "name": "no_opt_mask_not_pow2",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+        "why": "Mask -31 is not of the form -(2^k). Optimization should not trigger."
+      },
+      {
+        "name": "no_opt_overflow_case",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -2\n  %cmp = icmp sgt i32 %and, 2147483647\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+        "why": "C is MaxInt. (X & -2) is even. No even number > MaxInt. Should fold to false, not to X > C'."
+      },
+      {
+        "name": "commuted_and",
+        "ir": "define i1 @test(i32 %x) {\n  %and = and i32 -32, %x\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+        "why": "And operands are commutative. Optimization should work regardless of order."
+      }
+    ],
+    "implementation_notes": "In InstCombine, visitICmpInst:\n1. Match `icmp Pred (and X, Mask), C`.\n2. Check `Mask` is a ConstantInt.\n3. Check if `Mask` is of the form `~(K-1)` (i.e., `Mask` is `0...111...000`). Calculate `K = -Mask`.\n4. Check if `K` is a power of 2.\n5. Compute `C_new`:\n   - If `Pred` is `sgt`/`ugt` (strict greater): We want the smallest multiple of `K` strictly greater than `C`. Let `C_next = RoundUp(C + 1, K)`. If `C_next` overflows, handle (e.g. return false constant). The new comparison is `X > (C_next - 1)`.\n   - If `Pred` is `sge`/`uge` (greater or equal): We want the smallest multiple of `K` greater or equal to `C`. Let `C_next = RoundUp(C, K)`. New comparison: `X >= C_next`.\n   - Similar logic for `slt`/`sle` (swapping operands or using RoundDown).\n6. Replace the instruction.\n\nPitfalls:\n- Overflow in `C_next` calculation (e.g. C is near MAX_INT).\n- Signed vs Unsigned rounding behavior for negative C (APInt handles this, but logic must be explicit).\n- If `C_next` calculation wraps around (e.g. C = -2^31, K=2, signed), `C_next` becomes `0` or `MIN_INT`. Verify equivalence carefully.",
+    "regression_test_notes": "Use `opt -instcombine -S` to verify. Check that the `and` instruction is removed and the `icmp` constant is updated. Ensure that for the 'no_opt' cases, the IR remains unchanged or simplifies differently.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "sgt_i32_basic",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sgt_i16_smaller",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i16 %x) {\n  %and = and i16 %x, -8\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i16 %x) {\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i16 %x) {\n#0:\n  %and = and i16 %x, 65528\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i16 %x) {\n#0:\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i16 %x) {\n  %and = and i16 %x, -8\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i16 %x) {\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i16 %x) {\n#0:\n  %and = and i16 %x, 65528\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i16 %x) {\n#0:\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i16 %x) {\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i16 %x) {\n  %and = and i16 %x, -8\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i16 %x) {\n#0:\n  %cmp = icmp sgt i16 %x, 7\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i16 %x) {\n#0:\n  %and = and i16 %x, 65528\n  %cmp = icmp sgt i16 %and, 5\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sgt_i64_large",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %x) {\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i64 %x) {\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i64 %x) {\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %x) {\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %x) {\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %x) {\n#0:\n  %cmp = icmp sgt i64 %x, 1023\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %x) {\n#0:\n  %and = and i64 %x, -1024\n  %cmp = icmp sgt i64 %and, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sgt_vector",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i32> %x) {\n  %and = and <4 x i32> %x, <i32 -32, i32 -32, i32 -32, i32 -32>\n  %cmp = icmp sgt <4 x i32> %and, <i32 16, i32 16, i32 16, i32 16>\n  ret <4 x i1> %cmp\n}",
+          "tgt": "define <4 x i1> @test(<4 x i32> %x) {\n  %cmp = icmp sgt <4 x i32> %x, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %and = and <4 x i32> %x, { 4294967264, 4294967264, 4294967264, 4294967264 }\n  %cmp = icmp sgt <4 x i32> %and, { 16, 16, 16, 16 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp sgt <4 x i32> %x, { 31, 31, 31, 31 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %x) {\n  %and = and <4 x i32> %x, splat (i32 -32)\n  %cmp = icmp sgt <4 x i32> %and, splat (i32 16)\n  ret <4 x i1> %cmp\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i32> %x) {\n  %cmp = icmp sgt <4 x i32> %x, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %and = and <4 x i32> %x, { 4294967264, 4294967264, 4294967264, 4294967264 }\n  %cmp = icmp sgt <4 x i32> %and, { 16, 16, 16, 16 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp sgt <4 x i32> %x, { 31, 31, 31, 31 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i32> %x) {\n  %cmp = icmp sgt <4 x i32> %x, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i1> %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i32> %x) {\n  %and = and <4 x i32> %x, splat (i32 -32)\n  %cmp = icmp sgt <4 x i32> %and, splat (i32 16)\n  ret <4 x i1> %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %cmp = icmp sgt <4 x i32> %x, { 31, 31, 31, 31 }\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i32> %x) {\n#0:\n  %and = and <4 x i32> %x, { 4294967264, 4294967264, 4294967264, 4294967264 }\n  %cmp = icmp sgt <4 x i32> %and, { 16, 16, 16, 16 }\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sgt_negative_constant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, -50\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, -33\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 4294967246\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 4294967263\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, -50\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, -33\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 4294967246\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 4294967263\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, -33\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, -50\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 4294967263\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 4294967246\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "slt_swapped",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp slt i32 %x, 32\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp slt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ugt_unsigned",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -128\n  %cmp = icmp ugt i32 %and, 100\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967168\n  %cmp = icmp ugt i32 %and, 100\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp ugt i32 %x, 127\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sge_non_strict",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sge i32 %and, 32\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sge i32 %and, 32\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 31\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 31\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 31\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 32\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 31\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sge_non_strict_roundup",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sge i32 %and, 33\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sge i32 %and, 33\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 32\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 32\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 32\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sge i32 %x, 64\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 32\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_opt_mask_not_pow2",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -31\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967265\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_opt_overflow_case",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 %x, -2\n  %cmp = icmp sgt i32 %and, 2147483647\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967294\n  %cmp = icmp sgt i32 %and, 2147483647\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  ret i1 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_and",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\n  %and = and i32 -32, %x\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 4294967264, %x\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\n  %and = and i32 %x, -32\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\n#0:\n  %cmp = icmp sgt i32 %x, 31\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %cmp = icmp sgt i32 %and, 16\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,298 @@
+{
+  "issue_id": "58523",
+  "dataset_file": "58523.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ntarget datalayout = \"e-p:64:64:64-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\ndefine <2 x i8> @sub_to_and_vector1(<2 x i8> %x) {\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\n  %r = sub <2 x i8> <i8 55, i8 55>, %and\n  ret <2 x i8> %r\n}\n\ntarget datalayout = \"e-p:64:64:64-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\ndefine <2 x i8> @sub_to_and_vector1(<2 x i8> %x) {\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\n  ret <2 x i8> %r\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses an optimization that transforms a specific pattern of nested subtraction and bitwise AND into a single addition with a masked operand. This optimization is valid when the inner subtraction has the `nuw` flag and the constants satisfy a specific bitwise relationship preventing borrows into the masked bits.\",\n  \"before_after\": \"Input: `sub C_out, (and (sub nuw C_in, x), Mask)`\\nOutput: `add (and x, Mask), (sub C_out, (and C_in, Mask))`\",\n  \"preconditions\": [\n    \"The outer instruction is a `sub` with a constant RHS (`C_out`).\",\n    \"The LHS of the outer `sub` is an `and` instruction.\",\n    \"The RHS of the `and` is a constant `Mask`.\",\n    \"The LHS of the `and` is a `sub` with the `nuw` (No Unsigned Wrap) flag.\",\n    \"The LHS of the inner `sub` is a constant `C_in`.\",\n    \"The bits of `C_in` must be 1 wherever `Mask` is 0, within the bit-width range of `Mask` (i.e., `(C_in | Mask)` must have no zeros below its most significant set bit). This ensures that subtracting `x` from `C_in` does not generate a borrow that propagates into the bits selected by `Mask`.\"\n  ],\n  \"pattern\": \"The pattern matches expressions of the form `C3 - ((C1 - x) & C2)`. Under the constraint that `C1` covers the zeros of `C2` (preventing borrows into the mask during subtraction) and `C1 - x` does not wrap unsigned (guaranteeing `x & C2 <= C1 & C2`), the expression simplifies to `(x & C2) + (C3 - (C1 & C2))`.\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_Vector_i8\",\n      \"ir\": \"define <2 x i8> @test(<2 x i8> %x) {\\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\\n  %r = sub <2 x i8> <i8 55, i8 55>, %and\\n  ret <2 x i8> %r\\n}\",\n      \"expected_optimized_ir\": \"define <2 x i8> @test(<2 x i8> %x) {\\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\\n  ret <2 x i8> %r\\n}\",\n      \"why\": \"The original provided example. 71 (0b01000111) covers zeros of 120 (0b01111000) in lower bits.\"\n    },\n    {\n      \"name\": \"Scalar_i32_Basic\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %sub = sub nuw i32 255, %x\\n  %and = and i32 %sub, 240\\n  %r = sub i32 10, %and\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %1 = and i32 %x, 240\\n  %r = add i32 %1, -10\\n  ret i32 %r\\n}\",\n      \"why\": \"Scalar version. 255 (0b11111111) covers zeros of 240 (0b11110000). 10 - (255 & 240) = 10 - 240 = -10.\"\n    },\n    {\n      \"name\": \"Sparse_Mask_i16\",\n      \"ir\": \"define i16 @test(i16 %x) {\\n  %sub = sub nuw i16 65535, %x\\n  %and = and i16 %sub, 21845 ; 0x5555\\n  %r = sub i16 100, %and\\n  ret i16 %r\\n}\",\n      \"expected_optimized_ir\": \"define i16 @test(i16 %x) {\\n  %1 = and i16 %x, 21845\\n  %r = add i16 %1, -21845\\n  ret i16 %r\\n}\",\n      \"why\": \"Sparse mask (0x5555). C_in=65535 covers all zeros.\"\n    },\n    {\n      \"name\": \"High_Bits_Only_i64\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %sub = sub nuw i64 18446744069414584320, %x ; 0xFFFFFFFF00000000\\n  %and = and i64 %sub, -18446744073709551616 ; 0x8000000000000000\\n  %r = sub i64 0, %and\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %1 = and i64 %x, -18446744073709551616\\n  %r = sub i64 %1, -9223372036854775808\\n  ret i64 %r\\n}\",\n      \"why\": \"Mask selects only the sign bit. C_in has 1s in lower 32 bits, satisfying the condition.\"\n    },\n    {\n      \"name\": \"Negative_No_NUW\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %sub = sub i8 71, %x\\n  %and = and i8 %sub, 120\\n  %r = sub i8 55, %and\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x) {\\n  %sub = sub i8 71, %x\\n  %and = and i8 %sub, 120\\n  %r = sub i8 55, %and\\n  ret i8 %r\\n}\",\n      \"why\": \"Missing 'nuw' flag makes the optimization illegal because x could be > C_in, causing wrap and borrow.\"\n    },\n    {\n      \"name\": \"Negative_Borrow_Possible\",\n      \"ir\": \"define i8 @test(i8 %x) {\\n  %sub = sub nuw i8 8, %x ; 0b00001000\\n  %and = and i8 %sub, 8 ; 0b00001000\\n  %r = sub i8 100, %and\\n  ret i8 %r\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 @test(i8 %x) {\\n  %sub = sub nuw i8 8, %x\\n  %and = and i8 %sub, 8\\n  %r = sub i8 100, %and\\n  ret i8 %r\\n}\",\n      \"why\": \"C_in (8) does not cover zeros of Mask (8). Subtraction can borrow into the masked bit (e.g., 8 - 7 = 1).\"\n    },\n    {\n      \"name\": \"Vector_Wide_Elements\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\n  %sub = sub nuw <4 x i32> <i32 65535, i32 65535, i32 65535, i32 65535>, %x\\n  %and = and <4 x i32> %sub, <i32 -256, i32 -256, i32 -256, i32 -256>\\n  %r = sub <4 x i32> zeroinitializer, %and\\n  ret <4 x i32> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\n  %1 = and <4 x i32> %x, <i32 -256, i32 -256, i32 -256, i32 -256>\\n  %r = add <4 x i32> %1, <i32 256, i32 256, i32 256, i32 256>\\n  ret <4 x i32> %r\\n}\",\n      \"why\": \"Mask is 0xFFFFFF00. C_in is 0xFFFF. Optimizes to (x & ~0xFF) + 256.\"\n    },\n    {\n      \"name\": \"Commutative_And_Noise\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %sub = sub nuw i32 255, %x\\n  %and = and i32 240, %sub ; Commuted operands\\n  %r = sub i32 10, %and\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %1 = and i32 %x, 240\\n  %r = add i32 %1, -10\\n  ret i32 %r\\n}\",\n      \"why\": \"InstCombine should match commuted 'and' operands.\"\n    }\n  ],\n  \"implementation_notes\": \"This fold should be implemented in InstCombine's visitSub method. The logic should:\\n1. Check if the LHS of the outer `sub` is an `and` with a constant RHS (`Mask`).\\n2. Check if the LHS of the `and` is a `sub` with the `nuw` flag and a constant LHS (`C_in`).\\n3. Verify the bitwise condition: `(C_in | Mask)` should have no gaps of zeros below the most significant bit of `Mask`. This can be checked by verifying `(C_in & (~Mask & ((1 << (BitWidth - countLeadingZeros(Mask))) - 1))) == (~Mask & ...)`. Simpler: `C_in` must have 1s in all positions where `Mask` has 0s, up to the highest bit in `Mask`.\\n4. Compute `K = C_in & Mask`.\\n5. Compute `NewC = C_out - K`.\\n6. Construct `(and x, Mask)` and `add (and x, Mask), NewC`.\\n7. Attempt to infer `nsw`/`nuw` for the new `add` based on the ranges of `x & Mask` (constrained by `nuw` on inner sub) and `NewC`.\",\n  \"regression_test_notes\": \"Tests should be added to `llvm/test/Transforms/InstCombine/sub.ll` or a new dedicated file. Use `CHECK-ALL` for vector cases to ensure all elements are folded. Include negative checks with `CHECK-NOT` to ensure incorrect borrows or missing flags do not trigger the fold.\",\n  \"clarifying_questions\": [\n    \"Should the implementation attempt to infer 'nsw' for the resulting 'add' instruction if it can be proven safe from the constant ranges?\",\n    \"Is this pattern observed frequently in specific codebases (e.g., bit manipulation libraries, graphics kernels) to justify prioritization?\",\n    \"Should the fold handle the case where the outer 'sub' is actually an 'add' with a negative constant (after canonicalization), or strictly match 'sub'?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses an optimization that transforms a specific pattern of nested subtraction and bitwise AND into a single addition with a masked operand. This optimization is valid when the inner subtraction has the `nuw` flag and the constants satisfy a specific bitwise relationship preventing borrows into the masked bits.",
+    "before_after": "Input: `sub C_out, (and (sub nuw C_in, x), Mask)`\nOutput: `add (and x, Mask), (sub C_out, (and C_in, Mask))`",
+    "preconditions": [
+      "The outer instruction is a `sub` with a constant RHS (`C_out`).",
+      "The LHS of the outer `sub` is an `and` instruction.",
+      "The RHS of the `and` is a constant `Mask`.",
+      "The LHS of the `and` is a `sub` with the `nuw` (No Unsigned Wrap) flag.",
+      "The LHS of the inner `sub` is a constant `C_in`.",
+      "The bits of `C_in` must be 1 wherever `Mask` is 0, within the bit-width range of `Mask` (i.e., `(C_in | Mask)` must have no zeros below its most significant set bit). This ensures that subtracting `x` from `C_in` does not generate a borrow that propagates into the bits selected by `Mask`."
+    ],
+    "pattern": "The pattern matches expressions of the form `C3 - ((C1 - x) & C2)`. Under the constraint that `C1` covers the zeros of `C2` (preventing borrows into the mask during subtraction) and `C1 - x` does not wrap unsigned (guaranteeing `x & C2 <= C1 & C2`), the expression simplifies to `(x & C2) + (C3 - (C1 & C2))`.",
+    "testcases": [
+      {
+        "name": "Original_Vector_i8",
+        "ir": "define <2 x i8> @test(<2 x i8> %x) {\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\n  %r = sub <2 x i8> <i8 55, i8 55>, %and\n  ret <2 x i8> %r\n}",
+        "expected_optimized_ir": "define <2 x i8> @test(<2 x i8> %x) {\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\n  ret <2 x i8> %r\n}",
+        "why": "The original provided example. 71 (0b01000111) covers zeros of 120 (0b01111000) in lower bits."
+      },
+      {
+        "name": "Scalar_i32_Basic",
+        "ir": "define i32 @test(i32 %x) {\n  %sub = sub nuw i32 255, %x\n  %and = and i32 %sub, 240\n  %r = sub i32 10, %and\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %1 = and i32 %x, 240\n  %r = add i32 %1, -10\n  ret i32 %r\n}",
+        "why": "Scalar version. 255 (0b11111111) covers zeros of 240 (0b11110000). 10 - (255 & 240) = 10 - 240 = -10."
+      },
+      {
+        "name": "Sparse_Mask_i16",
+        "ir": "define i16 @test(i16 %x) {\n  %sub = sub nuw i16 65535, %x\n  %and = and i16 %sub, 21845 ; 0x5555\n  %r = sub i16 100, %and\n  ret i16 %r\n}",
+        "expected_optimized_ir": "define i16 @test(i16 %x) {\n  %1 = and i16 %x, 21845\n  %r = add i16 %1, -21845\n  ret i16 %r\n}",
+        "why": "Sparse mask (0x5555). C_in=65535 covers all zeros."
+      },
+      {
+        "name": "High_Bits_Only_i64",
+        "ir": "define i64 @test(i64 %x) {\n  %sub = sub nuw i64 18446744069414584320, %x ; 0xFFFFFFFF00000000\n  %and = and i64 %sub, -18446744073709551616 ; 0x8000000000000000\n  %r = sub i64 0, %and\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %1 = and i64 %x, -18446744073709551616\n  %r = sub i64 %1, -9223372036854775808\n  ret i64 %r\n}",
+        "why": "Mask selects only the sign bit. C_in has 1s in lower 32 bits, satisfying the condition."
+      },
+      {
+        "name": "Negative_No_NUW",
+        "ir": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+        "why": "Missing 'nuw' flag makes the optimization illegal because x could be > C_in, causing wrap and borrow."
+      },
+      {
+        "name": "Negative_Borrow_Possible",
+        "ir": "define i8 @test(i8 %x) {\n  %sub = sub nuw i8 8, %x ; 0b00001000\n  %and = and i8 %sub, 8 ; 0b00001000\n  %r = sub i8 100, %and\n  ret i8 %r\n}",
+        "expected_optimized_ir": "define i8 @test(i8 @test(i8 %x) {\n  %sub = sub nuw i8 8, %x\n  %and = and i8 %sub, 8\n  %r = sub i8 100, %and\n  ret i8 %r\n}",
+        "why": "C_in (8) does not cover zeros of Mask (8). Subtraction can borrow into the masked bit (e.g., 8 - 7 = 1)."
+      },
+      {
+        "name": "Vector_Wide_Elements",
+        "ir": "define <4 x i32> @test(<4 x i32> %x) {\n  %sub = sub nuw <4 x i32> <i32 65535, i32 65535, i32 65535, i32 65535>, %x\n  %and = and <4 x i32> %sub, <i32 -256, i32 -256, i32 -256, i32 -256>\n  %r = sub <4 x i32> zeroinitializer, %and\n  ret <4 x i32> %r\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x) {\n  %1 = and <4 x i32> %x, <i32 -256, i32 -256, i32 -256, i32 -256>\n  %r = add <4 x i32> %1, <i32 256, i32 256, i32 256, i32 256>\n  ret <4 x i32> %r\n}",
+        "why": "Mask is 0xFFFFFF00. C_in is 0xFFFF. Optimizes to (x & ~0xFF) + 256."
+      },
+      {
+        "name": "Commutative_And_Noise",
+        "ir": "define i32 @test(i32 %x) {\n  %sub = sub nuw i32 255, %x\n  %and = and i32 240, %sub ; Commuted operands\n  %r = sub i32 10, %and\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %1 = and i32 %x, 240\n  %r = add i32 %1, -10\n  ret i32 %r\n}",
+        "why": "InstCombine should match commuted 'and' operands."
+      }
+    ],
+    "implementation_notes": "This fold should be implemented in InstCombine's visitSub method. The logic should:\n1. Check if the LHS of the outer `sub` is an `and` with a constant RHS (`Mask`).\n2. Check if the LHS of the `and` is a `sub` with the `nuw` flag and a constant LHS (`C_in`).\n3. Verify the bitwise condition: `(C_in | Mask)` should have no gaps of zeros below the most significant bit of `Mask`. This can be checked by verifying `(C_in & (~Mask & ((1 << (BitWidth - countLeadingZeros(Mask))) - 1))) == (~Mask & ...)`. Simpler: `C_in` must have 1s in all positions where `Mask` has 0s, up to the highest bit in `Mask`.\n4. Compute `K = C_in & Mask`.\n5. Compute `NewC = C_out - K`.\n6. Construct `(and x, Mask)` and `add (and x, Mask), NewC`.\n7. Attempt to infer `nsw`/`nuw` for the new `add` based on the ranges of `x & Mask` (constrained by `nuw` on inner sub) and `NewC`.",
+    "regression_test_notes": "Tests should be added to `llvm/test/Transforms/InstCombine/sub.ll` or a new dedicated file. Use `CHECK-ALL` for vector cases to ensure all elements are folded. Include negative checks with `CHECK-NOT` to ensure incorrect borrows or missing flags do not trigger the fold.",
+    "clarifying_questions": [
+      "Should the implementation attempt to infer 'nsw' for the resulting 'add' instruction if it can be proven safe from the constant ranges?",
+      "Is this pattern observed frequently in specific codebases (e.g., bit manipulation libraries, graphics kernels) to justify prioritization?",
+      "Should the fold handle the case where the outer 'sub' is actually an 'add' with a negative constant (after canonicalization), or strictly match 'sub'?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "Original_Vector_i8",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i8> @test(<2 x i8> %x) {\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\n  %r = sub <2 x i8> <i8 55, i8 55>, %and\n  ret <2 x i8> %r\n}",
+          "tgt": "define <2 x i8> @test(<2 x i8> %x) {\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\n  ret <2 x i8> %r\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %sub = sub nuw <2 x i8> { 71, 71 }, %x\n  %and = and <2 x i8> %sub, { 120, 120 }\n  %r = sub <2 x i8> { 55, 55 }, %and\n  ret <2 x i8> %r\n}\n=>\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %#1 = and <2 x i8> %x, { 120, 120 }\n  %r = add nsw <2 x i8> %#1, { 247, 247 }\n  ret <2 x i8> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i8> @test(<2 x i8> %x) {\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\n  %r = sub nsw <2 x i8> <i8 55, i8 55>, %and\n  ret <2 x i8> %r\n}\n",
+          "tgt": "define <2 x i8> @test(<2 x i8> %x) {\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\n  ret <2 x i8> %r\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %sub = sub nuw <2 x i8> { 71, 71 }, %x\n  %and = and <2 x i8> %sub, { 120, 120 }\n  %r = sub nsw <2 x i8> { 55, 55 }, %and\n  ret <2 x i8> %r\n}\n=>\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %#1 = and <2 x i8> %x, { 120, 120 }\n  %r = add nsw <2 x i8> %#1, { 247, 247 }\n  ret <2 x i8> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i8> @test(<2 x i8> %x) {\n  %1 = and <2 x i8> %x, <i8 120, i8 120>\n  %r = add nsw <2 x i8> %1, <i8 -9, i8 -9>\n  ret <2 x i8> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i8> @test(<2 x i8> %x) {\n  %sub = sub nuw <2 x i8> <i8 71, i8 71>, %x\n  %and = and <2 x i8> %sub, <i8 120, i8 120>\n  %r = sub nsw <2 x i8> <i8 55, i8 55>, %and\n  ret <2 x i8> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %#1 = and <2 x i8> %x, { 120, 120 }\n  %r = add nsw <2 x i8> %#1, { 247, 247 }\n  ret <2 x i8> %r\n}\n=>\ndefine <2 x i8> @test(<2 x i8> %x) {\n#0:\n  %sub = sub nuw <2 x i8> { 71, 71 }, %x\n  %and = and <2 x i8> %sub, { 120, 120 }\n  %r = sub nsw <2 x i8> { 55, 55 }, %and\n  ret <2 x i8> %r\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<2 x i8> %x = < #x00 (0), #xc8 (200, -56) >\n\nSource:\n<2 x i8> %#1 = < #x00 (0), #x48 (72) >\n<2 x i8> %r = < #xf7 (247, -9), #x3f (63) >\n\nTarget:\n<2 x i8> %sub = < #x47 (71), poison >\n<2 x i8> %and = < #x40 (64), poison >\n<2 x i8> %r = < #xf7 (247, -9), poison >\nSource value: < #xf7 (247, -9), #x3f (63) >\nTarget value: < #xf7 (247, -9), poison >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Scalar_i32_Basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\n  %sub = sub nuw i32 255, %x\n  %and = and i32 %sub, 240\n  %r = sub i32 10, %and\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x) {\n  %1 = and i32 %x, 240\n  %r = add i32 %1, -10\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %sub = sub nuw i32 255, %x\n  %and = and i32 %sub, 240\n  %r = sub i32 10, %and\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %#1 = and i32 %x, 240\n  %r = add i32 %#1, 4294967286\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\n\nSource:\ni32 %sub = #x000000ff (255)\ni32 %and = #x000000f0 (240)\ni32 %r = #xffffff1a (4294967066, -230)\n\nTarget:\ni32 %#1 = #x00000000 (0)\ni32 %r = #xfffffff6 (4294967286, -10)\nSource value: #xffffff1a (4294967066, -230)\nTarget value: #xfffffff6 (4294967286, -10)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Sparse_Mask_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @test(i16 %x) {\n  %sub = sub nuw i16 65535, %x\n  %and = and i16 %sub, 21845 ; 0x5555\n  %r = sub i16 100, %and\n  ret i16 %r\n}",
+          "tgt": "define i16 @test(i16 %x) {\n  %1 = and i16 %x, 21845\n  %r = add i16 %1, -21845\n  ret i16 %r\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i16 %x) {\n#0:\n  %sub = sub nuw i16 65535, %x\n  %and = and i16 %sub, 21845\n  %r = sub i16 100, %and\n  ret i16 %r\n}\n=>\ndefine i16 @test(i16 %x) {\n#0:\n  %#1 = and i16 %x, 21845\n  %r = add i16 %#1, 43691\n  ret i16 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni16 %x = #x0000 (0)\n\nSource:\ni16 %sub = #xffff (65535, -1)\ni16 %and = #x5555 (21845)\ni16 %r = #xab0f (43791, -21745)\n\nTarget:\ni16 %#1 = #x0000 (0)\ni16 %r = #xaaab (43691, -21845)\nSource value: #xab0f (43791, -21745)\nTarget value: #xaaab (43691, -21845)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "High_Bits_Only_i64",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Negative_No_NUW",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+          "tgt": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub nsw i8 55, %and\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub nsw i8 55, %and\n  ret i8 %r\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x) {\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub nsw i8 55, %and\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub i8 55, %and\n  ret i8 %r\n}\n=>\ndefine i8 @test(i8 %x) {\n#0:\n  %sub = sub i8 71, %x\n  %and = and i8 %sub, 120\n  %r = sub nsw i8 55, %and\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative_Borrow_Possible",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": -1,
+        "current_opt": 4,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": false,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmpj3keyj3x.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmpj3keyj3x.ll:1:20: error: expected ')' at end of argument list\ndefine i8 @test(i8 @test(i8 %x) {\n                   ^\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Vector_Wide_Elements",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x) {\n  %sub = sub nuw <4 x i32> <i32 65535, i32 65535, i32 65535, i32 65535>, %x\n  %and = and <4 x i32> %sub, <i32 -256, i32 -256, i32 -256, i32 -256>\n  %r = sub <4 x i32> zeroinitializer, %and\n  ret <4 x i32> %r\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x) {\n  %1 = and <4 x i32> %x, <i32 -256, i32 -256, i32 -256, i32 -256>\n  %r = add <4 x i32> %1, <i32 256, i32 256, i32 256, i32 256>\n  ret <4 x i32> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %sub = sub nuw <4 x i32> { 65535, 65535, 65535, 65535 }, %x\n  %and = and <4 x i32> %sub, { 4294967040, 4294967040, 4294967040, 4294967040 }\n  %r = sub <4 x i32> { 0, 0, 0, 0 }, %and\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\n#0:\n  %#1 = and <4 x i32> %x, { 4294967040, 4294967040, 4294967040, 4294967040 }\n  %r = add <4 x i32> %#1, { 256, 256, 256, 256 }\n  ret <4 x i32> %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i32> %x = < #x00000000 (0), #x00000000 (0), #x00000000 (0), #x00000000 (0) >\n\nSource:\n<4 x i32> %sub = < #x0000ffff (65535), #x0000ffff (65535), #x0000ffff (65535), #x0000ffff (65535) >\n<4 x i32> %and = < #x0000ff00 (65280), #x0000ff00 (65280), #x0000ff00 (65280), #x0000ff00 (65280) >\n<4 x i32> %r = < #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280) >\n\nTarget:\n<4 x i32> %#1 = < #x00000000 (0), #x00000000 (0), #x00000000 (0), #x00000000 (0) >\n<4 x i32> %r = < #x00000100 (256), #x00000100 (256), #x00000100 (256), #x00000100 (256) >\nSource value: < #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280), #xffff0100 (4294902016, -65280) >\nTarget value: < #x00000100 (256), #x00000100 (256), #x00000100 (256), #x00000100 (256) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Commutative_And_Noise",
+      "missed_optimization": false,
+      "cost": {
+        "source": 4,
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\n  %sub = sub nuw i32 255, %x\n  %and = and i32 240, %sub ; Commuted operands\n  %r = sub i32 10, %and\n  ret i32 %r\n}",
+          "tgt": "define i32 @test(i32 %x) {\n  %1 = and i32 %x, 240\n  %r = add i32 %1, -10\n  ret i32 %r\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\n#0:\n  %sub = sub nuw i32 255, %x\n  %and = and i32 240, %sub\n  %r = sub i32 10, %and\n  ret i32 %r\n}\n=>\ndefine i32 @test(i32 %x) {\n#0:\n  %#1 = and i32 %x, 240\n  %r = add i32 %#1, 4294967286\n  ret i32 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\n\nSource:\ni32 %sub = #x000000ff (255)\ni32 %and = #x000000f0 (240)\ni32 %r = #xffffff1a (4294967066, -230)\n\nTarget:\ni32 %#1 = #x00000000 (0)\ni32 %r = #xfffffff6 (4294967286, -10)\nSource value: #xffffff1a (4294967066, -230)\nTarget value: #xfffffff6 (4294967286, -10)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.2s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

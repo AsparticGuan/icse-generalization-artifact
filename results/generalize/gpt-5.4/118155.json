@@ -1,0 +1,528 @@
+{
+  "issue_id": "118155",
+  "dataset_file": "118155.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue is the concrete idiom:\n\n- `umax(a, 10)` clamps `a` to be at least `10`\n- then `add ..., -10` subtracts that same clamp value\n\nSo `umax(a, C) - C` is really `max(a - C, 0)`, i.e. unsigned saturating subtract: `llvm.usub.sat(a, C)`. The motivating test shows this for `i8` and `C=10`.\n\nThe patch generalizes that exact shape in `foldAddWithConstant()` by matching:\n\n- an `add` with constant RHS `C`\n- where the non-constant operand is `m_OneUse(m_UMax(X, -C))`\n\nand rewrites:\n\n- `add (umax X, -C), C` with `C` negative\n- into `llvm.usub.sat(X, -C)`\n\nKey points:\n- it is not a one-off for `10`; it works for any integer type/constant pair where the add constant is the negation of the `umax` threshold.\n- the transform requires exact constant agreement (`umax(X, K) + -K` only).\n- `m_OneUse` constrains profitability/safety of replacing the matched `umax`.\n\nThe dev tests broaden coverage around that abstraction:\n- `fold_add_umax_to_usub`: the direct positive case.\n- `fold_add_umax_to_usub_incorrect_rhs`: negative test proving no fold if constants do not match (`10` vs `-11`).\n- `fold_add_umax_to_usub_multiuse`: checks the one-use restriction blocks the fold when `umax` has another consumer.\n- `uadd_sat_via_add_swapped_cmp_select_nonstrict`: separate generalized saturating-arithmetic coverage showing InstCombine also recognizes equivalent non-intrinsic forms even with swapped operands/non-strict compare structure.\n\nThis is a good template: start from one algebraic idiom, encode exact matcher constraints, then add positive/negative/multiuse/equivalent-form tests.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i8 @test(i8 %a) {\n  %1 = call i8 @llvm.umax.i8(i8 %a, i8 10)\n  %sel = add i8 %1, -10\n  ret i8 %sel\n}\n\ndefine i8 @test(i8 %a) {\n  %res = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\n  ret i8 %res\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Fold an add of a negative constant applied to an unsigned-maximum clamp into unsigned saturating subtract.\",\n    \"match\": {\n      \"root\": \"(add T Y, C)\",\n      \"constraints\": [\n        \"T is any integer scalar or integer vector type supported by the involved intrinsics\",\n        \"C is a constant integer splat/value\",\n        \"C is negative modulo the bitwidth, i.e. there exists K such that K = -C\",\n        \"Y is one-use\",\n        \"Y matches llvm.umax(X, K) or llvm.umax(K, X)\",\n        \"The umax threshold K must match exactly the negation of the add constant: K == -C\"\n      ],\n      \"canonical_form\": \"add (umax X, K), -K\"\n    },\n    \"rewrite\": {\n      \"to\": \"llvm.usub.sat(X, K)\",\n      \"equivalence\": \"umax(X, K) - K == usub.sat(X, K)\"\n    },\n    \"notes\": [\n      \"Works for any integer bitwidth and vector-of-integer type where llvm.umax and llvm.usub.sat exist.\",\n      \"The add constant and umax clamp constant must agree exactly; no fold for mismatched constants.\",\n      \"One-use on the matched umax mirrors the intended InstCombine profitability/safety restriction.\",\n      \"Commuted operand order of the add and of the umax should also be considered equivalent shapes.\",\n      \"Important corner cases include K = 0, K = 1, K = unsigned max, and very small integer widths.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_basic\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_basic(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 10)\\n  %r = add i8 %m, -10\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_basic(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_umax_operands_swapped\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_umax_operands_swapped(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 10, i8 %a)\\n  %r = add i8 %m, -10\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_umax_operands_swapped(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_add_operands_swapped\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_add_operands_swapped(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 10)\\n  %r = add i8 -10, %m\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_add_operands_swapped(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i16_basic\",\n      \"ir\": \"declare i16 @llvm.umax.i16(i16, i16)\\ndeclare i16 @llvm.usub.sat.i16(i16, i16)\\n\\ndefine i16 @fold_add_umax_to_usub_i16_basic(i16 %a) {\\n  %m = call i16 @llvm.umax.i16(i16 %a, i16 1234)\\n  %r = add i16 %m, -1234\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i16 @llvm.usub.sat.i16(i16, i16)\\n\\ndefine i16 @fold_add_umax_to_usub_i16_basic(i16 %a) {\\n  %r = call i16 @llvm.usub.sat.i16(i16 %a, i16 1234)\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i32_basic\",\n      \"ir\": \"declare i32 @llvm.umax.i32(i32, i32)\\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\\n\\ndefine i32 @fold_add_umax_to_usub_i32_basic(i32 %a) {\\n  %m = call i32 @llvm.umax.i32(i32 %a, i32 100000)\\n  %r = add i32 %m, -100000\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i32 @llvm.usub.sat.i32(i32, i32)\\n\\ndefine i32 @fold_add_umax_to_usub_i32_basic(i32 %a) {\\n  %r = call i32 @llvm.usub.sat.i32(i32 %a, i32 100000)\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i64_basic\",\n      \"ir\": \"declare i64 @llvm.umax.i64(i64, i64)\\ndeclare i64 @llvm.usub.sat.i64(i64, i64)\\n\\ndefine i64 @fold_add_umax_to_usub_i64_basic(i64 %a) {\\n  %m = call i64 @llvm.umax.i64(i64 %a, i64 4294967296)\\n  %r = add i64 %m, -4294967296\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i64 @llvm.usub.sat.i64(i64, i64)\\n\\ndefine i64 @fold_add_umax_to_usub_i64_basic(i64 %a) {\\n  %r = call i64 @llvm.usub.sat.i64(i64 %a, i64 4294967296)\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i3_small_width\",\n      \"ir\": \"declare i3 @llvm.umax.i3(i3, i3)\\ndeclare i3 @llvm.usub.sat.i3(i3, i3)\\n\\ndefine i3 @fold_add_umax_to_usub_i3_small_width(i3 %a) {\\n  %m = call i3 @llvm.umax.i3(i3 %a, i3 5)\\n  %r = add i3 %m, -5\\n  ret i3 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i3 @llvm.usub.sat.i3(i3, i3)\\n\\ndefine i3 @fold_add_umax_to_usub_i3_small_width(i3 %a) {\\n  %r = call i3 @llvm.usub.sat.i3(i3 %a, i3 5)\\n  ret i3 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i1_zero_threshold\",\n      \"ir\": \"declare i1 @llvm.umax.i1(i1, i1)\\ndeclare i1 @llvm.usub.sat.i1(i1, i1)\\n\\ndefine i1 @fold_add_umax_to_usub_i1_zero_threshold(i1 %a) {\\n  %m = call i1 @llvm.umax.i1(i1 %a, i1 0)\\n  %r = add i1 %m, 0\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i1 @llvm.usub.sat.i1(i1, i1)\\n\\ndefine i1 @fold_add_umax_to_usub_i1_zero_threshold(i1 %a) {\\n  %r = call i1 @llvm.usub.sat.i1(i1 %a, i1 0)\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_zero_threshold\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_zero_threshold(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 0)\\n  %r = add i8 %m, 0\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_zero_threshold(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 0)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_threshold_one\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_threshold_one(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 1)\\n  %r = add i8 %m, -1\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_threshold_one(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 1)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i8_threshold_allones\",\n      \"ir\": \"declare i8 @llvm.umax.i8(i8, i8)\\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_threshold_allones(i8 %a) {\\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 -1)\\n  %r = add i8 %m, 1\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i8 @llvm.usub.sat.i8(i8, i8)\\n\\ndefine i8 @fold_add_umax_to_usub_i8_threshold_allones(i8 %a) {\\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 -1)\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_i16_threshold_allones\",\n      \"ir\": \"declare i16 @llvm.umax.i16(i16, i16)\\ndeclare i16 @llvm.usub.sat.i16(i16, i16)\\n\\ndefine i16 @fold_add_umax_to_usub_i16_threshold_allones(i16 %a) {\\n  %m = call i16 @llvm.umax.i16(i16 -1, i16 %a)\\n  %r = add i16 1, %m\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i16 @llvm.usub.sat.i16(i16, i16)\\n\\ndefine i16 @fold_add_umax_to_usub_i16_threshold_allones(i16 %a) {\\n  %r = call i16 @llvm.usub.sat.i16(i16 %a, i16 -1)\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v4i8_basic\",\n      \"ir\": \"declare <4 x i8> @llvm.umax.v4i8(<4 x i8>, <4 x i8>)\\ndeclare <4 x i8> @llvm.usub.sat.v4i8(<4 x i8>, <4 x i8>)\\n\\ndefine <4 x i8> @fold_add_umax_to_usub_v4i8_basic(<4 x i8> %a) {\\n  %m = call <4 x i8> @llvm.umax.v4i8(<4 x i8> %a, <4 x i8> <i8 10, i8 10, i8 10, i8 10>)\\n  %r = add <4 x i8> %m, <i8 -10, i8 -10, i8 -10, i8 -10>\\n  ret <4 x i8> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <4 x i8> @llvm.usub.sat.v4i8(<4 x i8>, <4 x i8>)\\n\\ndefine <4 x i8> @fold_add_umax_to_usub_v4i8_basic(<4 x i8> %a) {\\n  %r = call <4 x i8> @llvm.usub.sat.v4i8(<4 x i8> %a, <4 x i8> <i8 10, i8 10, i8 10, i8 10>)\\n  ret <4 x i8> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v2i16_basic\",\n      \"ir\": \"declare <2 x i16> @llvm.umax.v2i16(<2 x i16>, <2 x i16>)\\ndeclare <2 x i16> @llvm.usub.sat.v2i16(<2 x i16>, <2 x i16>)\\n\\ndefine <2 x i16> @fold_add_umax_to_usub_v2i16_basic(<2 x i16> %a) {\\n  %m = call <2 x i16> @llvm.umax.v2i16(<2 x i16> <i16 300, i16 300>, <2 x i16> %a)\\n  %r = add <2 x i16> <i16 -300, i16 -300>, %m\\n  ret <2 x i16> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <2 x i16> @llvm.usub.sat.v2i16(<2 x i16>, <2 x i16>)\\n\\ndefine <2 x i16> @fold_add_umax_to_usub_v2i16_basic(<2 x i16> %a) {\\n  %r = call <2 x i16> @llvm.usub.sat.v2i16(<2 x i16> %a, <2 x i16> <i16 300, i16 300>)\\n  ret <2 x i16> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v8i8_threshold_one\",\n      \"ir\": \"declare <8 x i8> @llvm.umax.v8i8(<8 x i8>, <8 x i8>)\\ndeclare <8 x i8> @llvm.usub.sat.v8i8(<8 x i8>, <8 x i8>)\\n\\ndefine <8 x i8> @fold_add_umax_to_usub_v8i8_threshold_one(<8 x i8> %a) {\\n  %m = call <8 x i8> @llvm.umax.v8i8(<8 x i8> %a, <8 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>)\\n  %r = add <8 x i8> %m, <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>\\n  ret <8 x i8> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <8 x i8> @llvm.usub.sat.v8i8(<8 x i8>, <8 x i8>)\\n\\ndefine <8 x i8> @fold_add_umax_to_usub_v8i8_threshold_one(<8 x i8> %a) {\\n  %r = call <8 x i8> @llvm.usub.sat.v8i8(<8 x i8> %a, <8 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>)\\n  ret <8 x i8> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v4i32_zero_threshold\",\n      \"ir\": \"declare <4 x i32> @llvm.umax.v4i32(<4 x i32>, <4 x i32>)\\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)\\n\\ndefine <4 x i32> @fold_add_umax_to_usub_v4i32_zero_threshold(<4 x i32> %a) {\\n  %m = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %a, <4 x i32> zeroinitializer)\\n  %r = add <4 x i32> %m, zeroinitializer\\n  ret <4 x i32> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)\\n\\ndefine <4 x i32> @fold_add_umax_to_usub_v4i32_zero_threshold(<4 x i32> %a) {\\n  %r = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> zeroinitializer)\\n  ret <4 x i32> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v2i64_large_constant\",\n      \"ir\": \"declare <2 x i64> @llvm.umax.v2i64(<2 x i64>, <2 x i64>)\\ndeclare <2 x i64> @llvm.usub.sat.v2i64(<2 x i64>, <2 x i64>)\\n\\ndefine <2 x i64> @fold_add_umax_to_usub_v2i64_large_constant(<2 x i64> %a) {\\n  %m = call <2 x i64> @llvm.umax.v2i64(<2 x i64> %a, <2 x i64> <i64 9223372036854775808, i64 9223372036854775808>)\\n  %r = add <2 x i64> %m, <i64 -9223372036854775808, i64 -9223372036854775808>\\n  ret <2 x i64> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <2 x i64> @llvm.usub.sat.v2i64(<2 x i64>, <2 x i64>)\\n\\ndefine <2 x i64> @fold_add_umax_to_usub_v2i64_large_constant(<2 x i64> %a) {\\n  %r = call <2 x i64> @llvm.usub.sat.v2i64(<2 x i64> %a, <2 x i64> <i64 9223372036854775808, i64 9223372036854775808>)\\n  ret <2 x i64> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"fold_add_umax_to_usub_v16i8_allones_threshold\",\n      \"ir\": \"declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)\\ndeclare <16 x i8> @llvm.usub.sat.v16i8(<16 x i8>, <16 x i8>)\\n\\ndefine <16 x i8> @fold_add_umax_to_usub_v16i8_allones_threshold(<16 x i8> %a) {\\n  %m = call <16 x i8> @llvm.umax.v16i8(<16 x i8> <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>, <16 x i8> %a)\\n  %r = add <16 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>, %m\\n  ret <16 x i8> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare <16 x i8> @llvm.usub.sat.v16i8(<16 x i8>, <16 x i8>)\\n\\ndefine <16 x i8> @fold_add_umax_to_usub_v16i8_allones_threshold(<16 x i8> %a) {\\n  %r = call <16 x i8> @llvm.usub.sat.v16i8(<16 x i8> %a, <16 x i8> <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>)\\n  ret <16 x i8> %r\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold an add of a negative constant applied to an unsigned-maximum clamp into unsigned saturating subtract.",
+      "match": {
+        "root": "(add T Y, C)",
+        "constraints": [
+          "T is any integer scalar or integer vector type supported by the involved intrinsics",
+          "C is a constant integer splat/value",
+          "C is negative modulo the bitwidth, i.e. there exists K such that K = -C",
+          "Y is one-use",
+          "Y matches llvm.umax(X, K) or llvm.umax(K, X)",
+          "The umax threshold K must match exactly the negation of the add constant: K == -C"
+        ],
+        "canonical_form": "add (umax X, K), -K"
+      },
+      "rewrite": {
+        "to": "llvm.usub.sat(X, K)",
+        "equivalence": "umax(X, K) - K == usub.sat(X, K)"
+      },
+      "notes": [
+        "Works for any integer bitwidth and vector-of-integer type where llvm.umax and llvm.usub.sat exist.",
+        "The add constant and umax clamp constant must agree exactly; no fold for mismatched constants.",
+        "One-use on the matched umax mirrors the intended InstCombine profitability/safety restriction.",
+        "Commuted operand order of the add and of the umax should also be considered equivalent shapes.",
+        "Important corner cases include K = 0, K = 1, K = unsigned max, and very small integer widths."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "fold_add_umax_to_usub_i8_basic",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_basic(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 10)\n  %r = add i8 %m, -10\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_basic(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i8_umax_operands_swapped",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_umax_operands_swapped(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 10, i8 %a)\n  %r = add i8 %m, -10\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_umax_operands_swapped(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i8_add_operands_swapped",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_add_operands_swapped(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 10)\n  %r = add i8 -10, %m\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_add_operands_swapped(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 10)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i16_basic",
+        "ir": "declare i16 @llvm.umax.i16(i16, i16)\ndeclare i16 @llvm.usub.sat.i16(i16, i16)\n\ndefine i16 @fold_add_umax_to_usub_i16_basic(i16 %a) {\n  %m = call i16 @llvm.umax.i16(i16 %a, i16 1234)\n  %r = add i16 %m, -1234\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "declare i16 @llvm.usub.sat.i16(i16, i16)\n\ndefine i16 @fold_add_umax_to_usub_i16_basic(i16 %a) {\n  %r = call i16 @llvm.usub.sat.i16(i16 %a, i16 1234)\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i32_basic",
+        "ir": "declare i32 @llvm.umax.i32(i32, i32)\ndeclare i32 @llvm.usub.sat.i32(i32, i32)\n\ndefine i32 @fold_add_umax_to_usub_i32_basic(i32 %a) {\n  %m = call i32 @llvm.umax.i32(i32 %a, i32 100000)\n  %r = add i32 %m, -100000\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "declare i32 @llvm.usub.sat.i32(i32, i32)\n\ndefine i32 @fold_add_umax_to_usub_i32_basic(i32 %a) {\n  %r = call i32 @llvm.usub.sat.i32(i32 %a, i32 100000)\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i64_basic",
+        "ir": "declare i64 @llvm.umax.i64(i64, i64)\ndeclare i64 @llvm.usub.sat.i64(i64, i64)\n\ndefine i64 @fold_add_umax_to_usub_i64_basic(i64 %a) {\n  %m = call i64 @llvm.umax.i64(i64 %a, i64 4294967296)\n  %r = add i64 %m, -4294967296\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "declare i64 @llvm.usub.sat.i64(i64, i64)\n\ndefine i64 @fold_add_umax_to_usub_i64_basic(i64 %a) {\n  %r = call i64 @llvm.usub.sat.i64(i64 %a, i64 4294967296)\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i3_small_width",
+        "ir": "declare i3 @llvm.umax.i3(i3, i3)\ndeclare i3 @llvm.usub.sat.i3(i3, i3)\n\ndefine i3 @fold_add_umax_to_usub_i3_small_width(i3 %a) {\n  %m = call i3 @llvm.umax.i3(i3 %a, i3 5)\n  %r = add i3 %m, -5\n  ret i3 %r\n}\n",
+        "expected_optimized_ir": "declare i3 @llvm.usub.sat.i3(i3, i3)\n\ndefine i3 @fold_add_umax_to_usub_i3_small_width(i3 %a) {\n  %r = call i3 @llvm.usub.sat.i3(i3 %a, i3 5)\n  ret i3 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i1_zero_threshold",
+        "ir": "declare i1 @llvm.umax.i1(i1, i1)\ndeclare i1 @llvm.usub.sat.i1(i1, i1)\n\ndefine i1 @fold_add_umax_to_usub_i1_zero_threshold(i1 %a) {\n  %m = call i1 @llvm.umax.i1(i1 %a, i1 0)\n  %r = add i1 %m, 0\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "declare i1 @llvm.usub.sat.i1(i1, i1)\n\ndefine i1 @fold_add_umax_to_usub_i1_zero_threshold(i1 %a) {\n  %r = call i1 @llvm.usub.sat.i1(i1 %a, i1 0)\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i8_zero_threshold",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_zero_threshold(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 0)\n  %r = add i8 %m, 0\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_zero_threshold(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 0)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i8_threshold_one",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_threshold_one(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 1)\n  %r = add i8 %m, -1\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_threshold_one(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 1)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i8_threshold_allones",
+        "ir": "declare i8 @llvm.umax.i8(i8, i8)\ndeclare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_threshold_allones(i8 %a) {\n  %m = call i8 @llvm.umax.i8(i8 %a, i8 -1)\n  %r = add i8 %m, 1\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "declare i8 @llvm.usub.sat.i8(i8, i8)\n\ndefine i8 @fold_add_umax_to_usub_i8_threshold_allones(i8 %a) {\n  %r = call i8 @llvm.usub.sat.i8(i8 %a, i8 -1)\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_i16_threshold_allones",
+        "ir": "declare i16 @llvm.umax.i16(i16, i16)\ndeclare i16 @llvm.usub.sat.i16(i16, i16)\n\ndefine i16 @fold_add_umax_to_usub_i16_threshold_allones(i16 %a) {\n  %m = call i16 @llvm.umax.i16(i16 -1, i16 %a)\n  %r = add i16 1, %m\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "declare i16 @llvm.usub.sat.i16(i16, i16)\n\ndefine i16 @fold_add_umax_to_usub_i16_threshold_allones(i16 %a) {\n  %r = call i16 @llvm.usub.sat.i16(i16 %a, i16 -1)\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v4i8_basic",
+        "ir": "declare <4 x i8> @llvm.umax.v4i8(<4 x i8>, <4 x i8>)\ndeclare <4 x i8> @llvm.usub.sat.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i8> @fold_add_umax_to_usub_v4i8_basic(<4 x i8> %a) {\n  %m = call <4 x i8> @llvm.umax.v4i8(<4 x i8> %a, <4 x i8> <i8 10, i8 10, i8 10, i8 10>)\n  %r = add <4 x i8> %m, <i8 -10, i8 -10, i8 -10, i8 -10>\n  ret <4 x i8> %r\n}\n",
+        "expected_optimized_ir": "declare <4 x i8> @llvm.usub.sat.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i8> @fold_add_umax_to_usub_v4i8_basic(<4 x i8> %a) {\n  %r = call <4 x i8> @llvm.usub.sat.v4i8(<4 x i8> %a, <4 x i8> <i8 10, i8 10, i8 10, i8 10>)\n  ret <4 x i8> %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v2i16_basic",
+        "ir": "declare <2 x i16> @llvm.umax.v2i16(<2 x i16>, <2 x i16>)\ndeclare <2 x i16> @llvm.usub.sat.v2i16(<2 x i16>, <2 x i16>)\n\ndefine <2 x i16> @fold_add_umax_to_usub_v2i16_basic(<2 x i16> %a) {\n  %m = call <2 x i16> @llvm.umax.v2i16(<2 x i16> <i16 300, i16 300>, <2 x i16> %a)\n  %r = add <2 x i16> <i16 -300, i16 -300>, %m\n  ret <2 x i16> %r\n}\n",
+        "expected_optimized_ir": "declare <2 x i16> @llvm.usub.sat.v2i16(<2 x i16>, <2 x i16>)\n\ndefine <2 x i16> @fold_add_umax_to_usub_v2i16_basic(<2 x i16> %a) {\n  %r = call <2 x i16> @llvm.usub.sat.v2i16(<2 x i16> %a, <2 x i16> <i16 300, i16 300>)\n  ret <2 x i16> %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v8i8_threshold_one",
+        "ir": "declare <8 x i8> @llvm.umax.v8i8(<8 x i8>, <8 x i8>)\ndeclare <8 x i8> @llvm.usub.sat.v8i8(<8 x i8>, <8 x i8>)\n\ndefine <8 x i8> @fold_add_umax_to_usub_v8i8_threshold_one(<8 x i8> %a) {\n  %m = call <8 x i8> @llvm.umax.v8i8(<8 x i8> %a, <8 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>)\n  %r = add <8 x i8> %m, <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>\n  ret <8 x i8> %r\n}\n",
+        "expected_optimized_ir": "declare <8 x i8> @llvm.usub.sat.v8i8(<8 x i8>, <8 x i8>)\n\ndefine <8 x i8> @fold_add_umax_to_usub_v8i8_threshold_one(<8 x i8> %a) {\n  %r = call <8 x i8> @llvm.usub.sat.v8i8(<8 x i8> %a, <8 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>)\n  ret <8 x i8> %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v4i32_zero_threshold",
+        "ir": "declare <4 x i32> @llvm.umax.v4i32(<4 x i32>, <4 x i32>)\ndeclare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i32> @fold_add_umax_to_usub_v4i32_zero_threshold(<4 x i32> %a) {\n  %m = call <4 x i32> @llvm.umax.v4i32(<4 x i32> %a, <4 x i32> zeroinitializer)\n  %r = add <4 x i32> %m, zeroinitializer\n  ret <4 x i32> %r\n}\n",
+        "expected_optimized_ir": "declare <4 x i32> @llvm.usub.sat.v4i32(<4 x i32>, <4 x i32>)\n\ndefine <4 x i32> @fold_add_umax_to_usub_v4i32_zero_threshold(<4 x i32> %a) {\n  %r = call <4 x i32> @llvm.usub.sat.v4i32(<4 x i32> %a, <4 x i32> zeroinitializer)\n  ret <4 x i32> %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v2i64_large_constant",
+        "ir": "declare <2 x i64> @llvm.umax.v2i64(<2 x i64>, <2 x i64>)\ndeclare <2 x i64> @llvm.usub.sat.v2i64(<2 x i64>, <2 x i64>)\n\ndefine <2 x i64> @fold_add_umax_to_usub_v2i64_large_constant(<2 x i64> %a) {\n  %m = call <2 x i64> @llvm.umax.v2i64(<2 x i64> %a, <2 x i64> <i64 9223372036854775808, i64 9223372036854775808>)\n  %r = add <2 x i64> %m, <i64 -9223372036854775808, i64 -9223372036854775808>\n  ret <2 x i64> %r\n}\n",
+        "expected_optimized_ir": "declare <2 x i64> @llvm.usub.sat.v2i64(<2 x i64>, <2 x i64>)\n\ndefine <2 x i64> @fold_add_umax_to_usub_v2i64_large_constant(<2 x i64> %a) {\n  %r = call <2 x i64> @llvm.usub.sat.v2i64(<2 x i64> %a, <2 x i64> <i64 9223372036854775808, i64 9223372036854775808>)\n  ret <2 x i64> %r\n}\n"
+      },
+      {
+        "name": "fold_add_umax_to_usub_v16i8_allones_threshold",
+        "ir": "declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)\ndeclare <16 x i8> @llvm.usub.sat.v16i8(<16 x i8>, <16 x i8>)\n\ndefine <16 x i8> @fold_add_umax_to_usub_v16i8_allones_threshold(<16 x i8> %a) {\n  %m = call <16 x i8> @llvm.umax.v16i8(<16 x i8> <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>, <16 x i8> %a)\n  %r = add <16 x i8> <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>, %m\n  ret <16 x i8> %r\n}\n",
+        "expected_optimized_ir": "declare <16 x i8> @llvm.usub.sat.v16i8(<16 x i8>, <16 x i8>)\n\ndefine <16 x i8> @fold_add_umax_to_usub_v16i8_allones_threshold(<16 x i8> %a) {\n  %r = call <16 x i8> @llvm.usub.sat.v16i8(<16 x i8> %a, <16 x i8> <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>)\n  ret <16 x i8> %r\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "fold_add_umax_to_usub_i8_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i8_umax_operands_swapped",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i8_add_operands_swapped",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i16_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i32_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i64_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i3_small_width",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i1_zero_threshold",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i8_zero_threshold",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i8_threshold_one",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i8_threshold_allones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_i16_threshold_allones",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v4i8_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v2i16_basic",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v8i8_threshold_one",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v4i32_zero_threshold",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v2i64_large_constant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "fold_add_umax_to_usub_v16i8_allones_threshold",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

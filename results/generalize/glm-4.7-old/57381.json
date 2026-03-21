@@ -1,0 +1,305 @@
+{
+  "issue_id": "57381",
+  "dataset_file": "57381.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine <2 x i64> @neg_signbit_use1(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, <i32 31, i32 poison>\n  call void @usev2i32(<2 x i32> %s)\n  %z = zext <2 x i32> %s to <2 x i64>\n  %r = sub <2 x i64> zeroinitializer, %z\n  ret <2 x i64> %r\n}\n\ndeclare void @usev2i32(<2 x i32>)\n\ndefine <2 x i64> @neg_signbit_use1(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, <i32 31, i32 poison>\n  call void @usev2i32(<2 x i32> %s)\n  %1 = ashr <2 x i32> %x, <i32 31, i32 31>\n  %2 = sext <2 x i32> %1 to <2 x i64>\n  ret <2 x i64> %2\n}\n\ndeclare void @usev2i32(<2 x i32>)\n",
+  "model_output": "```json\n{\n  \"summary\": \"The optimization recognizes the pattern `0 - zext(lshr(x, BW-1))` and simplifies it to `sext(ashr(x, BW-1))`. This works because `lshr(x, BW-1)` extracts the sign bit (0 or 1), which when zero-extended and negated becomes 0 or -1. This is equivalent to sign-extending the result of an arithmetic shift of `x` by `BW-1` (which produces 0 or -1 directly). This reduces the number of operations and avoids the explicit negation.\",\n  \"before_after\": \"Before: `%sub = sub Ty 0, %zext` where `%zext = zext Ty2 %lshr` and `%lshr = lshr Ty2 %x, C`. After: `%sext = sext Ty %ashr` where `%ashr = ashr Ty2 %x, C`. Requires `C == BitWidth(Ty2) - 1`.\",\n  \"preconditions\": [\n    \"The LHS of the `sub` must be 0 (or a constant equivalent to 0).\",\n    \"The RHS of the `sub` must be a `zext` instruction.\",\n    \"The source of the `zext` must be an `lshr` instruction.\",\n    \"The shift amount `C` of the `lshr` must be a constant equal to `BitWidth(SourceTy) - 1`.\",\n    \"The `sub` instruction must not have the `nuw` (No Unsigned Wrap) flag. If `nuw` is present, the subtraction `0 - 1` would be undefined behavior/poison, whereas the `sext(ashr)` result is well-defined (-1), making the transform illegal.\",\n    \"The `lshr` and `zext` types must be integers (or vectors of integers).\"\n  ],\n  \"pattern\": \"General Pattern: `sub(0, zext(lshr(X, C))) -> sext(ashr(X, C))` given `C == BW(X) - 1`.\\n\\nAlive2/TGG Rewrite:\\n```\\n// Preconditions: let bw = bitwidth(X)\\n// C == bw - 1\\n%lshr = lshr X, C\\n%zext = zext %lshr to Ty\\n%res = sub Ty 0, %zext\\n=>\\n%ashr = ashr X, C\\n%res = sext %ashr to Ty\\n```\",\n  \"testcases\": [\n    {\n      \"name\": \"vector_i32_fixed_original\",\n      \"ir\": \"define <2 x i64> @test(<2 x i32> %x) {\\n  %s = lshr <2 x i32> %x, <i32 31, i32 31>\\n  call void @usev2i32(<2 x i32> %s)\\n  %z = zext <2 x i32> %s to <2 x i64>\\n  %r = sub <2 x i64> zeroinitializer, %z\\n  ret <2 x i64> %r\\n}\\ndeclare void @usev2i32(<2 x i32>)\",\n      \"expected_optimized_ir\": \"define <2 x i64> @test(<2 x i32> %x) {\\n  %s = lshr <2 x i32> %x, <i32 31, i32 31>\\n  call void @usev2i32(<2 x i32> %s)\\n  %1 = ashr <2 x i32> %x, <i32 31, i32 31>\\n  %2 = sext <2 x i32> %1 to <2 x i64>\\n  ret <2 x i64> %2\\n}\",\n      \"why\": \"The primary vector case from the prompt, assuming the shift amount was intended to be 31 in both lanes.\"\n    },\n    {\n      \"name\": \"scalar_i32\",\n      \"ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub i64 0, %z\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i32 %x) {\\n  %1 = ashr i32 %x, 31\\n  %2 = sext i32 %1 to i64\\n  ret i64 %2\\n}\",\n      \"why\": \"Scalar version of the optimization for 32-bit integers.\"\n    },\n    {\n      \"name\": \"scalar_i8\",\n      \"ir\": \"define i16 @test(i8 %x) {\\n  %s = lshr i8 %x, 7\\n  %z = zext i8 %s to i16\\n  %r = sub i16 0, %z\\n  ret i16 %r\\n}\",\n      \"expected_optimized_ir\": \"define i16 @test(i8 %x) {\\n  %1 = ashr i8 %x, 7\\n  %2 = sext i8 %1 to i16\\n  ret i16 %2\\n}\",\n      \"why\": \"Tests smaller bitwidth (i8 -> i16) where shift amount is 7.\"\n    },\n    {\n      \"name\": \"vector_i8\",\n      \"ir\": \"define <4 x i32> @test(<4 x i8> %x) {\\n  %s = lshr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\\n  %z = zext <4 x i8> %s to <4 x i32>\\n  %r = sub <4 x i32> zeroinitializer, %z\\n  ret <4 x i32> %r\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i8> %x) {\\n  %1 = ashr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\\n  %2 = sext <4 x i8> %1 to <4 x i32>\\n  ret <4 x i32> %2\\n}\",\n      \"why\": \"Vector test with different element types (i8 -> i32).\"\n    },\n    {\n      \"name\": \"no_zext_needed\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i32\\n  %r = sub i32 0, %z\\n  ret i32 %r\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %1 = ashr i32 %x, 31\\n  ret i32 %1\\n}\",\n      \"why\": \"Case where zext is a no-op (same type). Result simplifies directly to ashr.\"\n    },\n    {\n      \"name\": \"wrong_shift_amount\",\n      \"ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 30\\n  %z = zext i32 %s to i64\\n  %r = sub i64 0, %z\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 30\\n  %z = zext i32 %s to i64\\n  %r = sub i64 0, %z\\n  ret i64 %r\\n}\",\n      \"why\": \"Shift amount is 30 (not BW-1), so the pattern does not match. Optimization should NOT happen.\"\n    },\n    {\n      \"name\": \"nsw_flag_allowed\",\n      \"ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub nsw i64 0, %z\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i32 %x) {\\n  %1 = ashr i32 %x, 31\\n  %2 = sext i32 %1 to i64\\n  ret i64 %2\\n}\",\n      \"why\": \"nsw is allowed because 0 - 0 and 0 - 1 never overflow signed.\"\n    },\n    {\n      \"name\": \"nuw_flag_disallowed\",\n      \"ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub nuw i64 0, %z\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub nuw i64 0, %z\\n  ret i64 %r\\n}\",\n      \"why\": \"nuw makes the sub poison if input is 1. ashr/sext result is valid (-1). Cannot transform poison to valid value.\"\n    },\n    {\n      \"name\": \"commuted_sub\",\n      \"ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub i64 %z, 0\\n  ret i64 %r\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i32 %x) {\\n  %s = lshr i32 %x, 31\\n  %z = zext i32 %s to i64\\n  %r = sub i64 %z, 0\\n  ret i64 %r\\n}\",\n      \"why\": \"Sub is commuted (`val - 0`). This is just `val`, not the negation pattern. Should not optimize to ashr.\"\n    }\n  ],\n  \"implementation_notes\": \"This fold should be implemented in InstCombine's visitSub (or visitZExt).\\n\\n1. Match pattern: `Sub (Zero, ZExt (LShr X, C))`.\\n2. Verify `C` is a constant equal to `BitWidth(X) - 1`.\\n3. Check that `Sub` does not have `nuw`. If it has `nsw`, the flag can be preserved or dropped (result is safe).\\n4. Construct `NewAShr = Builder.CreateAShr(X, C)`.\\n5. Construct `NewSExt = Builder.CreateSExt(NewAShr, Sub->getType())`. (If types match, ASHR is the result).\\n6. ReplaceInstUsesWith.\\n\\nPitfalls:\\n- **NUW Flags:** If the original sub had `nuw`, it implies the result of `zext` is always 0 (or the code is UB). If `x` can be negative, `zext` is 1, `0-1` wraps, `nuw` triggers poison. The target `sext(ashr)` is always well-defined (0 or -1). Replacing poison with a defined value is illegal.\\n- **Dead Code:** If `%s` (the `lshr`) has no other uses, the `lshr` instruction becomes dead and will be removed by DCE, leaving only the `ashr`.\",\n  \"regression_test_notes\": \"Create a file `optimize-signbit-neg.ll`. Use `opt -instcombine -S`. Check that the `sub` and `zext` are replaced by `sext` and `ashr`. Ensure the `nuw` test case remains unchanged.\",\n  \"clarifying_questions\": [\n    \"In the provided example, the shift amount vector was `<31, poison>`. Did you intend for the second lane to be optimized to `ashr x, 31`? Strictly speaking, `lshr x, poison` is poison, so replacing it with a defined value changes semantics unless the context guarantees the lane is not executed.\",\n    \"Should this pattern handle the case where `zext` is replaced by a `and` with `1` (e.g. masking the low bit)?\",\n    \"Are there specific backend targets (e.g., GPUs) where `ashr` is significantly more expensive than `lshr + sub`, making this fold undesirable?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "The optimization recognizes the pattern `0 - zext(lshr(x, BW-1))` and simplifies it to `sext(ashr(x, BW-1))`. This works because `lshr(x, BW-1)` extracts the sign bit (0 or 1), which when zero-extended and negated becomes 0 or -1. This is equivalent to sign-extending the result of an arithmetic shift of `x` by `BW-1` (which produces 0 or -1 directly). This reduces the number of operations and avoids the explicit negation.",
+    "before_after": "Before: `%sub = sub Ty 0, %zext` where `%zext = zext Ty2 %lshr` and `%lshr = lshr Ty2 %x, C`. After: `%sext = sext Ty %ashr` where `%ashr = ashr Ty2 %x, C`. Requires `C == BitWidth(Ty2) - 1`.",
+    "preconditions": [
+      "The LHS of the `sub` must be 0 (or a constant equivalent to 0).",
+      "The RHS of the `sub` must be a `zext` instruction.",
+      "The source of the `zext` must be an `lshr` instruction.",
+      "The shift amount `C` of the `lshr` must be a constant equal to `BitWidth(SourceTy) - 1`.",
+      "The `sub` instruction must not have the `nuw` (No Unsigned Wrap) flag. If `nuw` is present, the subtraction `0 - 1` would be undefined behavior/poison, whereas the `sext(ashr)` result is well-defined (-1), making the transform illegal.",
+      "The `lshr` and `zext` types must be integers (or vectors of integers)."
+    ],
+    "pattern": "General Pattern: `sub(0, zext(lshr(X, C))) -> sext(ashr(X, C))` given `C == BW(X) - 1`.\n\nAlive2/TGG Rewrite:\n```\n// Preconditions: let bw = bitwidth(X)\n// C == bw - 1\n%lshr = lshr X, C\n%zext = zext %lshr to Ty\n%res = sub Ty 0, %zext\n=>\n%ashr = ashr X, C\n%res = sext %ashr to Ty\n```",
+    "testcases": [
+      {
+        "name": "vector_i32_fixed_original",
+        "ir": "define <2 x i64> @test(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, <i32 31, i32 31>\n  call void @usev2i32(<2 x i32> %s)\n  %z = zext <2 x i32> %s to <2 x i64>\n  %r = sub <2 x i64> zeroinitializer, %z\n  ret <2 x i64> %r\n}\ndeclare void @usev2i32(<2 x i32>)",
+        "expected_optimized_ir": "define <2 x i64> @test(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, <i32 31, i32 31>\n  call void @usev2i32(<2 x i32> %s)\n  %1 = ashr <2 x i32> %x, <i32 31, i32 31>\n  %2 = sext <2 x i32> %1 to <2 x i64>\n  ret <2 x i64> %2\n}",
+        "why": "The primary vector case from the prompt, assuming the shift amount was intended to be 31 in both lanes."
+      },
+      {
+        "name": "scalar_i32",
+        "ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+        "why": "Scalar version of the optimization for 32-bit integers."
+      },
+      {
+        "name": "scalar_i8",
+        "ir": "define i16 @test(i8 %x) {\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub i16 0, %z\n  ret i16 %r\n}",
+        "expected_optimized_ir": "define i16 @test(i8 %x) {\n  %1 = ashr i8 %x, 7\n  %2 = sext i8 %1 to i16\n  ret i16 %2\n}",
+        "why": "Tests smaller bitwidth (i8 -> i16) where shift amount is 7."
+      },
+      {
+        "name": "vector_i8",
+        "ir": "define <4 x i32> @test(<4 x i8> %x) {\n  %s = lshr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub <4 x i32> zeroinitializer, %z\n  ret <4 x i32> %r\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i8> %x) {\n  %1 = ashr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %2 = sext <4 x i8> %1 to <4 x i32>\n  ret <4 x i32> %2\n}",
+        "why": "Vector test with different element types (i8 -> i32)."
+      },
+      {
+        "name": "no_zext_needed",
+        "ir": "define i32 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i32\n  %r = sub i32 0, %z\n  ret i32 %r\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  ret i32 %1\n}",
+        "why": "Case where zext is a no-op (same type). Result simplifies directly to ashr."
+      },
+      {
+        "name": "wrong_shift_amount",
+        "ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+        "why": "Shift amount is 30 (not BW-1), so the pattern does not match. Optimization should NOT happen."
+      },
+      {
+        "name": "nsw_flag_allowed",
+        "ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+        "why": "nsw is allowed because 0 - 0 and 0 - 1 never overflow signed."
+      },
+      {
+        "name": "nuw_flag_disallowed",
+        "ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nuw i64 0, %z\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nuw i64 0, %z\n  ret i64 %r\n}",
+        "why": "nuw makes the sub poison if input is 1. ashr/sext result is valid (-1). Cannot transform poison to valid value."
+      },
+      {
+        "name": "commuted_sub",
+        "ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub i64 %z, 0\n  ret i64 %r\n}",
+        "expected_optimized_ir": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub i64 %z, 0\n  ret i64 %r\n}",
+        "why": "Sub is commuted (`val - 0`). This is just `val`, not the negation pattern. Should not optimize to ashr."
+      }
+    ],
+    "implementation_notes": "This fold should be implemented in InstCombine's visitSub (or visitZExt).\n\n1. Match pattern: `Sub (Zero, ZExt (LShr X, C))`.\n2. Verify `C` is a constant equal to `BitWidth(X) - 1`.\n3. Check that `Sub` does not have `nuw`. If it has `nsw`, the flag can be preserved or dropped (result is safe).\n4. Construct `NewAShr = Builder.CreateAShr(X, C)`.\n5. Construct `NewSExt = Builder.CreateSExt(NewAShr, Sub->getType())`. (If types match, ASHR is the result).\n6. ReplaceInstUsesWith.\n\nPitfalls:\n- **NUW Flags:** If the original sub had `nuw`, it implies the result of `zext` is always 0 (or the code is UB). If `x` can be negative, `zext` is 1, `0-1` wraps, `nuw` triggers poison. The target `sext(ashr)` is always well-defined (0 or -1). Replacing poison with a defined value is illegal.\n- **Dead Code:** If `%s` (the `lshr`) has no other uses, the `lshr` instruction becomes dead and will be removed by DCE, leaving only the `ashr`.",
+    "regression_test_notes": "Create a file `optimize-signbit-neg.ll`. Use `opt -instcombine -S`. Check that the `sub` and `zext` are replaced by `sext` and `ashr`. Ensure the `nuw` test case remains unchanged.",
+    "clarifying_questions": [
+      "In the provided example, the shift amount vector was `<31, poison>`. Did you intend for the second lane to be optimized to `ashr x, 31`? Strictly speaking, `lshr x, poison` is poison, so replacing it with a defined value changes semantics unless the context guarantees the lane is not executed.",
+      "Should this pattern handle the case where `zext` is replaced by a `and` with `1` (e.g. masking the low bit)?",
+      "Are there specific backend targets (e.g., GPUs) where `ashr` is significantly more expensive than `lshr + sub`, making this fold undesirable?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "vector_i32_fixed_original",
+      "missed_optimization": false,
+      "cost": {
+        "expected": -1,
+        "current_opt": 4,
+        "expected_le_current_opt": false,
+        "ok": false,
+        "expected_log": "Command '['/data/btguan/auto-opt/utils/cost/cost', '/tmp/tmpv5t7nr_a.ll']' returned non-zero exit status 1.\n/data/btguan/auto-opt/utils/cost/cost: /tmp/tmpv5t7nr_a.ll:3:13: error: use of undefined value '@usev2i32'\n  call void @usev2i32(<2 x i32> %s)\n            ^\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+          "tgt": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @test(i8 %x) {\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub i16 0, %z\n  ret i16 %r\n}",
+          "tgt": "define i16 @test(i8 %x) {\n  %1 = ashr i8 %x, 7\n  %2 = sext i8 %1 to i16\n  ret i16 %2\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i8 %x) {\n#0:\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub i16 0, %z\n  ret i16 %r\n}\n=>\ndefine i16 @test(i8 %x) {\n#0:\n  %#1 = ashr i8 %x, 7\n  %#2 = sext i8 %#1 to i16\n  ret i16 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @test(i8 %x) {\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub nsw i16 0, %z\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @test(i8 %x) {\n  %1 = ashr i8 %x, 7\n  %2 = sext i8 %1 to i16\n  ret i16 %2\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i8 %x) {\n#0:\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub nsw i16 0, %z\n  ret i16 %r\n}\n=>\ndefine i16 @test(i8 %x) {\n#0:\n  %#1 = ashr i8 %x, 7\n  %#2 = sext i8 %#1 to i16\n  ret i16 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @test(i8 %x) {\n  %1 = ashr i8 %x, 7\n  %2 = sext i8 %1 to i16\n  ret i16 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @test(i8 %x) {\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub nsw i16 0, %z\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @test(i8 %x) {\n#0:\n  %#1 = ashr i8 %x, 7\n  %#2 = sext i8 %#1 to i16\n  ret i16 %#2\n}\n=>\ndefine i16 @test(i8 %x) {\n#0:\n  %s = lshr i8 %x, 7\n  %z = zext i8 %s to i16\n  %r = sub nsw i16 0, %z\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i8> %x) {\n  %s = lshr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub <4 x i32> zeroinitializer, %z\n  ret <4 x i32> %r\n}",
+          "tgt": "define <4 x i32> @test(<4 x i8> %x) {\n  %1 = ashr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %2 = sext <4 x i8> %1 to <4 x i32>\n  ret <4 x i32> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %s = lshr <4 x i8> %x, { 7, 7, 7, 7 }\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub <4 x i32> { 0, 0, 0, 0 }, %z\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %#1 = ashr <4 x i8> %x, { 7, 7, 7, 7 }\n  %#2 = sext <4 x i8> %#1 to <4 x i32>\n  ret <4 x i32> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i8> %x) {\n  %s = lshr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub nsw <4 x i32> zeroinitializer, %z\n  ret <4 x i32> %r\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i8> %x) {\n  %1 = ashr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %2 = sext <4 x i8> %1 to <4 x i32>\n  ret <4 x i32> %2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %s = lshr <4 x i8> %x, { 7, 7, 7, 7 }\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub nsw <4 x i32> { 0, 0, 0, 0 }, %z\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %#1 = ashr <4 x i8> %x, { 7, 7, 7, 7 }\n  %#2 = sext <4 x i8> %#1 to <4 x i32>\n  ret <4 x i32> %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i8> %x) {\n  %1 = ashr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %2 = sext <4 x i8> %1 to <4 x i32>\n  ret <4 x i32> %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i8> %x) {\n  %s = lshr <4 x i8> %x, <i8 7, i8 7, i8 7, i8 7>\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub nsw <4 x i32> zeroinitializer, %z\n  ret <4 x i32> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %#1 = ashr <4 x i8> %x, { 7, 7, 7, 7 }\n  %#2 = sext <4 x i8> %#1 to <4 x i32>\n  ret <4 x i32> %#2\n}\n=>\ndefine <4 x i32> @test(<4 x i8> %x) {\n#0:\n  %s = lshr <4 x i8> %x, { 7, 7, 7, 7 }\n  %z = zext <4 x i8> %s to <4 x i32>\n  %r = sub nsw <4 x i32> { 0, 0, 0, 0 }, %z\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "no_zext_needed",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "wrong_shift_amount",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+          "tgt": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 30\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nsw_flag_allowed",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}",
+          "tgt": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i32 %x) {\n  %1 = ashr i32 %x, 31\n  %2 = sext i32 %1 to i64\n  ret i64 %2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i32 %x) {\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i32 %x) {\n#0:\n  %#1 = ashr i32 %x, 31\n  %#2 = sext i32 %#1 to i64\n  ret i64 %#2\n}\n=>\ndefine i64 @test(i32 %x) {\n#0:\n  %s = lshr i32 %x, 31\n  %z = zext i32 %s to i64\n  %r = sub nsw i64 0, %z\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_flag_disallowed",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "commuted_sub",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at CMakeLists.txt:8 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\n\n\nCMake Deprecation Warning at CMakeLists.txt:13 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Go bindings disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.2s)\n-- Generating done (0.7s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

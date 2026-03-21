@@ -1,0 +1,434 @@
+{
+  "issue_id": "55599",
+  "dataset_file": "55599.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndeclare void @use(i64)\n\ndefine i64 @scalar_mul_bit_x0_y0_uses(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\n\ndeclare void @use(i64)\n\ndefine i64 @scalar_mul_bit_x0_y0_uses(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %and2, %x\n  ret i64 %mul\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine fails to optimize `mul (and X, 1), (and Y, 1)` into `and X, Y, 1`. Since the operands of the multiplication are masked to retain only the least significant bit (values 0 or 1), the multiplication operation is equivalent to a logical AND. The masks can also be folded into the resulting AND instruction.\",\n  \"before_after\": \"Before: `%mul = mul i64 %and1, %and2` (where `%and1 = and i64 %x, 1`, `%and2 = and i64 %y, 1`). After: `%mul = and i64 %x, %y, 1` (or `and i64 %x, %and2` depending on CSE/use constraints).\",\n  \"preconditions\": \"1. The instruction is a `mul`. 2. Both operands are integers (scalar or vector). 3. Both operands are proven to be in the range [0, 1]. This is typically established by an `and Val, 1` or `zext i1` pattern. 4. The mask constant must be exactly 1 (or power-of-two mask aligned to LSB if generalized, but `mul` == `and` only holds for 0/1 logic, i.e., mask 1).\",\n  \"pattern\": \"InstCombine Rewrite:\\n  `mul (and X, 1), (and Y, 1)`  ->  `and X, Y, 1`\\n  `mul (and X, 1), (zext i1 Y)` -> `and X, (zext i1 Y)` (or `and X, Y, 1`)\\n\\nRationale:\\nIf inputs A and B are 0 or 1:\\n  A * B is 1 iff A == 1 and B == 1.\\n  A & B is 1 iff A == 1 and B == 1.\\nThus, `mul` and `and` are equivalent.\",\n  \"testcases\": [\n    {\n      \"name\": \"scalar_i64_basic\",\n      \"ir\": \"declare void @use(i64)\\n\\ndefine i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, 1\\n  call void @use(i64 %and1)\\n  %and2 = and i64 %y, 1\\n  call void @use(i64 %and2)\\n  %mul = mul i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i64)\\n\\ndefine i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, 1\\n  call void @use(i64 %and1)\\n  %and2 = and i64 %y, 1\\n  call void @use(i64 %and2)\\n  %mul = and i64 %x, %and2\\n  ret i64 %mul\\n}\",\n      \"why\": \"Basic case: `mul (x&1), (y&1)` -> `and x, (y&1)`. The `and` instruction implicitly masks x with 1 because the other operand is masked by 1.\"\n    },\n    {\n      \"name\": \"scalar_i32_reassociated\",\n      \"ir\": \"declare void @use(i32)\\n\\ndefine i32 @test(i32 %x, i32 %y) {\\n  %and1 = and i32 %x, 1\\n  call void @use(i32 %and1)\\n  %and2 = and i32 1, %y\\n  call void @use(i32 %and2)\\n  %mul = mul i32 %and1, %and2\\n  ret i32 %mul\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i32)\\n\\ndefine i32 @test(i32 %x, i32 %y) {\\n  %and1 = and i32 %x, 1\\n  call void @use(i32 %and1)\\n  %and2 = and i32 %y, 1\\n  call void @use(i32 %and2)\\n  %mul = and i32 %x, %and2\\n  ret i32 %mul\\n}\",\n      \"why\": \"Commutative `and` operands should be handled.\"\n    },\n    {\n      \"name\": \"scalar_i8\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %and1 = and i8 %x, 1\\n  %and2 = and i8 %y, 1\\n  %mul = mul i8 %and1, %and2\\n  ret i8 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %mul = and i8 %x, %y\\n  %mul.trunc = and i8 %mul, 1\\n  ret i8 %mul.trunc\\n}\",\n      \"why\": \"Smaller bitwidth (i8). Ideally optimizes to `and x, y, 1`.\"\n    },\n    {\n      \"name\": \"vector_4xi32\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\\n  %and1 = and <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %and2 = and <4 x i32> %y, <i32 1, i32 1, i32 1, i32 1>\\n  %mul = mul <4 x i32> %and1, %and2\\n  ret <4 x i32> %mul\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\\n  %mul = and <4 x i32> %x, %y\\n  %mul.masked = and <4 x i32> %mul, <i32 1, i32 1, i32 1, i32 1>\\n  ret <4 x i32> %mul.masked\\n}\",\n      \"why\": \"Vector case: Should fold element-wise.\"\n    },\n    {\n      \"name\": \"zext_i1_source\",\n      \"ir\": \"declare void @use(i32)\\n\\ndefine i32 @test(i32 %x, i32 %y) {\\n  %tr1 = trunc i32 %x to i1\\n  %ext1 = zext i1 %tr1 to i32\\n  call void @use(i32 %ext1)\\n  %tr2 = trunc i32 %y to i1\\n  %ext2 = zext i1 %tr2 to i32\\n  call void @use(i32 %ext2)\\n  %mul = mul i32 %ext1, %ext2\\n  ret i32 %mul\\n}\",\n      \"expected_optimized_ir\": \"declare void @use(i32)\\n\\ndefine i32 @test(i32 %x, i32 %y) {\\n  %tr1 = trunc i32 %x to i1\\n  %ext1 = zext i1 %tr1 to i32\\n  call void @use(i32 %ext1)\\n  %tr2 = trunc i32 %y to i1\\n  %ext2 = zext i1 %tr2 to i32\\n  call void @use(i32 %ext2)\\n  %mul = and i32 %ext1, %ext2\\n  ret i32 %mul\\n}\",\n      \"why\": \"Inputs are `zext i1`. `mul` of two `zext i1` is equivalent to `and` of the two `zext i1`.\"\n    },\n    {\n      \"name\": \"mixed_and_and_zext\",\n      \"ir\": \"define i32 @test(i32 %x, i1 %y) {\\n  %and1 = and i32 %x, 1\\n  %ext1 = zext i1 %y to i32\\n  %mul = mul i32 %and1, %ext1\\n  ret i32 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i1 %y) {\\n  %and1 = and i32 %x, 1\\n  %ext1 = zext i1 %y to i32\\n  %mul = and i32 %and1, %ext1\\n  ret i32 %mul\\n}\",\n      \"why\": \"Mix of `and x, 1` and `zext i1`.\"\n    },\n    {\n      \"name\": \"negative_mask_2\",\n      \"ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, 2\\n  %and2 = and i64 %y, 2\\n  %mul = mul i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, 2\\n  %and2 = and i64 %y, 2\\n  %mul = mul i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"why\": \"Mask is 2 (values 0 or 2). 2*2=4, 2&2=2. Optimization is INVALID.\"\n    },\n    {\n      \"name\": \"negative_mask_neg1\",\n      \"ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, -1\\n  %and2 = and i64 %y, -1\\n  %mul = mul i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, -1\\n  %and2 = and i64 %y, -1\\n  %mul = mul i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"why\": \"Mask is -1 (identity). Inputs are arbitrary. Optimization is INVALID.\"\n    },\n    {\n      \"name\": \"constant_fold_0\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %and1 = and i64 %x, 1\\n  %mul = mul i64 %and1, 0\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  ret i64 0\\n}\",\n      \"why\": \"Standard constant folding should apply (0 * anything = 0).\"\n    },\n    {\n      \"name\": \"constant_fold_1\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %and1 = and i64 %x, 1\\n  %mul = mul i64 %and1, 1\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %and1 = and i64 %x, 1\\n  ret i64 %and1\\n}\",\n      \"why\": \"Standard constant folding (x * 1 = x).\"\n    },\n    {\n      \"name\": \"flags_nuw_nsw\",\n      \"ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %and1 = and i64 %x, 1\\n  %and2 = and i64 %y, 1\\n  %mul = mul nuw nsw i64 %and1, %and2\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %mul = and i64 %x, %y\\n  %mul.masked = and i64 %mul, 1\\n  ret i64 %mul.masked\\n}\",\n      \"why\": \"Since inputs are 0/1, overflow is impossible, so `nuw`/`nsw` are safe to drop or transfer if the replacement `and` could somehow violate them (it can't).\"\n    },\n    {\n      \"name\": \"same_operand\",\n      \"ir\": \"define i64 @test(i64 %x) {\\n  %and1 = and i64 %x, 1\\n  %mul = mul i64 %and1, %and1\\n  ret i64 %mul\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\n  %and1 = and i64 %x, 1\\n  ret i64 %and1\\n}\",\n      \"why\": \"`x*x` where `x` is 0 or 1 is `x`. `mul` -> `and` -> `x`.\"\n    }\n  ],\n  \"implementation_notes\": \"1. Matcher: Look for `mul` instructions where both operands match `Value *isSingleBitValue(Value *V)`. 2. Helper `isSingleBitValue`: Check for `and V, 1`, `zext (trunc V to i1)`, or `select Cond, 0, 1`. 3. Fold: Create `Builder.CreateAnd(Mul->getOperand(0), Mul->getOperand(1))`. 4. Dead Code Elimination: Existing InstCombine passes will likely clean up the redundant `and` instructions if they have no other uses. 5. If inputs are `and X, 1` and `and Y, 1`, the result `and` can be optimized to `and X, Y, 1` immediately if the inputs have single uses, but doing the direct `mul`->`and` replacement is safer and relies on subsequent `and` simplification passes.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on the provided IR. Verify that `mul` is replaced by `and`. Check that the result value is correct for inputs 0, 1, 2, etc. Ensure `nuw`/`nsw` flags don't prevent the fold.\",\n  \"clarifying_questions\": [\n    \"Should the implementation aggressively fold the masks (e.g. `and x, y, 1`) in one go, or just perform the `mul` -> `and` conversion and let existing `and` simplification logic handle the mask folding?\",\n    \"Are there other patterns for '0 or 1' values besides `and val, 1` and `zext i1` that should be supported immediately (e.g. `icmp ne` boolean result)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine fails to optimize `mul (and X, 1), (and Y, 1)` into `and X, Y, 1`. Since the operands of the multiplication are masked to retain only the least significant bit (values 0 or 1), the multiplication operation is equivalent to a logical AND. The masks can also be folded into the resulting AND instruction.",
+    "before_after": "Before: `%mul = mul i64 %and1, %and2` (where `%and1 = and i64 %x, 1`, `%and2 = and i64 %y, 1`). After: `%mul = and i64 %x, %y, 1` (or `and i64 %x, %and2` depending on CSE/use constraints).",
+    "preconditions": "1. The instruction is a `mul`. 2. Both operands are integers (scalar or vector). 3. Both operands are proven to be in the range [0, 1]. This is typically established by an `and Val, 1` or `zext i1` pattern. 4. The mask constant must be exactly 1 (or power-of-two mask aligned to LSB if generalized, but `mul` == `and` only holds for 0/1 logic, i.e., mask 1).",
+    "pattern": "InstCombine Rewrite:\n  `mul (and X, 1), (and Y, 1)`  ->  `and X, Y, 1`\n  `mul (and X, 1), (zext i1 Y)` -> `and X, (zext i1 Y)` (or `and X, Y, 1`)\n\nRationale:\nIf inputs A and B are 0 or 1:\n  A * B is 1 iff A == 1 and B == 1.\n  A & B is 1 iff A == 1 and B == 1.\nThus, `mul` and `and` are equivalent.",
+    "testcases": [
+      {
+        "name": "scalar_i64_basic",
+        "ir": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}",
+        "why": "Basic case: `mul (x&1), (y&1)` -> `and x, (y&1)`. The `and` instruction implicitly masks x with 1 because the other operand is masked by 1."
+      },
+      {
+        "name": "scalar_i32_reassociated",
+        "ir": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 1, %y\n  call void @use(i32 %and2)\n  %mul = mul i32 %and1, %and2\n  ret i32 %mul\n}",
+        "expected_optimized_ir": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}",
+        "why": "Commutative `and` operands should be handled."
+      },
+      {
+        "name": "scalar_i8",
+        "ir": "define i8 @test(i8 %x, i8 %y) {\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul i8 %and1, %and2\n  ret i8 %mul\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y) {\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}",
+        "why": "Smaller bitwidth (i8). Ideally optimizes to `and x, y, 1`."
+      },
+      {
+        "name": "vector_4xi32",
+        "ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %and1 = and <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %and2 = and <4 x i32> %y, <i32 1, i32 1, i32 1, i32 1>\n  %mul = mul <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %mul.masked\n}",
+        "why": "Vector case: Should fold element-wise."
+      },
+      {
+        "name": "zext_i1_source",
+        "ir": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %tr1 = trunc i32 %x to i1\n  %ext1 = zext i1 %tr1 to i32\n  call void @use(i32 %ext1)\n  %tr2 = trunc i32 %y to i1\n  %ext2 = zext i1 %tr2 to i32\n  call void @use(i32 %ext2)\n  %mul = mul i32 %ext1, %ext2\n  ret i32 %mul\n}",
+        "expected_optimized_ir": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %tr1 = trunc i32 %x to i1\n  %ext1 = zext i1 %tr1 to i32\n  call void @use(i32 %ext1)\n  %tr2 = trunc i32 %y to i1\n  %ext2 = zext i1 %tr2 to i32\n  call void @use(i32 %ext2)\n  %mul = and i32 %ext1, %ext2\n  ret i32 %mul\n}",
+        "why": "Inputs are `zext i1`. `mul` of two `zext i1` is equivalent to `and` of the two `zext i1`."
+      },
+      {
+        "name": "mixed_and_and_zext",
+        "ir": "define i32 @test(i32 %x, i1 %y) {\n  %and1 = and i32 %x, 1\n  %ext1 = zext i1 %y to i32\n  %mul = mul i32 %and1, %ext1\n  ret i32 %mul\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i1 %y) {\n  %and1 = and i32 %x, 1\n  %ext1 = zext i1 %y to i32\n  %mul = and i32 %and1, %ext1\n  ret i32 %mul\n}",
+        "why": "Mix of `and x, 1` and `zext i1`."
+      },
+      {
+        "name": "negative_mask_2",
+        "ir": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+        "why": "Mask is 2 (values 0 or 2). 2*2=4, 2&2=2. Optimization is INVALID."
+      },
+      {
+        "name": "negative_mask_neg1",
+        "ir": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, -1\n  %and2 = and i64 %y, -1\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, -1\n  %and2 = and i64 %y, -1\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+        "why": "Mask is -1 (identity). Inputs are arbitrary. Optimization is INVALID."
+      },
+      {
+        "name": "constant_fold_0",
+        "ir": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 0\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  ret i64 0\n}",
+        "why": "Standard constant folding should apply (0 * anything = 0)."
+      },
+      {
+        "name": "constant_fold_1",
+        "ir": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 1\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+        "why": "Standard constant folding (x * 1 = x)."
+      },
+      {
+        "name": "flags_nuw_nsw",
+        "ir": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x, i64 %y) {\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}",
+        "why": "Since inputs are 0/1, overflow is impossible, so `nuw`/`nsw` are safe to drop or transfer if the replacement `and` could somehow violate them (it can't)."
+      },
+      {
+        "name": "same_operand",
+        "ir": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, %and1\n  ret i64 %mul\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+        "why": "`x*x` where `x` is 0 or 1 is `x`. `mul` -> `and` -> `x`."
+      }
+    ],
+    "implementation_notes": "1. Matcher: Look for `mul` instructions where both operands match `Value *isSingleBitValue(Value *V)`. 2. Helper `isSingleBitValue`: Check for `and V, 1`, `zext (trunc V to i1)`, or `select Cond, 0, 1`. 3. Fold: Create `Builder.CreateAnd(Mul->getOperand(0), Mul->getOperand(1))`. 4. Dead Code Elimination: Existing InstCombine passes will likely clean up the redundant `and` instructions if they have no other uses. 5. If inputs are `and X, 1` and `and Y, 1`, the result `and` can be optimized to `and X, Y, 1` immediately if the inputs have single uses, but doing the direct `mul`->`and` replacement is safer and relies on subsequent `and` simplification passes.",
+    "regression_test_notes": "Use `opt -instcombine -S` on the provided IR. Verify that `mul` is replaced by `and`. Check that the result value is correct for inputs 0, 1, 2, etc. Ensure `nuw`/`nsw` flags don't prevent the fold.",
+    "clarifying_questions": [
+      "Should the implementation aggressively fold the masks (e.g. `and x, y, 1`) in one go, or just perform the `mul` -> `and` conversion and let existing `and` simplification logic handle the mask folding?",
+      "Are there other patterns for '0 or 1' values besides `and val, 1` and `zext i1` that should be supported immediately (e.g. `icmp ne` boolean result)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_i64_basic",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+          "tgt": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "tgt": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = and i64 %x, %and2\n  ret i64 %mul\n}\n=>\ndeclare void @use(i64)\n\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  call void @use(i64 %and1)\n  %and2 = and i64 %y, 1\n  call void @use(i64 %and2)\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_reassociated",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 1, %y\n  call void @use(i32 %and2)\n  %mul = mul i32 %and1, %and2\n  ret i32 %mul\n}",
+          "tgt": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 1, %y\n  call void @use(i32 %and2)\n  %mul = mul i32 %and1, %and2\n  ret i32 %mul\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = mul nuw nsw i32 %and1, %and2\n  ret i32 %mul\n}\n",
+          "tgt": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = mul nsw nuw i32 %and1, %and2\n  ret i32 %mul\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = mul nuw nsw i32 %and1, %and2\n  ret i32 %mul\n}\n",
+          "log": "\n----------------------------------------\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = and i32 %x, %and2\n  ret i32 %mul\n}\n=>\ndeclare void @use(i32)\n\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %and1 = and i32 %x, 1\n  call void @use(i32 %and1)\n  %and2 = and i32 %y, 1\n  call void @use(i32 %and2)\n  %mul = mul nsw nuw i32 %and1, %and2\n  ret i32 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul i8 %and1, %and2\n  ret i8 %mul\n}",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul i8 %and1, %and2\n  ret i8 %mul\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul nuw nsw i8 %and1, %and2\n  ret i8 %mul\n}\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul nsw nuw i8 %and1, %and2\n  ret i8 %mul\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul nuw nsw i8 %and1, %and2\n  ret i8 %mul\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %mul = and i8 %x, %y\n  %mul.trunc = and i8 %mul, 1\n  ret i8 %mul.trunc\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %and1 = and i8 %x, 1\n  %and2 = and i8 %y, 1\n  %mul = mul nsw nuw i8 %and1, %and2\n  ret i8 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_4xi32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %and1 = and <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %and2 = and <4 x i32> %y, <i32 1, i32 1, i32 1, i32 1>\n  %mul = mul <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %mul.masked\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %and1 = and <4 x i32> %x, { 1, 1, 1, 1 }\n  %and2 = and <4 x i32> %y, { 1, 1, 1, 1 }\n  %mul = mul <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, { 1, 1, 1, 1 }\n  ret <4 x i32> %mul.masked\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %and1 = and <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %and2 = and <4 x i32> %y, <i32 1, i32 1, i32 1, i32 1>\n  %mul = mul nuw nsw <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %mul.masked\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %and1 = and <4 x i32> %x, { 1, 1, 1, 1 }\n  %and2 = and <4 x i32> %y, { 1, 1, 1, 1 }\n  %mul = mul nsw nuw <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, { 1, 1, 1, 1 }\n  ret <4 x i32> %mul.masked\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, <i32 1, i32 1, i32 1, i32 1>\n  ret <4 x i32> %mul.masked\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %and1 = and <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %and2 = and <4 x i32> %y, <i32 1, i32 1, i32 1, i32 1>\n  %mul = mul nuw nsw <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %mul = and <4 x i32> %x, %y\n  %mul.masked = and <4 x i32> %mul, { 1, 1, 1, 1 }\n  ret <4 x i32> %mul.masked\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %and1 = and <4 x i32> %x, { 1, 1, 1, 1 }\n  %and2 = and <4 x i32> %y, { 1, 1, 1, 1 }\n  %mul = mul nsw nuw <4 x i32> %and1, %and2\n  ret <4 x i32> %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zext_i1_source",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 6,
+        "current_opt": 4,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "mixed_and_and_zext",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "negative_mask_2",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 2\n  %and2 = and i64 %y, 2\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_mask_neg1",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 2,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "constant_fold_0",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 1,
+        "current_opt": 1,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 0\n  ret i64 %mul\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  ret i64 0\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 0\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  ret i64 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  ret i64 0\n}\n",
+          "tgt": "define i64 @test(i64 %x) {\n  ret i64 0\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  ret i64 0\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  ret i64 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  ret i64 0\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  ret i64 0\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  ret i64 0\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  ret i64 0\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_fold_1",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 1\n  ret i64 %mul\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, 1\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "flags_nuw_nsw",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nuw nsw i64 %and1, %and2\n  ret i64 %mul\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %mul = and i64 %x, %y\n  %mul.masked = and i64 %mul, 1\n  ret i64 %mul.masked\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %and1 = and i64 %x, 1\n  %and2 = and i64 %y, 1\n  %mul = mul nsw nuw i64 %and1, %and2\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "same_operand",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, %and1\n  ret i64 %mul\n}",
+          "tgt": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  %mul = mul i64 %and1, %and1\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul nuw nsw i64 %and1, %and1\n  ret i64 %mul\n}\n",
+          "tgt": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  %mul = mul nsw nuw i64 %and1, %and1\n  ret i64 %mul\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\n  %and1 = and i64 %x, 1\n  %mul = mul nuw nsw i64 %and1, %and1\n  ret i64 %mul\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  ret i64 %and1\n}\n=>\ndefine i64 @test(i64 %x) {\n#0:\n  %and1 = and i64 %x, 1\n  %mul = mul nsw nuw i64 %and1, %and1\n  ret i64 %mul\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at CMakeLists.txt:8 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\n\n\n-- Looking for link.h\n-- Looking for link.h - found\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Performing Test Terminfo_LINKABLE\n-- Performing Test Terminfo_LINKABLE - Success\n-- Found Terminfo: /usr/lib/x86_64-linux-gnu/libtinfo.so  \n-- Looking for xar_open in xar\n-- Looking for xar_open in xar - not found\n-- Looking for lseek64\n-- Looking for lseek64 - found\n-- Looking for strerror\n-- Looking for strerror - found\n-- Performing Test HAVE_STD_IS_TRIVIALLY_COPYABLE\n-- Performing Test HAVE_STD_IS_TRIVIALLY_COPYABLE - Success\n-- Performing Test SUPPORTS_VARIADIC_MACROS_FLAG\n-- Performing Test SUPPORTS_VARIADIC_MACROS_FLAG - Success\n-- Performing Test SUPPORTS_GNU_ZERO_VARIADIC_MACRO_ARGUMENTS_FLAG\n-- Performing Test SUPPORTS_GNU_ZERO_VARIADIC_MACRO_ARGUMENTS_FLAG - Failed\n-- Performing Test HAS_MAYBE_UNINITIALIZED\n-- Performing Test HAS_MAYBE_UNINITIALIZED - Success\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Go bindings disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Performing Test C_SUPPORTS_WERROR_DATE_TIME\n-- Performing Test C_SUPPORTS_WERROR_DATE_TIME - Success\n-- Performing Test CXX_SUPPORTS_WERROR_DATE_TIME\n-- Performing Test CXX_SUPPORTS_WERROR_DATE_TIME - Success\n-- Performing Test CXX_SUPPORTS_WERROR_UNGUARDED_AVAILABILITY_NEW\n-- Performing Test CXX_SUPPORTS_WERROR_UNGUARDED_AVAILABILITY_NEW - Failed\n-- Performing Test C_SUPPORTS_FNO_FUNCTION_SECTIONS\n-- Performing Test C_SUPPORTS_FNO_FUNCTION_SECTIONS - Success\n-- Performing Test C_SUPPORTS_FFUNCTION_SECTIONS\n-- Performing Test C_SUPPORTS_FFUNCTION_SECTIONS - Success\n-- Performing Test CXX_SUPPORTS_FFUNCTION_SECTIONS\n-- Performing Test CXX_SUPPORTS_FFUNCTION_SECTIONS - Success\n-- Performing Test C_SUPPORTS_FDATA_SECTIONS\n-- Performing Test C_SUPPORTS_FDATA_SECTIONS - Success\n-- Performing Test CXX_SUPPORTS_FDATA_SECTIONS\n-- Performing Test CXX_SUPPORTS_FDATA_SECTIONS - Success\n-- Found Python3: /data/btguan/miniconda3/bin/python3 (found suitable version \"3.13.5\", minimum required is \"3.6\") found components: Interpreter \n-- Looking for __aarch64__\n-- Looking for __aarch64__ - not found\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_CXX_FLAG_STD_CXX11\n-- Performing Test HAVE_CXX_FLAG_STD_CXX11 - Success\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (3.5s)\n-- Generating done (0.7s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

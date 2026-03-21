@@ -1,0 +1,643 @@
+{
+  "issue_id": "142497",
+  "dataset_file": "142497.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue was a specific **“ceil divide by 8” idiom** hidden inside a larger computation: after deriving `%sub = 32 - ctlz(v)`, the code computed  \n`(sub >> 3) + zext((sub & 7) != 0)`, which is exactly `ceil(sub / 8)`.  \nThe missed optimization was to recognize this as a power-of-two ceiling division and fold it to the simpler canonical form `(sub + 7) >> 3`, provided the add cannot unsigned-overflow.\n\nThe patch generalizes this in `visitAdd()` by matching the abstract shape:\n\n- `(X lshr C) + zext((X & Mask) != 0)`  \n- or the commuted add form,\n- where `Mask` is a **low-bit mask** and `popcount(Mask) == C` (so `Mask = 2^C - 1`).\n\nIf matched, it checks `willNotOverflowUnsignedAdd(X, Mask, I)`, then rewrites to:\n`lshr (nuw (X + Mask)), C`.\n\nSo the motivating `ctlz` case is no longer special-cased: it works because `%sub` simply becomes `X`.\n\nThe dev tests broaden coverage along the important dimensions:\n\n- **Positive folds**: scalar, vector, different widths (`i16`), different divisors (`8`, `16`), known range / overflow-proof cases, and the original `ctlz`-derived source.\n- **Operand freedom**: commuted add operands.\n- **Use-count robustness**: multi-use of `%shr`, `%and`, `%ext`; unlike the matcher, only `%shr` must be one-use.\n- **Negative tests**: wrong mask, wrong shift, wrong compare predicate, insufficient overflow info, and only-`nuw`-on-add cases.\n- **Non-related regression guard**: `fold_zext_nneg_add_const_fail2` ensures no accidental interaction with nearby add/zext folds.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine noundef range(i32 0, 6) i32 @test(i32 noundef %v) unnamed_addr #0 {\nstart:\n  %0 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %_2 = sub nuw nsw i32 32, %0\n  %_41 = lshr i32 %_2, 3\n  %_5 = and i32 %_2, 7\n  %_6.not = icmp ne i32 %_5, 0\n  %1 = zext i1 %_6.not to i32\n  %_0.sroa.0.0 = add nuw nsw i32 %_41, %1\n  ret i32 %_0.sroa.0.0\n}\n\ndefine noundef range(i32 0, 5) i32 @test(i32 noundef %v) unnamed_addr #0 {\nstart:\n  %0 = tail call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %1 = sub nuw nsw i32 32, %0\n  %2 = add nuw nsw i32 %1, 7\n  %3 = lshr i32 %2, 3\n  ret i32 %3\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"name\": \"ceil_udiv_pow2_from_lshr_plus_zext_nonzero_lowbits\",\n    \"summary\": \"Recognize unsigned ceil-division by a power of two encoded as a logical shift-right plus a 0/1 increment based on whether any truncated low bits are nonzero.\",\n    \"match\": [\n      \"(lshr X, C) + zext((X & Mask) != 0)\",\n      \"zext((X & Mask) != 0) + (lshr X, C)\"\n    ],\n    \"preconditions\": [\n      \"Mask must be a contiguous low-bit mask of the form (1 << C) - 1\",\n      \"Equivalently, popcount(Mask) == C and Mask == lowbits(C)\",\n      \"The compare must test nonzero: icmp ne (X & Mask), 0\",\n      \"The zext must extend the i1 compare result into the add type\",\n      \"X, lshr result, and mask/compare must be in the same scalar or vector element width\",\n      \"Unsigned add of X + Mask must be provably non-wrapping in the demanded context, e.g. willNotOverflowUnsignedAdd(X, Mask, I)\",\n      \"The lshr node should be safe/canonical to replace; current combine commonly requires the lshr to be one-use\"\n    ],\n    \"rewrite\": {\n      \"from\": \"(lshr X, C) + zext((X & ((1 << C) - 1)) != 0)\",\n      \"to\": \"lshr (add nuw X, ((1 << C) - 1)), C\"\n    },\n    \"intuition\": \"For unsigned X, floor(X / 2^C) plus 1 if any low C bits are set equals ceil(X / 2^C). When X + (2^C - 1) is known not to unsigned-overflow, ceil(X / 2^C) canonically becomes (X + (2^C - 1)) >> C.\",\n    \"notes\": [\n      \"This is not specific to ctlz-derived values; any X with sufficient no-overflow proof qualifies.\",\n      \"The fold applies to scalars and fixed-width vectors lane-wise.\",\n      \"Typical profitable sources include bit-width computations, bounded subtracts, masked lengths, and values carrying range metadata or known-bits information.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"scalar_i32_basic_non_ctlz_known_bounded_8\",\n      \"ir\": \"define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\\nentry:\\n  %m = and i32 %x, 255\\n  %shr = lshr i32 %m, 3\\n  %low = and i32 %m, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\\nentry:\\n  %m = and i32 %x, 255\\n  %add = add nuw i32 %m, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_commuted_add_8\",\n      \"ir\": \"define i32 @scalar_i32_commuted_add_8(i32 %x) {\\nentry:\\n  %m = and i32 %x, 1023\\n  %shr = lshr i32 %m, 3\\n  %low = and i32 %m, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %inc, %shr\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_commuted_add_8(i32 %x) {\\nentry:\\n  %m = and i32 %x, 1023\\n  %add = add nuw i32 %m, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i16_div16\",\n      \"ir\": \"define i16 @scalar_i16_div16(i16 %x) {\\nentry:\\n  %m = and i16 %x, 255\\n  %shr = lshr i16 %m, 4\\n  %low = and i16 %m, 15\\n  %nz = icmp ne i16 %low, 0\\n  %inc = zext i1 %nz to i16\\n  %r = add nuw i16 %shr, %inc\\n  ret i16 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i16 @scalar_i16_div16(i16 %x) {\\nentry:\\n  %m = and i16 %x, 255\\n  %add = add nuw i16 %m, 15\\n  %r = lshr i16 %add, 4\\n  ret i16 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_div2\",\n      \"ir\": \"define i64 @scalar_i64_div2(i64 %x) {\\nentry:\\n  %m = and i64 %x, 9223372036854775806\\n  %shr = lshr i64 %m, 1\\n  %low = and i64 %m, 1\\n  %nz = icmp ne i64 %low, 0\\n  %inc = zext i1 %nz to i64\\n  %r = add nuw i64 %shr, %inc\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @scalar_i64_div2(i64 %x) {\\nentry:\\n  %m = and i64 %x, 9223372036854775806\\n  %add = add nuw i64 %m, 1\\n  %r = lshr i64 %add, 1\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_div4\",\n      \"ir\": \"define i8 @scalar_i8_div4(i8 %x) {\\nentry:\\n  %m = and i8 %x, 31\\n  %shr = lshr i8 %m, 2\\n  %low = and i8 %m, 3\\n  %nz = icmp ne i8 %low, 0\\n  %inc = zext i1 %nz to i8\\n  %r = add nuw i8 %shr, %inc\\n  ret i8 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i8 @scalar_i8_div4(i8 %x) {\\nentry:\\n  %m = and i8 %x, 31\\n  %add = add nuw i8 %m, 3\\n  %r = lshr i8 %add, 2\\n  ret i8 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_ctlz_original_shape\",\n      \"ir\": \"declare i32 @llvm.ctlz.i32(i32, i1 immarg)\\n\\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\\nentry:\\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\\n  %x = sub nuw nsw i32 32, %c\\n  %shr = lshr i32 %x, 3\\n  %low = and i32 %x, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw nsw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"declare i32 @llvm.ctlz.i32(i32, i1 immarg)\\n\\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\\nentry:\\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\\n  %x = sub nuw nsw i32 32, %c\\n  %add = add nuw i32 %x, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_sub_from_constant_bounded\",\n      \"ir\": \"define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\\nentry:\\n  %m = and i32 %x, 63\\n  %y = sub nuw nsw i32 100, %m\\n  %shr = lshr i32 %y, 3\\n  %low = and i32 %y, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\\nentry:\\n  %m = and i32 %x, 63\\n  %y = sub nuw nsw i32 100, %m\\n  %add = add nuw i32 %y, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_exact_low_mask_31_shift5\",\n      \"ir\": \"define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\\nentry:\\n  %m = and i32 %x, 4095\\n  %shr = lshr i32 %m, 5\\n  %low = and i32 %m, 31\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\\nentry:\\n  %m = and i32 %x, 4095\\n  %add = add nuw i32 %m, 31\\n  %r = lshr i32 %add, 5\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i32_div8\",\n      \"ir\": \"define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\\nentry:\\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\\n  %shr = lshr <4 x i32> %m, <i32 3, i32 3, i32 3, i32 3>\\n  %low = and <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\\n  %nz = icmp ne <4 x i32> %low, zeroinitializer\\n  %inc = zext <4 x i1> %nz to <4 x i32>\\n  %r = add nuw <4 x i32> %shr, %inc\\n  ret <4 x i32> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\\nentry:\\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\\n  %add = add nuw <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\\n  %r = lshr <4 x i32> %add, <i32 3, i32 3, i32 3, i32 3>\\n  ret <4 x i32> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v2i16_div16\",\n      \"ir\": \"define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\\nentry:\\n  %m = and <2 x i16> %x, <i16 255, i16 255>\\n  %shr = lshr <2 x i16> %m, <i16 4, i16 4>\\n  %low = and <2 x i16> %m, <i16 15, i16 15>\\n  %nz = icmp ne <2 x i16> %low, zeroinitializer\\n  %inc = zext <2 x i1> %nz to <2 x i16>\\n  %r = add nuw <2 x i16> %shr, %inc\\n  ret <2 x i16> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\\nentry:\\n  %m = and <2 x i16> %x, <i16 255, i16 255>\\n  %add = add nuw <2 x i16> %m, <i16 15, i16 15>\\n  %r = lshr <2 x i16> %add, <i16 4, i16 4>\\n  ret <2 x i16> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_multiuse_and_ext_only_shr_oneuse\",\n      \"ir\": \"define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\\nentry:\\n  %m = and i32 %x, 255\\n  %shr = lshr i32 %m, 3\\n  %low = and i32 %m, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  %u1 = add i32 %low, 42\\n  %u2 = add i32 %inc, %u1\\n  %out = add i32 %r, %u2\\n  ret i32 %out\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\\nentry:\\n  %m = and i32 %x, 255\\n  %add = add nuw i32 %m, 7\\n  %r = lshr i32 %add, 3\\n  %low = and i32 %m, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %u1 = add i32 %low, 42\\n  %u2 = add i32 %inc, %u1\\n  %out = add i32 %r, %u2\\n  ret i32 %out\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_phi_bounded\",\n      \"ir\": \"define i32 @scalar_i32_phi_bounded(i1 %c, i32 %a, i32 %b) {\\nentry:\\n  %ma = and i32 %a, 120\\n  %mb = and i32 %b, 120\\n  br i1 %c, label %t, label %f\\n\\nt:\\n  br label %merge\\n\\nf:\\n  br label %merge\\n\\nmerge:\\n  %x = phi i32 [ %ma, %t ], [ %mb, %f ]\\n  %shr = lshr i32 %x, 3\\n  %low = and i32 %x, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_phi_bounded(i1 %c, i32 %a, i32 %b) {\\nentry:\\n  %ma = and i32 %a, 120\\n  %mb = and i32 %b, 120\\n  br i1 %c, label %t, label %f\\n\\nt:\\n  br label %merge\\n\\nf:\\n  br label %merge\\n\\nmerge:\\n  %x = phi i32 [ %ma, %t ], [ %mb, %f ]\\n  %add = add nuw i32 %x, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_range_metadata_parameter\",\n      \"ir\": \"define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\\nentry:\\n  %shr = lshr i32 %x, 3\\n  %low = and i32 %x, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\\nentry:\\n  %add = add nuw i32 %x, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_select_bounded\",\n      \"ir\": \"define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\\nentry:\\n  %mx = and i32 %x, 100\\n  %my = and i32 %y, 200\\n  %s = select i1 %c, i32 %mx, i32 %my\\n  %shr = lshr i32 %s, 3\\n  %low = and i32 %s, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\\nentry:\\n  %mx = and i32 %x, 100\\n  %my = and i32 %y, 200\\n  %s = select i1 %c, i32 %mx, i32 %my\\n  %add = add nuw i32 %s, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_shift6_mask63\",\n      \"ir\": \"define i64 @scalar_i64_shift6_mask63(i64 %x) {\\nentry:\\n  %m = and i64 %x, 4095\\n  %shr = lshr i64 %m, 6\\n  %low = and i64 %m, 63\\n  %nz = icmp ne i64 %low, 0\\n  %inc = zext i1 %nz to i64\\n  %r = add nuw i64 %shr, %inc\\n  ret i64 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i64 @scalar_i64_shift6_mask63(i64 %x) {\\nentry:\\n  %m = and i64 %x, 4095\\n  %add = add nuw i64 %m, 63\\n  %r = lshr i64 %add, 6\\n  ret i64 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_masked_then_or_zero\",\n      \"ir\": \"define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\\nentry:\\n  %m0 = and i32 %x, 255\\n  %m = or i32 %m0, 0\\n  %shr = lshr i32 %m, 3\\n  %low = and i32 %m, 7\\n  %nz = icmp ne i32 %low, 0\\n  %inc = zext i1 %nz to i32\\n  %r = add nuw i32 %shr, %inc\\n  ret i32 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\\nentry:\\n  %m0 = and i32 %x, 255\\n  %m = or i32 %m0, 0\\n  %add = add nuw i32 %m, 7\\n  %r = lshr i32 %add, 3\\n  ret i32 %r\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "name": "ceil_udiv_pow2_from_lshr_plus_zext_nonzero_lowbits",
+      "summary": "Recognize unsigned ceil-division by a power of two encoded as a logical shift-right plus a 0/1 increment based on whether any truncated low bits are nonzero.",
+      "match": [
+        "(lshr X, C) + zext((X & Mask) != 0)",
+        "zext((X & Mask) != 0) + (lshr X, C)"
+      ],
+      "preconditions": [
+        "Mask must be a contiguous low-bit mask of the form (1 << C) - 1",
+        "Equivalently, popcount(Mask) == C and Mask == lowbits(C)",
+        "The compare must test nonzero: icmp ne (X & Mask), 0",
+        "The zext must extend the i1 compare result into the add type",
+        "X, lshr result, and mask/compare must be in the same scalar or vector element width",
+        "Unsigned add of X + Mask must be provably non-wrapping in the demanded context, e.g. willNotOverflowUnsignedAdd(X, Mask, I)",
+        "The lshr node should be safe/canonical to replace; current combine commonly requires the lshr to be one-use"
+      ],
+      "rewrite": {
+        "from": "(lshr X, C) + zext((X & ((1 << C) - 1)) != 0)",
+        "to": "lshr (add nuw X, ((1 << C) - 1)), C"
+      },
+      "intuition": "For unsigned X, floor(X / 2^C) plus 1 if any low C bits are set equals ceil(X / 2^C). When X + (2^C - 1) is known not to unsigned-overflow, ceil(X / 2^C) canonically becomes (X + (2^C - 1)) >> C.",
+      "notes": [
+        "This is not specific to ctlz-derived values; any X with sufficient no-overflow proof qualifies.",
+        "The fold applies to scalars and fixed-width vectors lane-wise.",
+        "Typical profitable sources include bit-width computations, bounded subtracts, masked lengths, and values carrying range metadata or known-bits information."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "scalar_i32_basic_non_ctlz_known_bounded_8",
+        "ir": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_commuted_add_8",
+        "ir": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %inc, %shr\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i16_div16",
+        "ir": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %shr = lshr i16 %m, 4\n  %low = and i16 %m, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nuw i16 %shr, %inc\n  ret i16 %r\n}\n",
+        "expected_optimized_ir": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_div2",
+        "ir": "define i64 @scalar_i64_div2(i64 %x) {\nentry:\n  %m = and i64 %x, 9223372036854775806\n  %shr = lshr i64 %m, 1\n  %low = and i64 %m, 1\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw i64 %shr, %inc\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @scalar_i64_div2(i64 %x) {\nentry:\n  %m = and i64 %x, 9223372036854775806\n  %add = add nuw i64 %m, 1\n  %r = lshr i64 %add, 1\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "scalar_i8_div4",
+        "ir": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %shr = lshr i8 %m, 2\n  %low = and i8 %m, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nuw i8 %shr, %inc\n  ret i8 %r\n}\n",
+        "expected_optimized_ir": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_ctlz_original_shape",
+        "ir": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_sub_from_constant_bounded",
+        "ir": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_exact_low_mask_31_shift5",
+        "ir": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %shr = lshr i32 %m, 5\n  %low = and i32 %m, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "vector_v4i32_div8",
+        "ir": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %shr = lshr <4 x i32> %m, <i32 3, i32 3, i32 3, i32 3>\n  %low = and <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %nz = icmp ne <4 x i32> %low, zeroinitializer\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nuw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n",
+        "expected_optimized_ir": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %add = add nuw <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %r = lshr <4 x i32> %add, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i32> %r\n}\n"
+      },
+      {
+        "name": "vector_v2i16_div16",
+        "ir": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %shr = lshr <2 x i16> %m, <i16 4, i16 4>\n  %low = and <2 x i16> %m, <i16 15, i16 15>\n  %nz = icmp ne <2 x i16> %low, zeroinitializer\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nuw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n",
+        "expected_optimized_ir": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %add = add nuw <2 x i16> %m, <i16 15, i16 15>\n  %r = lshr <2 x i16> %add, <i16 4, i16 4>\n  ret <2 x i16> %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_multiuse_and_ext_only_shr_oneuse",
+        "ir": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n"
+      },
+      {
+        "name": "scalar_i32_phi_bounded",
+        "ir": "define i32 @scalar_i32_phi_bounded(i1 %c, i32 %a, i32 %b) {\nentry:\n  %ma = and i32 %a, 120\n  %mb = and i32 %b, 120\n  br i1 %c, label %t, label %f\n\nt:\n  br label %merge\n\nf:\n  br label %merge\n\nmerge:\n  %x = phi i32 [ %ma, %t ], [ %mb, %f ]\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_phi_bounded(i1 %c, i32 %a, i32 %b) {\nentry:\n  %ma = and i32 %a, 120\n  %mb = and i32 %b, 120\n  br i1 %c, label %t, label %f\n\nt:\n  br label %merge\n\nf:\n  br label %merge\n\nmerge:\n  %x = phi i32 [ %ma, %t ], [ %mb, %f ]\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_range_metadata_parameter",
+        "ir": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_select_bounded",
+        "ir": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = and i32 %s, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_shift6_mask63",
+        "ir": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %shr = lshr i64 %m, 6\n  %low = and i64 %m, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw i64 %shr, %inc\n  ret i64 %r\n}\n",
+        "expected_optimized_ir": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_masked_then_or_zero",
+        "ir": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+        "expected_optimized_ir": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_i32_basic_non_ctlz_known_bounded_8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_basic_non_ctlz_known_bounded_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_commuted_add_8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %inc, %shr\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %inc, %shr\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = and i32 %x, 1023\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_commuted_add_8(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i16_div16",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %shr = lshr i16 %m, 4\n  %low = and i16 %m, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nuw i16 %shr, %inc\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %shr = lshr i16 %m, 4\n  %low = and i16 %m, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nuw i16 %shr, %inc\n  ret i16 %r\n}\n=>\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = lshr i16 %x, 4\n  %shr = and i16 %m, 15\n  %low = and i16 %x, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nuw nsw i16 %shr, %inc\n  ret i16 %r\n}\n",
+          "tgt": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = lshr i16 %x, 4\n  %shr = and i16 %m, 15\n  %low = and i16 %x, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nsw nuw i16 %shr, %inc\n  ret i16 %r\n}\n=>\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = lshr i16 %x, 4\n  %shr = and i16 %m, 15\n  %low = and i16 %x, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nuw nsw i16 %shr, %inc\n  ret i16 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = and i16 %x, 255\n  %add = add nuw i16 %m, 15\n  %r = lshr i16 %add, 4\n  ret i16 %r\n}\n=>\ndefine i16 @scalar_i16_div16(i16 %x) {\nentry:\n  %m = lshr i16 %x, 4\n  %shr = and i16 %m, 15\n  %low = and i16 %x, 15\n  %nz = icmp ne i16 %low, 0\n  %inc = zext i1 %nz to i16\n  %r = add nsw nuw i16 %shr, %inc\n  ret i16 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i64_div2",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i8_div4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %shr = lshr i8 %m, 2\n  %low = and i8 %m, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nuw i8 %shr, %inc\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %shr = lshr i8 %m, 2\n  %low = and i8 %m, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nuw i8 %shr, %inc\n  ret i8 %r\n}\n=>\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = lshr i8 %x, 2\n  %shr = and i8 %m, 7\n  %low = and i8 %x, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nuw nsw i8 %shr, %inc\n  ret i8 %r\n}\n",
+          "tgt": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = lshr i8 %x, 2\n  %shr = and i8 %m, 7\n  %low = and i8 %x, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nsw nuw i8 %shr, %inc\n  ret i8 %r\n}\n=>\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = lshr i8 %x, 2\n  %shr = and i8 %m, 7\n  %low = and i8 %x, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nuw nsw i8 %shr, %inc\n  ret i8 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = and i8 %x, 31\n  %add = add nuw i8 %m, 3\n  %r = lshr i8 %add, 2\n  ret i8 %r\n}\n=>\ndefine i8 @scalar_i8_div4(i8 %x) {\nentry:\n  %m = lshr i8 %x, 2\n  %shr = and i8 %m, 7\n  %low = and i8 %x, 3\n  %nz = icmp ne i8 %low, 0\n  %inc = zext i1 %nz to i8\n  %r = add nsw nuw i8 %shr, %inc\n  ret i8 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_ctlz_original_shape",
+      "missed_optimization": true,
+      "cost": {
+        "source": 9,
+        "expected": 6,
+        "current_opt": 9,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 9\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %x = sub nsw nuw i32 32, %c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %x = sub nsw nuw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %#range_0_%c = !range i32 %c, i32 0, i32 33\n  %x = sub nsw nuw i32 32, %#range_0_%c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %x = sub nsw nuw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare i32 @llvm.ctlz.i32(i32, i1 immarg)\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %v, i1 false)\n  %x = sub nuw nsw i32 32, %c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %x = sub nsw nuw i32 32, %c\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_ctlz_original_shape(i32 %v) {\nentry:\n  %c = ctlz i32 %v, 0\n  %#range_0_%c = !range i32 %c, i32 0, i32 33\n  %x = sub nsw nuw i32 32, %#range_0_%c\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_sub_from_constant_bounded",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 5,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nuw nsw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %add = add nuw i32 %y, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_sub_from_constant_bounded(i32 %x) {\nentry:\n  %m = and i32 %x, 63\n  %y = sub nsw nuw i32 100, %m\n  %shr = lshr i32 %y, 3\n  %low = and i32 %y, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_exact_low_mask_31_shift5",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %shr = lshr i32 %m, 5\n  %low = and i32 %m, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %shr = lshr i32 %m, 5\n  %low = and i32 %m, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = lshr i32 %x, 5\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = lshr i32 %x, 5\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = lshr i32 %x, 5\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = and i32 %x, 4095\n  %add = add nuw i32 %m, 31\n  %r = lshr i32 %add, 5\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_exact_low_mask_31_shift5(i32 %x) {\nentry:\n  %m = lshr i32 %x, 5\n  %shr = and i32 %m, 127\n  %low = and i32 %x, 31\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i32_div8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %shr = lshr <4 x i32> %m, <i32 3, i32 3, i32 3, i32 3>\n  %low = and <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %nz = icmp ne <4 x i32> %low, zeroinitializer\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nuw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n",
+          "tgt": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %add = add nuw <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %r = lshr <4 x i32> %add, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i32> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, { 255, 255, 255, 255 }\n  %shr = lshr <4 x i32> %m, { 3, 3, 3, 3 }\n  %low = and <4 x i32> %m, { 7, 7, 7, 7 }\n  %nz = icmp ne <4 x i32> %low, { 0, 0, 0, 0 }\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nuw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, { 255, 255, 255, 255 }\n  %add = add nuw <4 x i32> %m, { 7, 7, 7, 7 }\n  %r = lshr <4 x i32> %add, { 3, 3, 3, 3 }\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = lshr <4 x i32> %x, splat (i32 3)\n  %shr = and <4 x i32> %m, splat (i32 31)\n  %low = and <4 x i32> %x, splat (i32 7)\n  %nz = icmp ne <4 x i32> %low, zeroinitializer\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nuw nsw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n",
+          "tgt": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %add = add nuw <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %r = lshr <4 x i32> %add, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i32> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = lshr <4 x i32> %x, { 3, 3, 3, 3 }\n  %shr = and <4 x i32> %m, { 31, 31, 31, 31 }\n  %low = and <4 x i32> %x, { 7, 7, 7, 7 }\n  %nz = icmp ne <4 x i32> %low, { 0, 0, 0, 0 }\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nsw nuw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, { 255, 255, 255, 255 }\n  %add = add nuw <4 x i32> %m, { 7, 7, 7, 7 }\n  %r = lshr <4 x i32> %add, { 3, 3, 3, 3 }\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, <i32 255, i32 255, i32 255, i32 255>\n  %add = add nuw <4 x i32> %m, <i32 7, i32 7, i32 7, i32 7>\n  %r = lshr <4 x i32> %add, <i32 3, i32 3, i32 3, i32 3>\n  ret <4 x i32> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = lshr <4 x i32> %x, splat (i32 3)\n  %shr = and <4 x i32> %m, splat (i32 31)\n  %low = and <4 x i32> %x, splat (i32 7)\n  %nz = icmp ne <4 x i32> %low, zeroinitializer\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nuw nsw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = and <4 x i32> %x, { 255, 255, 255, 255 }\n  %add = add nuw <4 x i32> %m, { 7, 7, 7, 7 }\n  %r = lshr <4 x i32> %add, { 3, 3, 3, 3 }\n  ret <4 x i32> %r\n}\n=>\ndefine <4 x i32> @vector_v4i32_div8(<4 x i32> %x) {\nentry:\n  %m = lshr <4 x i32> %x, { 3, 3, 3, 3 }\n  %shr = and <4 x i32> %m, { 31, 31, 31, 31 }\n  %low = and <4 x i32> %x, { 7, 7, 7, 7 }\n  %nz = icmp ne <4 x i32> %low, { 0, 0, 0, 0 }\n  %inc = zext <4 x i1> %nz to <4 x i32>\n  %r = add nsw nuw <4 x i32> %shr, %inc\n  ret <4 x i32> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v2i16_div16",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %shr = lshr <2 x i16> %m, <i16 4, i16 4>\n  %low = and <2 x i16> %m, <i16 15, i16 15>\n  %nz = icmp ne <2 x i16> %low, zeroinitializer\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nuw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n",
+          "tgt": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %add = add nuw <2 x i16> %m, <i16 15, i16 15>\n  %r = lshr <2 x i16> %add, <i16 4, i16 4>\n  ret <2 x i16> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, { 255, 255 }\n  %shr = lshr <2 x i16> %m, { 4, 4 }\n  %low = and <2 x i16> %m, { 15, 15 }\n  %nz = icmp ne <2 x i16> %low, { 0, 0 }\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nuw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n=>\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, { 255, 255 }\n  %add = add nuw <2 x i16> %m, { 15, 15 }\n  %r = lshr <2 x i16> %add, { 4, 4 }\n  ret <2 x i16> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = lshr <2 x i16> %x, splat (i16 4)\n  %shr = and <2 x i16> %m, splat (i16 15)\n  %low = and <2 x i16> %x, splat (i16 15)\n  %nz = icmp ne <2 x i16> %low, zeroinitializer\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nuw nsw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n",
+          "tgt": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %add = add nuw <2 x i16> %m, <i16 15, i16 15>\n  %r = lshr <2 x i16> %add, <i16 4, i16 4>\n  ret <2 x i16> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = lshr <2 x i16> %x, { 4, 4 }\n  %shr = and <2 x i16> %m, { 15, 15 }\n  %low = and <2 x i16> %x, { 15, 15 }\n  %nz = icmp ne <2 x i16> %low, { 0, 0 }\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nsw nuw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n=>\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, { 255, 255 }\n  %add = add nuw <2 x i16> %m, { 15, 15 }\n  %r = lshr <2 x i16> %add, { 4, 4 }\n  ret <2 x i16> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, <i16 255, i16 255>\n  %add = add nuw <2 x i16> %m, <i16 15, i16 15>\n  %r = lshr <2 x i16> %add, <i16 4, i16 4>\n  ret <2 x i16> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = lshr <2 x i16> %x, splat (i16 4)\n  %shr = and <2 x i16> %m, splat (i16 15)\n  %low = and <2 x i16> %x, splat (i16 15)\n  %nz = icmp ne <2 x i16> %low, zeroinitializer\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nuw nsw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = and <2 x i16> %x, { 255, 255 }\n  %add = add nuw <2 x i16> %m, { 15, 15 }\n  %r = lshr <2 x i16> %add, { 4, 4 }\n  ret <2 x i16> %r\n}\n=>\ndefine <2 x i16> @vector_v2i16_div16(<2 x i16> %x) {\nentry:\n  %m = lshr <2 x i16> %x, { 4, 4 }\n  %shr = and <2 x i16> %m, { 15, 15 }\n  %low = and <2 x i16> %x, { 15, 15 }\n  %nz = icmp ne <2 x i16> %low, { 0, 0 }\n  %inc = zext <2 x i1> %nz to <2 x i16>\n  %r = add nsw nuw <2 x i16> %shr, %inc\n  ret <2 x i16> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_multiuse_and_ext_only_shr_oneuse",
+      "missed_optimization": true,
+      "cost": {
+        "source": 10,
+        "expected": 10,
+        "current_opt": 10,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 10\n",
+        "expected_log": "Cost: 10\n",
+        "current_opt_log": "Cost: 10\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n",
+          "tgt": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n=>\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  %u1 = add nuw nsw i32 %low, 42\n  %u2 = add nuw nsw i32 %u1, %inc\n  %out = add nuw nsw i32 %r, %u2\n  ret i32 %out\n}\n",
+          "tgt": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  %u1 = add nsw nuw i32 %low, 42\n  %u2 = add nsw nuw i32 %u1, %inc\n  %out = add nsw nuw i32 %r, %u2\n  ret i32 %out\n}\n=>\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  %u1 = add nuw nsw i32 %low, 42\n  %u2 = add nuw nsw i32 %u1, %inc\n  %out = add nuw nsw i32 %r, %u2\n  ret i32 %out\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = and i32 %x, 255\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %u1 = add i32 %low, 42\n  %u2 = add i32 %inc, %u1\n  %out = add i32 %r, %u2\n  ret i32 %out\n}\n=>\ndefine i32 @scalar_i32_multiuse_and_ext_only_shr_oneuse(i32 %x) {\nentry:\n  %m = lshr i32 %x, 3\n  %shr = and i32 %m, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  %u1 = add nsw nuw i32 %low, 42\n  %u2 = add nsw nuw i32 %u1, %inc\n  %out = add nsw nuw i32 %r, %u2\n  ret i32 %out\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_phi_bounded",
+      "missed_optimization": false,
+      "cost": {
+        "source": 12,
+        "expected": 9,
+        "current_opt": 7,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 12\n",
+        "expected_log": "Cost: 9\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "scalar_i32_range_metadata_parameter",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 3,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %shr = lshr i32 %#range_0_%x, 3\n  %low = and i32 %#range_0_%x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %add = add nuw i32 %#range_0_%x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %shr = lshr i32 %#range_0_%x, 3\n  %low = and i32 %#range_0_%x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %add = add nuw i32 %#range_0_%x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %add = add nuw i32 %x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef range(i32 0, 1000) %x) {\nentry:\n  %shr = lshr i32 %x, 3\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %add = add nuw i32 %#range_0_%x, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_range_metadata_parameter(i32 noundef %x) {\ninit:\n  %#range_0_%x = !range i32 noundef %x, i32 0, i32 1000, welldefined\n  br label %entry\n\nentry:\n  %shr = lshr i32 %#range_0_%x, 3\n  %low = and i32 %#range_0_%x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_select_bounded",
+      "missed_optimization": true,
+      "cost": {
+        "source": 9,
+        "expected": 6,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = and i32 %s, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = and i32 %s, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = lshr exact i32 %s, 2\n  %low.lobit = and i32 %low, 1\n  %r = add nuw nsw i32 %shr, %low.lobit\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = lshr exact i32 %s, 2\n  %low.lobit = and i32 %low, 1\n  %r = add nsw nuw i32 %shr, %low.lobit\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = lshr exact i32 %s, 2\n  %low.lobit = and i32 %low, 1\n  %r = add nuw nsw i32 %shr, %low.lobit\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %add = add nuw i32 %s, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_select_bounded(i1 %c, i32 %x, i32 %y) {\nentry:\n  %mx = and i32 %x, 100\n  %my = and i32 %y, 200\n  %s = select i1 %c, i32 %mx, i32 %my\n  %shr = lshr i32 %s, 3\n  %low = lshr exact i32 %s, 2\n  %low.lobit = and i32 %low, 1\n  %r = add nsw nuw i32 %shr, %low.lobit\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i64_shift6_mask63",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %shr = lshr i64 %m, 6\n  %low = and i64 %m, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw i64 %shr, %inc\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %shr = lshr i64 %m, 6\n  %low = and i64 %m, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw i64 %shr, %inc\n  ret i64 %r\n}\n=>\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = lshr i64 %x, 6\n  %shr = and i64 %m, 63\n  %low = and i64 %x, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw nsw i64 %shr, %inc\n  ret i64 %r\n}\n",
+          "tgt": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = lshr i64 %x, 6\n  %shr = and i64 %m, 63\n  %low = and i64 %x, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nsw nuw i64 %shr, %inc\n  ret i64 %r\n}\n=>\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = lshr i64 %x, 6\n  %shr = and i64 %m, 63\n  %low = and i64 %x, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nuw nsw i64 %shr, %inc\n  ret i64 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = and i64 %x, 4095\n  %add = add nuw i64 %m, 63\n  %r = lshr i64 %add, 6\n  ret i64 %r\n}\n=>\ndefine i64 @scalar_i64_shift6_mask63(i64 %x) {\nentry:\n  %m = lshr i64 %x, 6\n  %shr = and i64 %m, 63\n  %low = and i64 %x, 63\n  %nz = icmp ne i64 %low, 0\n  %inc = zext i1 %nz to i64\n  %r = add nsw nuw i64 %shr, %inc\n  ret i64 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_masked_then_or_zero",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %shr = lshr i32 %m, 3\n  %low = and i32 %m, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = lshr i32 %x, 3\n  %shr = and i32 %m0, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "tgt": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = lshr i32 %x, 3\n  %shr = and i32 %m0, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = lshr i32 %x, 3\n  %shr = and i32 %m0, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nuw nsw i32 %shr, %inc\n  ret i32 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = and i32 %x, 255\n  %m = or i32 %m0, 0\n  %add = add nuw i32 %m, 7\n  %r = lshr i32 %add, 3\n  ret i32 %r\n}\n=>\ndefine i32 @scalar_i32_masked_then_or_zero(i32 %x) {\nentry:\n  %m0 = lshr i32 %x, 3\n  %shr = and i32 %m0, 31\n  %low = and i32 %x, 7\n  %nz = icmp ne i32 %low, 0\n  %inc = zext i1 %nz to i32\n  %r = add nsw nuw i32 %shr, %inc\n  ret i32 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

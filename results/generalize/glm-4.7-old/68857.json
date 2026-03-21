@@ -1,0 +1,478 @@
+{
+  "issue_id": "68857",
+  "dataset_file": "68857.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @sdiv_shl_pair2(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n\ndefine i32 @sdiv_shl_pair2(i32 %a, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw nsw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Fold signed division of two shifted values by the same base into a logical right shift of a power of two. Specifically, `sdiv (shl nsw A, X), (shl nsw A, Y)` simplifies to `lshr (shl nuw 1, X), Y`. This is valid because `A` cancels out mathematically, and the `nsw` flags ensure the shifts behave as exact multiplication without sign changes or overflows (implying `A` is non-zero and retains its sign).\",\n  \"before_after\": \"Transforms `sdiv (shl nsw %a, %x), (shl nsw %a, %y)` into `lshr (shl nuw 1, %x), %y`.\",\n  \"preconditions\": [\n    \"The opcode of the top-level instruction must be `sdiv`.\",\n    \"The LHS operand must be a `shl` instruction with the `nsw` (No Signed Wrap) flag set.\",\n    \"The RHS operand must be a `shl` instruction with the `nsw` flag set.\",\n    \"The first operand (the value being shifted) of both `shl` instructions must be identical (`%a`).\",\n    \"The shift amounts (`%x` and `%y`) can be variables or constants of the same integer type.\",\n    \"The `nsw` flags guarantee that `A` does not overflow and that the signs of `(A<<X)` and `(A<<Y)` match the sign of `A`. Since they share `A`, their signs match each other. `sdiv` of same-sign values is equivalent to `udiv` of their magnitudes. The divisor `(A<<Y)` being non-zero implies `A != 0`, allowing the cancellation of `A`.\"\n  ],\n  \"pattern\": \"sdiv (shl nsw %A, %X), (shl nsw %A, %Y) -> lshr (shl nuw 1, %X), %Y\",\n  \"testcases\": [\n    {\n      \"name\": \"basic_i32_variable_shifts\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl nsw i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %shl.dividend = shl nuw i32 1, %x\\n  %div = lshr i32 %shl.dividend, %y\\n  ret i32 %div\\n}\",\n      \"why\": \"Standard case matching the user's example with variable shifts.\"\n    },\n    {\n      \"name\": \"basic_i32_constant_shifts\",\n      \"ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, 5\\n  %rhs = shl nsw i32 %a, 2\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  ret i32 8\\n}\",\n      \"why\": \"With constant shifts, InstCombine should evaluate the power-of-two division immediately to 2^(5-2) = 8.\"\n    },\n    {\n      \"name\": \"i8_bitwidth\",\n      \"ir\": \"define i8 @test(i8 %a, i8 %x, i8 %y) {\\nentry:\\n  %lhs = shl nuw nsw i8 %a, %x\\n  %rhs = shl nsw i8 %a, %y\\n  %div = sdiv i8 %lhs, %rhs\\n  ret i8 %div\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %a, i8 %x, i8 %y) {\\nentry:\\n  %shl.dividend = shl nuw i8 1, %x\\n  %div = lshr i8 %shl.dividend, %y\\n  ret i8 %div\\n}\",\n      \"why\": \"Tests validity on a smaller integer bitwidth (i8).\"\n    },\n    {\n      \"name\": \"i64_bitwidth\",\n      \"ir\": \"define i64 @test(i64 %a, i64 %x, i64 %y) {\\nentry:\\n  %lhs = shl nuw nsw i64 %a, %x\\n  %rhs = shl nsw i64 %a, %y\\n  %div = sdiv i64 %lhs, %rhs\\n  ret i64 %div\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %a, i64 %x, i64 %y) {\\nentry:\\n  %shl.dividend = shl nuw i64 1, %x\\n  %div = lshr i64 %shl.dividend, %y\\n  ret i64 %div\\n}\",\n      \"why\": \"Tests validity on a larger integer bitwidth (i64).\"\n    },\n    {\n      \"name\": \"vector_i32\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\\nentry:\\n  %lhs = shl nuw nsw <4 x i32> %a, %x\\n  %rhs = shl nsw <4 x i32> %a, %y\\n  %div = sdiv <4 x i32> %lhs, %rhs\\n  ret <4 x i32> %div\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\\nentry:\\n  %shl.dividend = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %x\\n  %div = lshr <4 x i32> %shl.dividend, %y\\n  ret <4 x i32> %div\\n}\",\n      \"why\": \"Verifies the fold works for vector types.\"\n    },\n    {\n      \"name\": \"commuted_shifts_lhs_greater\",\n      \"ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, 10\\n  %rhs = shl nsw i32 %a, 4\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  ret i32 64\\n}\",\n      \"why\": \"Case where shift amount X > Y, result should be 1 << (10-4) = 64.\"\n    },\n    {\n      \"name\": \"commuted_shifts_rhs_greater\",\n      \"ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, 2\\n  %rhs = shl nsw i32 %a, 5\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a) {\\nentry:\\n  ret i32 0\\n}\",\n      \"why\": \"Case where shift amount X < Y, mathematically fraction, integer division yields 0.\"\n    },\n    {\n      \"name\": \"negative_missing_nsw_rhs\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"why\": \"Missing nsw flag on RHS prevents the fold because RHS might change sign or overflow in a way that invalidates cancellation.\"\n    },\n    {\n      \"name\": \"negative_missing_nsw_lhs\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl i32 %a, %x\\n  %rhs = shl nsw i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl i32 %a, %x\\n  %rhs = shl nsw i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"why\": \"Missing nsw flag on LHS prevents the fold.\"\n    },\n    {\n      \"name\": \"negative_different_operands\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl nsw i32 %b, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl nsw i32 %b, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"why\": \"Operands %a and %b are different, so values cannot cancel out.\"\n    },\n    {\n      \"name\": \"negative_udiv_opcode\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw i32 %a, %x\\n  %rhs = shl nuw i32 %a, %y\\n  %div = udiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw i32 %a, %x\\n  %rhs = shl nuw i32 %a, %y\\n  %div = udiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"why\": \"While mathematically similar, unsigned division has different canonical forms and requirements. The pattern specifically targets sdiv to handle sign logic correctly.\"\n    },\n    {\n      \"name\": \"extra_uses_of_shl\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl nsw i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  %use = add i32 %lhs, 1\\n  ret i32 %use\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %x, i32 %y) {\\nentry:\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %shl.dividend = shl nuw i32 1, %x\\n  %div = lshr i32 %shl.dividend, %y\\n  %use = add i32 %lhs, 1\\n  ret i32 %use\\n}\",\n      \"why\": \"The fold should still happen for the `sdiv`, even if the original `shl` instructions have other uses.\"\n    },\n    {\n      \"name\": \"zext_roundtrip\",\n      \"ir\": \"define i32 @test(i8 %a8, i32 %x, i32 %y) {\\nentry:\\n  %a = zext i8 %a8 to i32\\n  %lhs = shl nuw nsw i32 %a, %x\\n  %rhs = shl nsw i32 %a, %y\\n  %div = sdiv i32 %lhs, %rhs\\n  ret i32 %div\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i8 %a8, i32 %x, i32 %y) {\\nentry:\\n  %shl.dividend = shl nuw i32 1, %x\\n  %div = lshr i32 %shl.dividend, %y\\n  ret i32 %div\\n}\",\n      \"why\": \"The fold works regardless of where %a comes from, provided flags are correct.\"\n    }\n  ],\n  \"implementation_notes\": \"The implementation should live in `InstCombineAddSub.cpp` or `InstCombineMulDivRem.cpp`. It should match `BinaryOperator` with opcode `SDiv`. Check LHS and RHS for `Shl` opcode. Verify `LHS->getOperand(0) == RHS->getOperand(0)`. Check `LHS->hasNoSignedWrap()` and `RHS->hasNoSignedWrap()`. Construct replacement: `Builder.CreateLShr(Builder.CreateShl(ConstantInt::get(Type, 1), X), Y)`. Ensure the new `Shl` has `NUW` (and potentially `NSW`) set, as `1 << X` is valid given the original constraints.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S`. Verify that the `sdiv` is eliminated and replaced by `shl`/`lshr` logic. For constant cases, verify the final constant is correct. Ensure that removing `nsw` flags or changing operands prevents the optimization.\",\n  \"clarifying_questions\": [\n    \"Should the implementation also handle `udiv` if both `shl` instructions have `nuw` flags? Mathematically yes, but does InstCombine have a separate canonical path for that?\",\n    \"Does `nuw` on the LHS (as seen in the example) imply `nsw` if we can prove the input is non-negative, or should we strictly require `nsw` as stated in the pattern?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Fold signed division of two shifted values by the same base into a logical right shift of a power of two. Specifically, `sdiv (shl nsw A, X), (shl nsw A, Y)` simplifies to `lshr (shl nuw 1, X), Y`. This is valid because `A` cancels out mathematically, and the `nsw` flags ensure the shifts behave as exact multiplication without sign changes or overflows (implying `A` is non-zero and retains its sign).",
+    "before_after": "Transforms `sdiv (shl nsw %a, %x), (shl nsw %a, %y)` into `lshr (shl nuw 1, %x), %y`.",
+    "preconditions": [
+      "The opcode of the top-level instruction must be `sdiv`.",
+      "The LHS operand must be a `shl` instruction with the `nsw` (No Signed Wrap) flag set.",
+      "The RHS operand must be a `shl` instruction with the `nsw` flag set.",
+      "The first operand (the value being shifted) of both `shl` instructions must be identical (`%a`).",
+      "The shift amounts (`%x` and `%y`) can be variables or constants of the same integer type.",
+      "The `nsw` flags guarantee that `A` does not overflow and that the signs of `(A<<X)` and `(A<<Y)` match the sign of `A`. Since they share `A`, their signs match each other. `sdiv` of same-sign values is equivalent to `udiv` of their magnitudes. The divisor `(A<<Y)` being non-zero implies `A != 0`, allowing the cancellation of `A`."
+    ],
+    "pattern": "sdiv (shl nsw %A, %X), (shl nsw %A, %Y) -> lshr (shl nuw 1, %X), %Y",
+    "testcases": [
+      {
+        "name": "basic_i32_variable_shifts",
+        "ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+        "why": "Standard case matching the user's example with variable shifts."
+      },
+      {
+        "name": "basic_i32_constant_shifts",
+        "ir": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}",
+        "why": "With constant shifts, InstCombine should evaluate the power-of-two division immediately to 2^(5-2) = 8."
+      },
+      {
+        "name": "i8_bitwidth",
+        "ir": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nuw nsw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}",
+        "why": "Tests validity on a smaller integer bitwidth (i8)."
+      },
+      {
+        "name": "i64_bitwidth",
+        "ir": "define i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %lhs = shl nuw nsw i64 %a, %x\n  %rhs = shl nsw i64 %a, %y\n  %div = sdiv i64 %lhs, %rhs\n  ret i64 %div\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %shl.dividend = shl nuw i64 1, %x\n  %div = lshr i64 %shl.dividend, %y\n  ret i64 %div\n}",
+        "why": "Tests validity on a larger integer bitwidth (i64)."
+      },
+      {
+        "name": "vector_i32",
+        "ir": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %lhs = shl nuw nsw <4 x i32> %a, %x\n  %rhs = shl nsw <4 x i32> %a, %y\n  %div = sdiv <4 x i32> %lhs, %rhs\n  ret <4 x i32> %div\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %shl.dividend = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %x\n  %div = lshr <4 x i32> %shl.dividend, %y\n  ret <4 x i32> %div\n}",
+        "why": "Verifies the fold works for vector types."
+      },
+      {
+        "name": "commuted_shifts_lhs_greater",
+        "ir": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}",
+        "why": "Case where shift amount X > Y, result should be 1 << (10-4) = 64."
+      },
+      {
+        "name": "commuted_shifts_rhs_greater",
+        "ir": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}",
+        "why": "Case where shift amount X < Y, mathematically fraction, integer division yields 0."
+      },
+      {
+        "name": "negative_missing_nsw_rhs",
+        "ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "why": "Missing nsw flag on RHS prevents the fold because RHS might change sign or overflow in a way that invalidates cancellation."
+      },
+      {
+        "name": "negative_missing_nsw_lhs",
+        "ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "why": "Missing nsw flag on LHS prevents the fold."
+      },
+      {
+        "name": "negative_different_operands",
+        "ir": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "why": "Operands %a and %b are different, so values cannot cancel out."
+      },
+      {
+        "name": "negative_udiv_opcode",
+        "ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "why": "While mathematically similar, unsigned division has different canonical forms and requirements. The pattern specifically targets sdiv to handle sign logic correctly."
+      },
+      {
+        "name": "extra_uses_of_shl",
+        "ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  %use = add i32 %lhs, 1\n  ret i32 %use\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  %use = add i32 %lhs, 1\n  ret i32 %use\n}",
+        "why": "The fold should still happen for the `sdiv`, even if the original `shl` instructions have other uses."
+      },
+      {
+        "name": "zext_roundtrip",
+        "ir": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+        "expected_optimized_ir": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+        "why": "The fold works regardless of where %a comes from, provided flags are correct."
+      }
+    ],
+    "implementation_notes": "The implementation should live in `InstCombineAddSub.cpp` or `InstCombineMulDivRem.cpp`. It should match `BinaryOperator` with opcode `SDiv`. Check LHS and RHS for `Shl` opcode. Verify `LHS->getOperand(0) == RHS->getOperand(0)`. Check `LHS->hasNoSignedWrap()` and `RHS->hasNoSignedWrap()`. Construct replacement: `Builder.CreateLShr(Builder.CreateShl(ConstantInt::get(Type, 1), X), Y)`. Ensure the new `Shl` has `NUW` (and potentially `NSW`) set, as `1 << X` is valid given the original constraints.",
+    "regression_test_notes": "Use `opt -instcombine -S`. Verify that the `sdiv` is eliminated and replaced by `shl`/`lshr` logic. For constant cases, verify the final constant is correct. Ensure that removing `nsw` flags or changing operands prevents the optimization.",
+    "clarifying_questions": [
+      "Should the implementation also handle `udiv` if both `shl` instructions have `nuw` flags? Mathematically yes, but does InstCombine have a separate canonical path for that?",
+      "Does `nuw` on the LHS (as seen in the example) imply `nsw` if we can prove the input is non-negative, or should we strictly require `nsw` as stated in the pattern?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_i32_variable_shifts",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "basic_i32_constant_shifts",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 8\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 5\n  %rhs = shl nsw i32 %a, 2\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %a = #x00000000 (0)\n\nSource:\n\nTarget:\ni32 %lhs = #x00000000 (0)\ni32 %rhs = #x00000000 (0)\ni32 %div = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8_bitwidth",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nuw nsw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}",
+          "tgt": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nsw nuw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}\n=>\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nuw nsw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}\n",
+          "tgt": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nsw nuw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}\n=>\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nuw nsw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %shl.dividend = shl nuw i8 1, %x\n  %div = lshr i8 %shl.dividend, %y\n  ret i8 %div\n}\n=>\ndefine i8 @test(i8 %a, i8 %x, i8 %y) {\nentry:\n  %lhs = shl nsw nuw i8 %a, %x\n  %rhs = shl nsw i8 %a, %y\n  %div = sdiv i8 %lhs, %rhs\n  ret i8 %div\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %a = #x00 (0)\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\n\nSource:\ni8 %shl.dividend = #x01 (1)\ni8 %div = #x01 (1)\n\nTarget:\ni8 %lhs = #x00 (0)\ni8 %rhs = #x00 (0)\ni8 %div = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i64_bitwidth",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %lhs = shl nuw nsw i64 %a, %x\n  %rhs = shl nsw i64 %a, %y\n  %div = sdiv i64 %lhs, %rhs\n  ret i64 %div\n}",
+          "tgt": "define i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %shl.dividend = shl nuw i64 1, %x\n  %div = lshr i64 %shl.dividend, %y\n  ret i64 %div\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %lhs = shl nsw nuw i64 %a, %x\n  %rhs = shl nsw i64 %a, %y\n  %div = sdiv i64 %lhs, %rhs\n  ret i64 %div\n}\n=>\ndefine i64 @test(i64 %a, i64 %x, i64 %y) {\nentry:\n  %shl.dividend = shl nuw i64 1, %x\n  %div = lshr i64 %shl.dividend, %y\n  ret i64 %div\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_i32",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %lhs = shl nuw nsw <4 x i32> %a, %x\n  %rhs = shl nsw <4 x i32> %a, %y\n  %div = sdiv <4 x i32> %lhs, %rhs\n  ret <4 x i32> %div\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %shl.dividend = shl nuw <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %x\n  %div = lshr <4 x i32> %shl.dividend, %y\n  ret <4 x i32> %div\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %lhs = shl nsw nuw <4 x i32> %a, %x\n  %rhs = shl nsw <4 x i32> %a, %y\n  %div = sdiv <4 x i32> %lhs, %rhs\n  ret <4 x i32> %div\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %a, <4 x i32> %x, <4 x i32> %y) {\nentry:\n  %shl.dividend = shl nuw <4 x i32> { 1, 1, 1, 1 }, %x\n  %div = lshr <4 x i32> %shl.dividend, %y\n  ret <4 x i32> %div\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "commuted_shifts_lhs_greater",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 64\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 10\n  %rhs = shl nsw i32 %a, 4\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %a = #x00000000 (0)\n\nSource:\n\nTarget:\ni32 %lhs = #x00000000 (0)\ni32 %rhs = #x00000000 (0)\ni32 %div = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_shifts_rhs_greater",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nuw nsw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\nentry:\n  ret i32 0\n}\n=>\ndefine i32 @test(i32 %a) {\nentry:\n  %lhs = shl nsw nuw i32 %a, 2\n  %rhs = shl nsw i32 %a, 5\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %a = #x00000000 (0)\n\nSource:\n\nTarget:\ni32 %lhs = #x00000000 (0)\ni32 %rhs = #x00000000 (0)\ni32 %div = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_missing_nsw_rhs",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_missing_nsw_lhs",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_different_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %b, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %b, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_udiv_opcode",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 13,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 13\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i32 %a, i32 %x, i32 %y) {\nentry:\n  %lhs = shl nuw i32 %a, %x\n  %rhs = shl nuw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "extra_uses_of_shl",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 5,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "zext_roundtrip",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 14,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 14\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}",
+          "tgt": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = sdiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "tgt": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n=>\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nuw nsw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %shl.dividend = shl nuw i32 1, %x\n  %div = lshr i32 %shl.dividend, %y\n  ret i32 %div\n}\n=>\ndefine i32 @test(i8 %a8, i32 %x, i32 %y) {\nentry:\n  %a = zext i8 %a8 to i32\n  %lhs = shl nsw nuw i32 %a, %x\n  %rhs = shl nsw i32 %a, %y\n  %div = udiv i32 %lhs, %rhs\n  ret i32 %div\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %a8 = #x00 (0)\ni32 %x = poison\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %shl.dividend = poison\ni32 %div = poison\n\nTarget:\ni32 %a = #x00000000 (0)\ni32 %lhs = poison\ni32 %rhs = #x00000000 (0)\ni32 %div = UB triggered!\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.4s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

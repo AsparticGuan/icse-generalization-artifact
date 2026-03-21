@@ -1,0 +1,432 @@
+{
+  "issue_id": "107228",
+  "dataset_file": "107228.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @lsb_mask_sign_zext(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n\ndefine i32 @lsb_mask_sign_zext(i32 %x) {\nentry:\n  %0 = icmp eq i32 %x, 0\n  %shr = zext i1 %0 to i32\n  ret i32 %shr\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize `(x-1) & ~x` sign-bit extraction into a comparison against zero. The expression `(x - 1) & ~x` yields a value with the sign bit set if and only if `x` is zero. Extracting this sign bit via logical shift right (or arithmetic shift right) is equivalent to zero-extending (or sign-extending) the result of `icmp eq x, 0`.\",\n  \"before_after\": {\n    \"description\": \"Fold `lshr (and (add X, -1), (xor X, -1)), BW-1` to `zext (icmp eq X, 0)`. Also handles `ashr` -> `sext`.\",\n    \"original\": \"%sub = add i32 %x, -1\\n%not = xor i32 %x, -1\\n%and = and i32 %sub, %not\\n%shr = lshr i32 %and, 31\",\n    \"optimized\": \"%cmp = icmp eq i32 %x, 0\\n%zext = zext i1 %cmp to i32\"\n  },\n  \"preconditions\": [\n    \"The inner `add` (or `sub`) must be with the all-ones constant for the bitwidth (e.g., `-1`).\",\n    \"The inner `xor` must be with the all-ones constant for the bitwidth (e.g., `-1`).\",\n    \"The outer shift (`lshr` or `ashr`) must be by `BitWidth - 1`.\",\n    \"If the `add` has the `nuw` flag, the optimization is only valid if we can prove `x != 0`. If `x=0` causes poison in the source, the destination `icmp eq` must also be considered poison (or the fold should be restricted). Specifically, `add i32 %x, -1 nuw` poisons if `%x` is 0. Since the original code would be poison for `x=0`, and the result is 1 for `x=0`, we cannot simply replace with `icmp`. However, if `nuw` is present, `x` cannot be 0, so the result is always 0.\"\n  ],\n  \"pattern\": \"Match the DAG:\\n`lshr`/`ashr` (`and` (`add`/`sub` X, -1), (`xor` X, -1)), BW-1\\n\\nWhere constants are all-ones.\",\n  \"testcases\": [\n    {\n      \"name\": \"base_case_i32\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = zext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"Standard i32 case matching the user's example.\"\n    },\n    {\n      \"name\": \"base_case_i64\",\n      \"ir\": \"define i64 @test(i64 %x) {\\nentry:\\n  %sub = add i64 %x, -1\\n  %not = xor i64 %x, -1\\n  %and = and i64 %sub, %not\\n  %shr = lshr i64 %and, 63\\n  ret i64 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x) {\\nentry:\\n  %cmp = icmp eq i64 %x, 0\\n  %zext = zext i1 %cmp to i64\\n  ret i64 %zext\\n}\",\n      \"why\": \"Different bitwidth (i64).\"\n    },\n    {\n      \"name\": \"vector_case_v4i32\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\nentry:\\n  %sub = add <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %not = xor <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\\n  %and = and <4 x i32> %sub, %not\\n  %shr = lshr <4 x i32> %and, <i32 31, i32 31, i32 31, i32 31>\\n  ret <4 x i32> %shr\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x) {\\nentry:\\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\\n  %zext = zext <4 x i1> %cmp to <4 x i32>\\n  ret <4 x i32> %zext\\n}\",\n      \"why\": \"Vector type support.\"\n    },\n    {\n      \"name\": \"commuted_and_operands\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %not, %sub\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = zext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"AND is commutative; ensure matching handles swapped order.\"\n    },\n    {\n      \"name\": \"sub_instead_of_add\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = sub i32 %x, 1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = zext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"`sub x, 1` is equivalent to `add x, -1`.\"\n    },\n    {\n      \"name\": \"ashr_sext_variant\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = ashr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = sext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"Arithmetic shift extracts the sign bit as -1 or 0, equivalent to `sext` of the comparison.\"\n    },\n    {\n      \"name\": \"wrong_constant_xor\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, 5\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, 5\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"why\": \"Pattern should not match if XOR constant is not all-ones.\"\n    },\n    {\n      \"name\": \"wrong_shift_amount\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 30\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 30\\n  ret i32 %shr\\n}\",\n      \"why\": \"Pattern requires extracting the MSB (bit 31 for i32).\"\n    },\n    {\n      \"name\": \"nuw_flag_folds_to_zero\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add nuw i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  ret i32 0\\n}\",\n      \"why\": \"If `add` has `nuw`, `x` cannot be 0 (otherwise 0-1 wraps). If `x != 0`, the result is always 0.\"\n    },\n    {\n      \"name\": \"nsw_flag_valid\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add nsw i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %shr = lshr i32 %and, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = zext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"`nsw` allows signed wrapping, which 0-1 does (becomes -1), so the logic holds.\"\n    },\n    {\n      \"name\": \"extra_bitwise_noise\",\n      \"ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %sub = add i32 %x, -1\\n  %not = xor i32 %x, -1\\n  %and = and i32 %sub, %not\\n  %zero = xor i32 %and, 0\\n  %shr = lshr i32 %zero, 31\\n  ret i32 %shr\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\nentry:\\n  %cmp = icmp eq i32 %x, 0\\n  %zext = zext i1 %cmp to i32\\n  ret i32 %zext\\n}\",\n      \"why\": \"InstCombine should look through transparent no-ops like XOR 0.\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"location\": \"InstCombineCalls.cpp or InstCombineAddSub.cpp (likely InstCombineCompares or generic InstCombine pass for bitwise patterns).\",\n    \"match_logic\": \"Look for a `lshr`/`ashr` where the LHS is an `and`. The `and` must have operands that are `(add/sub X, -1)` and `(xor X, -1)`. The shift amount must be `BitWidth-1`. The constants -1 must be `getAllOnesValue()`.\",\n    \"fold_logic\": \"If `lshr`, replace with `zext (icmp eq X, 0)`. If `ashr`, replace with `sext (icmp eq X, 0)`. If `add` has `nuw`, replace with 0.\",\n    \"pitfalls\": [\n      \"Handling `nuw`/`nsw` flags correctly is crucial. `add nuw x, -1` implies `x != 0`.\",\n      \"Matching `xor X, -1` might appear as `xor -1, X` (commuted).\",\n      \"Matching `add X, -1` might appear as `sub X, 1`.\",\n      \"Ensure the match works for vectors (constants are splats or vector constants matching the type).\"\n    ]\n  },\n  \"regression_test_notes\": \"Use `opt -instcombine -S`. Verify that `icmp eq` appears. Add checks for `nuw` cases folding to 0. Ensure vector types are handled correctly.\",\n  \"clarifying_questions\": [\n    \"Should this pattern also match if the result of the AND is masked with `SignMask` instead of shifted (e.g. `and ..., 0x80000000`)?\",\n    \"Are there any specific performance targets (e.g., specific GPU architectures) where this pattern is particularly common?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize `(x-1) & ~x` sign-bit extraction into a comparison against zero. The expression `(x - 1) & ~x` yields a value with the sign bit set if and only if `x` is zero. Extracting this sign bit via logical shift right (or arithmetic shift right) is equivalent to zero-extending (or sign-extending) the result of `icmp eq x, 0`.",
+    "before_after": {
+      "description": "Fold `lshr (and (add X, -1), (xor X, -1)), BW-1` to `zext (icmp eq X, 0)`. Also handles `ashr` -> `sext`.",
+      "original": "%sub = add i32 %x, -1\n%not = xor i32 %x, -1\n%and = and i32 %sub, %not\n%shr = lshr i32 %and, 31",
+      "optimized": "%cmp = icmp eq i32 %x, 0\n%zext = zext i1 %cmp to i32"
+    },
+    "preconditions": [
+      "The inner `add` (or `sub`) must be with the all-ones constant for the bitwidth (e.g., `-1`).",
+      "The inner `xor` must be with the all-ones constant for the bitwidth (e.g., `-1`).",
+      "The outer shift (`lshr` or `ashr`) must be by `BitWidth - 1`.",
+      "If the `add` has the `nuw` flag, the optimization is only valid if we can prove `x != 0`. If `x=0` causes poison in the source, the destination `icmp eq` must also be considered poison (or the fold should be restricted). Specifically, `add i32 %x, -1 nuw` poisons if `%x` is 0. Since the original code would be poison for `x=0`, and the result is 1 for `x=0`, we cannot simply replace with `icmp`. However, if `nuw` is present, `x` cannot be 0, so the result is always 0."
+    ],
+    "pattern": "Match the DAG:\n`lshr`/`ashr` (`and` (`add`/`sub` X, -1), (`xor` X, -1)), BW-1\n\nWhere constants are all-ones.",
+    "testcases": [
+      {
+        "name": "base_case_i32",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "Standard i32 case matching the user's example."
+      },
+      {
+        "name": "base_case_i64",
+        "ir": "define i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}",
+        "why": "Different bitwidth (i64)."
+      },
+      {
+        "name": "vector_case_v4i32",
+        "ir": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %not = xor <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i32> %shr\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}",
+        "why": "Vector type support."
+      },
+      {
+        "name": "commuted_and_operands",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %not, %sub\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "AND is commutative; ensure matching handles swapped order."
+      },
+      {
+        "name": "sub_instead_of_add",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = sub i32 %x, 1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "`sub x, 1` is equivalent to `add x, -1`."
+      },
+      {
+        "name": "ashr_sext_variant",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "Arithmetic shift extracts the sign bit as -1 or 0, equivalent to `sext` of the comparison."
+      },
+      {
+        "name": "wrong_constant_xor",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, 5\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, 5\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "why": "Pattern should not match if XOR constant is not all-ones."
+      },
+      {
+        "name": "wrong_shift_amount",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+        "why": "Pattern requires extracting the MSB (bit 31 for i32)."
+      },
+      {
+        "name": "nuw_flag_folds_to_zero",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add nuw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  ret i32 0\n}",
+        "why": "If `add` has `nuw`, `x` cannot be 0 (otherwise 0-1 wraps). If `x != 0`, the result is always 0."
+      },
+      {
+        "name": "nsw_flag_valid",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "`nsw` allows signed wrapping, which 0-1 does (becomes -1), so the logic holds."
+      },
+      {
+        "name": "extra_bitwise_noise",
+        "ir": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %zero = xor i32 %and, 0\n  %shr = lshr i32 %zero, 31\n  ret i32 %shr\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+        "why": "InstCombine should look through transparent no-ops like XOR 0."
+      }
+    ],
+    "implementation_notes": {
+      "location": "InstCombineCalls.cpp or InstCombineAddSub.cpp (likely InstCombineCompares or generic InstCombine pass for bitwise patterns).",
+      "match_logic": "Look for a `lshr`/`ashr` where the LHS is an `and`. The `and` must have operands that are `(add/sub X, -1)` and `(xor X, -1)`. The shift amount must be `BitWidth-1`. The constants -1 must be `getAllOnesValue()`.",
+      "fold_logic": "If `lshr`, replace with `zext (icmp eq X, 0)`. If `ashr`, replace with `sext (icmp eq X, 0)`. If `add` has `nuw`, replace with 0.",
+      "pitfalls": [
+        "Handling `nuw`/`nsw` flags correctly is crucial. `add nuw x, -1` implies `x != 0`.",
+        "Matching `xor X, -1` might appear as `xor -1, X` (commuted).",
+        "Matching `add X, -1` might appear as `sub X, 1`.",
+        "Ensure the match works for vectors (constants are splats or vector constants matching the type)."
+      ]
+    },
+    "regression_test_notes": "Use `opt -instcombine -S`. Verify that `icmp eq` appears. Add checks for `nuw` cases folding to 0. Ensure vector types are handled correctly.",
+    "clarifying_questions": [
+      "Should this pattern also match if the result of the AND is masked with `SignMask` instead of shifted (e.g. `and ..., 0x80000000`)?",
+      "Are there any specific performance targets (e.g., specific GPU architectures) where this pattern is particularly common?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "base_case_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "base_case_i64",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}",
+          "tgt": "define i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}\n=>\ndefine i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}\n",
+          "tgt": "define i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}\n=>\ndefine i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x) {\nentry:\n  %cmp = icmp eq i64 %x, 0\n  %zext = zext i1 %cmp to i64\n  ret i64 %zext\n}\n=>\ndefine i64 @test(i64 %x) {\nentry:\n  %sub = add i64 %x, -1\n  %not = xor i64 %x, -1\n  %and = and i64 %sub, %not\n  %shr = lshr i64 %and, 63\n  ret i64 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_case_v4i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %not = xor <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i32> %shr\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %not = xor <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, { 31, 31, 31, 31 }\n  ret <4 x i32> %shr\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %not = xor <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i32> %shr\n}\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %not = xor <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, { 31, 31, 31, 31 }\n  ret <4 x i32> %shr\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, zeroinitializer\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %not = xor <4 x i32> %x, <i32 -1, i32 -1, i32 -1, i32 -1>\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, <i32 31, i32 31, i32 31, i32 31>\n  ret <4 x i32> %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %cmp = icmp eq <4 x i32> %x, { 0, 0, 0, 0 }\n  %zext = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %zext\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x) {\nentry:\n  %sub = add <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %not = xor <4 x i32> %x, { 4294967295, 4294967295, 4294967295, 4294967295 }\n  %and = and <4 x i32> %sub, %not\n  %shr = lshr <4 x i32> %and, { 31, 31, 31, 31 }\n  ret <4 x i32> %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_and_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %not, %sub\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %not, %sub\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sub_instead_of_add",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = sub i32 %x, 1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = sub i32 %x, 1\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ashr_sext_variant",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = sext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = ashr i32 %and, 31\n  ret i32 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "wrong_constant_xor",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 5,
+        "current_opt": 4,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "wrong_shift_amount",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 30\n  ret i32 %shr\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_flag_folds_to_zero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add nuw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  ret i32 0\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nuw i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  ret i32 0\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x00000000 (0)\n\nSource:\ni32 %sub = #xffffffff (4294967295, -1)\ni32 %not = #xffffffff (4294967295, -1)\ni32 %and = #xffffffff (4294967295, -1)\ni32 %shr = #x00000001 (1)\n\nTarget:\nSource value: #x00000001 (1)\nTarget value: #x00000000 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "nsw_flag_valid",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add nsw i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x80000000 (2147483648, -2147483648)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %zext = #x00000000 (0)\n\nTarget:\ni32 %sub = poison\ni32 %not = #x7fffffff (2147483647)\ni32 %and = poison\ni32 %shr = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "extra_bitwise_noise",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %zero = xor i32 %and, 0\n  %shr = lshr i32 %zero, 31\n  ret i32 %shr\n}",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %zero = xor i32 %and, 0\n  %shr = lshr i32 %zero, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "tgt": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, -1\n  %not = xor i32 %x, -1\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x) {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  ret i32 %zext\n}\n=>\ndefine i32 @test(i32 %x) {\nentry:\n  %sub = add i32 %x, 4294967295\n  %not = xor i32 %x, 4294967295\n  %and = and i32 %sub, %not\n  %shr = lshr i32 %and, 31\n  ret i32 %shr\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Looking for sys/param.h\n-- Looking for sys/param.h - found\n-- Looking for sys/types.h\n-- Looking for sys/types.h - found\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.5s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

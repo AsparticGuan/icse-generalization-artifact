@@ -1,0 +1,404 @@
+{
+  "issue_id": "63749",
+  "dataset_file": "63749.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine <2 x i1> @eq_vector_equal_minus_1(<2 x i8> %x, <2 x i8> %y) {\n  %add = add <2 x i8> %x, <i8 1, i8 1>\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\n\ndefine <2 x i1> @eq_vector_equal_minus_1(<2 x i8> %x, <2 x i8> %y) {\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimize `(icmp eq X, -1) | (icmp ugt (X + 1), Y)` to `icmp uge X, Y`. This pattern effectively handles the unsigned overflow case where `X == -1` implies `X` is the maximum unsigned value, making `X >= Y` trivially true. For all other values, `X + 1` does not overflow, and `X + 1 > Y` implies `X >= Y`.\",\n  \"before_after\": \"The rewrite transforms a disjunction of an equality check against -1 (MaxUInt) and an unsigned greater-than check of the incremented value into a single unsigned greater-or-equal check. Specifically: `icmp eq X, -1 OR icmp ugt (add X, 1), Y` becomes `icmp uge X, Y`.\",\n  \"preconditions\": [\n    \"The operation is an `or` (or `and` with inverted predicates/DeMorgan's law).\",\n    \"One side compares a value `X` for equality with the all-ones constant (-1 for the type).\",\n    \"The other side compares `(X + 1)` with `Y` using `icmp ugt` (or `icmp ult` with swapped operands).\",\n    \"The addition is a constant add of 1.\",\n    \"The types are integers or vectors of integers.\",\n    \"The comparison is unsigned (`u` prefix). Signed comparisons do not apply because -1 is not the maximum signed value.\"\n  ],\n  \"pattern\": \"General Pattern:\\n\\n  (icmp eq X, -1) | (icmp ugt (X + 1), Y)  =>  icmp uge X, Y\\n\\nVariations:\\n\\n  1. Commutative OR:\\n     (icmp ugt (X + 1), Y) | (icmp eq X, -1)  =>  icmp uge X, Y\\n\\n  2. Swapped Predicates:\\n     (icmp eq X, -1) | (icmp ult Y, (X + 1)) =>  icmp uge X, Y\\n\\n  3. DeMorgan's Law (AND form):\\n     (icmp ne X, -1) & (icmp ule (X + 1), Y) =>  icmp ult X, Y\",\n  \"testcases\": [\n    {\n      \"name\": \"original_vector_i8\",\n      \"ir\": \"define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\\n  %add = add <2 x i8> %x, <i8 1, i8 1>\\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\\n  %c2 = icmp ugt <2 x i8> %add, %y\\n  %or = or <2 x i1> %c1, %c2\\n  ret <2 x i1> %or\\n}\",\n      \"expected_optimized_ir\": \"define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\\n  %or = icmp uge <2 x i8> %x, %y\\n  ret <2 x i1> %or\\n}\",\n      \"why\": \"Original example case verifying vector i8 logic.\"\n    },\n    {\n      \"name\": \"scalar_i32\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %or = icmp uge i32 %x, %y\\n  ret i1 %or\\n}\",\n      \"why\": \"Standard scalar i32 case.\"\n    },\n    {\n      \"name\": \"commutative_or\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c2, %c1\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %or = icmp uge i32 %x, %y\\n  ret i1 %or\\n}\",\n      \"why\": \"Verifies matching works regardless of OR operand order.\"\n    },\n    {\n      \"name\": \"predicate_swap_ult\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ult i32 %y, %add\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %or = icmp uge i32 %x, %y\\n  ret i1 %or\\n}\",\n      \"why\": \"Verifies matching `ult y, x+1` which is semantically identical to `ugt x+1, y`.\"\n    },\n    {\n      \"name\": \"demorgan_and_form\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp ne i32 %x, -1\\n  %c2 = icmp ule i32 %add, %y\\n  %and = and i1 %c1, %c2\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %and = icmp ult i32 %x, %y\\n  ret i1 %and\\n}\",\n      \"why\": \"Verifies the logical inverse (AND with inverted predicates) folds to `ult`.\"\n    },\n    {\n      \"name\": \"vector_i4\",\n      \"ir\": \"define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\\n  %add = add <4 x i4> %x, <i4 1, i4 1, i4 1, i4 1>\\n  %c1 = icmp eq <4 x i4> %x, <i4 -1, i4 -1, i4 -1, i4 -1>\\n  %c2 = icmp ugt <4 x i4> %add, %y\\n  %or = or <4 x i1> %c1, %c2\\n  ret <4 x i1> %or\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\\n  %or = icmp uge <4 x i4> %x, %y\\n  ret <4 x i1> %or\\n}\",\n      \"why\": \"Tests unusual bitwidth (i4) to ensure generality.\"\n    },\n    {\n      \"name\": \"negative_wrong_const\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, 0\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, 0\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"why\": \"Boundary case: constant is 0, not -1. Optimization should not fire.\"\n    },\n    {\n      \"name\": \"negative_wrong_add\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 2\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 2\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"why\": \"Boundary case: add constant is 2, not 1. Optimization should not fire.\"\n    },\n    {\n      \"name\": \"negative_signed_predicate\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp sgt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp sgt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"why\": \"Boundary case: signed comparison `sgt`. Logic is incorrect for signed (e.g. x=-1, y=-128). Should not fire.\"\n    },\n    {\n      \"name\": \"nuw_flag_case\",\n      \"ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %add = add nuw i32 %x, 1\\n  %c1 = icmp eq i32 %x, -1\\n  %c2 = icmp ugt i32 %add, %y\\n  %or = or i1 %c1, %c2\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x, i32 %y) {\\n  %or = icmp uge i32 %x, %y\\n  ret i1 %or\\n}\",\n      \"why\": \"With `nuw`, `x` cannot be -1, so `c1` is technically false. However, the result `x >= y` is still equivalent to `x+1 > y` (when `x != -1`). The fold remains valid and desirable.\"\n    }\n  ],\n  \"implementation_notes\": \"This can be implemented in `InstCombineCompares.cpp` or `InstCombineLogical.cpp` within the `visitOr` (or `visitAnd`) handler.\\n\\nThe matcher should look for:\\n1. `Op0 = icmp eq X, -1` (using `m_ICmp` and `m_AllOnes` or `m_SpecificInt(-1)`).\\n2. `Op1 = icmp ugt (add X, 1), Y` (using `m_ICmp`, `m_Add`, `m_Specific(X)`, `m_One()`).\\n3. Or the commuted variants.\\n\\nIf matched, replace the `or` with `new ICmpInst(ICmpInst::ICMP_UGE, X, Y)`.\\n\\nFor the `and` variant:\\n1. `Op0 = icmp ne X, -1`\\n2. `Op1 = icmp ule (add X, 1), Y`\\nReplace with `new ICmpInst(ICmpInst::ICMP_ULT, X, Y)`.\\n\\nPitfalls:\\n- Ensure `X` and `Y` are the same type.\\n- Ensure the add is actually `+ 1` (or `C1` in the pattern, but here specifically 1).\\n- Ensure we don't match signed max (e.g. 127 for i8). `m_AllOnes` covers this because 127 is `01111111`, not all ones.\\n- The optimization is specific to unsigned wrap-around at -1.\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on the provided IR. FileCheck directives should verify the existence of `icmp uge` and the absence of the `add` and `or` instructions in the output. For negative cases, verify that the `or` and `add` remain.\",\n  \"clarifying_questions\": [\n    \"Should this pattern also match if the constant is explicitly the max value for the type (e.g., 255 for i8) rather than -1? (Note: -1 is canonical for all-ones, so matching -1 usually suffices).\",\n    \"Is there a need to support `sub` instructions, e.g., `(x == 0) | (x > y)`? (Though `x == 0` doesn't protect against overflow in the same way `x == -1` protects `x+1`).\",\n    \"Should this handle the case where `Y` is a constant that simplifies the comparison further, or is the fold to `icmp uge` sufficient as a canonicalization step?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Optimize `(icmp eq X, -1) | (icmp ugt (X + 1), Y)` to `icmp uge X, Y`. This pattern effectively handles the unsigned overflow case where `X == -1` implies `X` is the maximum unsigned value, making `X >= Y` trivially true. For all other values, `X + 1` does not overflow, and `X + 1 > Y` implies `X >= Y`.",
+    "before_after": "The rewrite transforms a disjunction of an equality check against -1 (MaxUInt) and an unsigned greater-than check of the incremented value into a single unsigned greater-or-equal check. Specifically: `icmp eq X, -1 OR icmp ugt (add X, 1), Y` becomes `icmp uge X, Y`.",
+    "preconditions": [
+      "The operation is an `or` (or `and` with inverted predicates/DeMorgan's law).",
+      "One side compares a value `X` for equality with the all-ones constant (-1 for the type).",
+      "The other side compares `(X + 1)` with `Y` using `icmp ugt` (or `icmp ult` with swapped operands).",
+      "The addition is a constant add of 1.",
+      "The types are integers or vectors of integers.",
+      "The comparison is unsigned (`u` prefix). Signed comparisons do not apply because -1 is not the maximum signed value."
+    ],
+    "pattern": "General Pattern:\n\n  (icmp eq X, -1) | (icmp ugt (X + 1), Y)  =>  icmp uge X, Y\n\nVariations:\n\n  1. Commutative OR:\n     (icmp ugt (X + 1), Y) | (icmp eq X, -1)  =>  icmp uge X, Y\n\n  2. Swapped Predicates:\n     (icmp eq X, -1) | (icmp ult Y, (X + 1)) =>  icmp uge X, Y\n\n  3. DeMorgan's Law (AND form):\n     (icmp ne X, -1) & (icmp ule (X + 1), Y) =>  icmp ult X, Y",
+    "testcases": [
+      {
+        "name": "original_vector_i8",
+        "ir": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %add = add <2 x i8> %x, <i8 1, i8 1>\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}",
+        "expected_optimized_ir": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}",
+        "why": "Original example case verifying vector i8 logic."
+      },
+      {
+        "name": "scalar_i32",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+        "why": "Standard scalar i32 case."
+      },
+      {
+        "name": "commutative_or",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+        "why": "Verifies matching works regardless of OR operand order."
+      },
+      {
+        "name": "predicate_swap_ult",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ult i32 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+        "why": "Verifies matching `ult y, x+1` which is semantically identical to `ugt x+1, y`."
+      },
+      {
+        "name": "demorgan_and_form",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}",
+        "why": "Verifies the logical inverse (AND with inverted predicates) folds to `ult`."
+      },
+      {
+        "name": "vector_i4",
+        "ir": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %add = add <4 x i4> %x, <i4 1, i4 1, i4 1, i4 1>\n  %c1 = icmp eq <4 x i4> %x, <i4 -1, i4 -1, i4 -1, i4 -1>\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}",
+        "why": "Tests unusual bitwidth (i4) to ensure generality."
+      },
+      {
+        "name": "negative_wrong_const",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "why": "Boundary case: constant is 0, not -1. Optimization should not fire."
+      },
+      {
+        "name": "negative_wrong_add",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "why": "Boundary case: add constant is 2, not 1. Optimization should not fire."
+      },
+      {
+        "name": "negative_signed_predicate",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "why": "Boundary case: signed comparison `sgt`. Logic is incorrect for signed (e.g. x=-1, y=-128). Should not fire."
+      },
+      {
+        "name": "nuw_flag_case",
+        "ir": "define i1 @test(i32 %x, i32 %y) {\n  %add = add nuw i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+        "why": "With `nuw`, `x` cannot be -1, so `c1` is technically false. However, the result `x >= y` is still equivalent to `x+1 > y` (when `x != -1`). The fold remains valid and desirable."
+      }
+    ],
+    "implementation_notes": "This can be implemented in `InstCombineCompares.cpp` or `InstCombineLogical.cpp` within the `visitOr` (or `visitAnd`) handler.\n\nThe matcher should look for:\n1. `Op0 = icmp eq X, -1` (using `m_ICmp` and `m_AllOnes` or `m_SpecificInt(-1)`).\n2. `Op1 = icmp ugt (add X, 1), Y` (using `m_ICmp`, `m_Add`, `m_Specific(X)`, `m_One()`).\n3. Or the commuted variants.\n\nIf matched, replace the `or` with `new ICmpInst(ICmpInst::ICMP_UGE, X, Y)`.\n\nFor the `and` variant:\n1. `Op0 = icmp ne X, -1`\n2. `Op1 = icmp ule (add X, 1), Y`\nReplace with `new ICmpInst(ICmpInst::ICMP_ULT, X, Y)`.\n\nPitfalls:\n- Ensure `X` and `Y` are the same type.\n- Ensure the add is actually `+ 1` (or `C1` in the pattern, but here specifically 1).\n- Ensure we don't match signed max (e.g. 127 for i8). `m_AllOnes` covers this because 127 is `01111111`, not all ones.\n- The optimization is specific to unsigned wrap-around at -1.",
+    "regression_test_notes": "Use `opt -instcombine -S` on the provided IR. FileCheck directives should verify the existence of `icmp uge` and the absence of the `add` and `or` instructions in the output. For negative cases, verify that the `or` and `add` remain.",
+    "clarifying_questions": [
+      "Should this pattern also match if the constant is explicitly the max value for the type (e.g., 255 for i8) rather than -1? (Note: -1 is canonical for all-ones, so matching -1 usually suffices).",
+      "Is there a need to support `sub` instructions, e.g., `(x == 0) | (x > y)`? (Though `x == 0` doesn't protect against overflow in the same way `x == -1` protects `x+1`).",
+      "Should this handle the case where `Y` is a constant that simplifies the comparison further, or is the fold to `icmp uge` sufficient as a canonicalization step?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "original_vector_i8",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %add = add <2 x i8> %x, <i8 1, i8 1>\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}",
+          "tgt": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %add = add <2 x i8> %x, { 1, 1 }\n  %c1 = icmp eq <2 x i8> %x, { 255, 255 }\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %add = add <2 x i8> %x, <i8 1, i8 1>\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\n",
+          "tgt": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %add = add <2 x i8> %x, { 1, 1 }\n  %c1 = icmp eq <2 x i8> %x, { 255, 255 }\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n  %add = add <2 x i8> %x, <i8 1, i8 1>\n  %c1 = icmp eq <2 x i8> %x, <i8 -1, i8 -1>\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %or = icmp uge <2 x i8> %x, %y\n  ret <2 x i1> %or\n}\n=>\ndefine <2 x i1> @test(<2 x i8> %x, <2 x i8> %y) {\n#0:\n  %add = add <2 x i8> %x, { 1, 1 }\n  %c1 = icmp eq <2 x i8> %x, { 255, 255 }\n  %c2 = icmp ugt <2 x i8> %add, %y\n  %or = or <2 x i1> %c1, %c2\n  ret <2 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commutative_or",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c2, %c1\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "predicate_swap_ult",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ult i32 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ult i32 %y, %add\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "demorgan_and_form",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, -1\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %and = icmp ult i32 %x, %y\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp ne i32 %x, 4294967295\n  %c2 = icmp ule i32 %add, %y\n  %and = and i1 %c1, %c2\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_i4",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %add = add <4 x i4> %x, <i4 1, i4 1, i4 1, i4 1>\n  %c1 = icmp eq <4 x i4> %x, <i4 -1, i4 -1, i4 -1, i4 -1>\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}",
+          "tgt": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %add = add <4 x i4> %x, { 1, 1, 1, 1 }\n  %c1 = icmp eq <4 x i4> %x, { 15, 15, 15, 15 }\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %add = add <4 x i4> %x, <i4 1, i4 1, i4 1, i4 1>\n  %c1 = icmp eq <4 x i4> %x, <i4 -1, i4 -1, i4 -1, i4 -1>\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %add = add <4 x i4> %x, { 1, 1, 1, 1 }\n  %c1 = icmp eq <4 x i4> %x, { 15, 15, 15, 15 }\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n  %add = add <4 x i4> %x, <i4 1, i4 1, i4 1, i4 1>\n  %c1 = icmp eq <4 x i4> %x, <i4 -1, i4 -1, i4 -1, i4 -1>\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %or = icmp uge <4 x i4> %x, %y\n  ret <4 x i1> %or\n}\n=>\ndefine <4 x i1> @test(<4 x i4> %x, <4 x i4> %y) {\n#0:\n  %add = add <4 x i4> %x, { 1, 1, 1, 1 }\n  %c1 = icmp eq <4 x i4> %x, { 15, 15, 15, 15 }\n  %c2 = icmp ugt <4 x i4> %add, %y\n  %or = or <4 x i1> %c1, %c2\n  ret <4 x i1> %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_wrong_const",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 0\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_wrong_add",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 2\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_signed_predicate",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp sgt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "nuw_flag_case",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %add = add nuw i32 %x, 1\n  %c1 = icmp eq i32 %x, -1\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %add = add nuw i32 %x, 1\n  %c1 = icmp eq i32 %x, 4294967295\n  %c2 = icmp ugt i32 %add, %y\n  %or = or i1 %c1, %c2\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %c2 = icmp uge i32 %x, %y\n  ret i1 %c2\n}\n",
+          "tgt": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %c2 = icmp uge i32 %x, %y\n  ret i1 %c2\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x, i32 %y) {\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x, i32 %y) {\n  %c2 = icmp uge i32 %x, %y\n  ret i1 %c2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %or = icmp uge i32 %x, %y\n  ret i1 %or\n}\n=>\ndefine i1 @test(i32 %x, i32 %y) {\n#0:\n  %c2 = icmp uge i32 %x, %y\n  ret i1 %c2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0091 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:16 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.5s)\n-- Generating done (0.8s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

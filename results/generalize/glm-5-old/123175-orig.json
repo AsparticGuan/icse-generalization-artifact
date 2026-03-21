@@ -1,0 +1,331 @@
+{
+  "issue_id": "123175-orig",
+  "dataset_file": "123175-orig.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n    %x = mul nsw nuw i8 %a, %b\n    %y = mul nsw nuw i8 %x, %c\n    ret i8 %y\n}\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n    %x = mul i8 %c, %b\n    %y = mul nsw nuw i8 %x, %a\n    ret i8 %y\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"InstCombine misses the opportunity to reassociate multiplication chains (mul) when nsw/nuw flags are present. While mathematically valid, reassociating (A * B) * C requires stripping overflow flags from intermediate operations (as B * C might wrap even if (A*B)*C does not) but can preserve flags on the final result. This enables canonicalization or constant folding that is currently missed due to conservatism with flags.\",\n  \"before_after\": {\n    \"input\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n    %x = mul nsw nuw i8 %a, %b\\n    %y = mul nsw nuw i8 %x, %c\\n    ret i8 %y\\n}\",\n    \"expected\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n    %x = mul i8 %c, %b\\n    %y = mul nsw nuw i8 %x, %a\\n    ret i8 %y\\n}\"\n  },\n  \"preconditions\": [\n    \"The operation is integer multiplication (associative and commutative).\",\n    \"The input is a tree of multiplications (e.g., (A * B) * C).\",\n    \"The root multiplication has nsw/nuw flags indicating the final result does not wrap.\",\n    \"Safety: Flags on intermediate nodes must be dropped in the new tree because the new intermediate operation (e.g., C * B) is not guaranteed to be wrap-free just because the original intermediate (A * B) or the final result was.\",\n    \"Legality: The transformation is valid even if the intermediate mul has multiple uses (we create a new node), but profitability usually requires simplification or single-use of the replaced node.\"\n  ],\n  \"pattern\": \"Reassociate `mul` trees to a canonical form (e.g., sorting operands, grouping constants, or rotating the tree).\\n\\nGeneral Form:\\n  %1 = mul [flags1] %A, %B\\n  %2 = mul [flags2] %1, %C\\n\\nRewritten to (example reordering):\\n  %3 = mul %C, %B          ; flags stripped\\n  %4 = mul [flags2] %3, %A ; flags from root %2 preserved\",\n  \"testcases\": [\n    {\n      \"name\": \"Basic Reordering (i8)\",\n      \"ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n  %x = mul nsw nuw i8 %a, %b\\n  %y = mul nsw nuw i8 %x, %c\\n  ret i8 %y\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n  %x = mul i8 %c, %b\\n  %y = mul nsw nuw i8 %x, %a\\n  ret i8 %y\\n}\",\n      \"why\": \"Verifies the basic pattern matching and reordering logic.\"\n    },\n    {\n      \"name\": \"Constant Folding Opportunity\",\n      \"ir\": \"define i32 @test(i32 %a) {\\n  %x = mul nsw i32 %a, 10\\n  %y = mul nsw i32 %x, 3\\n  ret i32 %y\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a) {\\n  %y = mul nsw i32 %a, 30\\n  ret i32 %y\\n}\",\n      \"why\": \"Demonstrates that reassociation enables constant folding (10*3=30), which is the primary motivation for such passes.\"\n    },\n    {\n      \"name\": \"Vector Type\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\\n  %x = mul nuw <4 x i32> %a, %b\\n  %y = mul nuw <4 x i32> %x, %c\\n  ret <4 x i32> %y\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\\n  %x = mul <4 x i32> %c, %b\\n  %y = mul nuw <4 x i32> %x, %a\\n  ret <4 x i32> %y\\n}\",\n      \"why\": \"Ensures the transformation works for vector types (scalable or fixed).\"\n    },\n    {\n      \"name\": \"Mixed Flags (NSW then NUW)\",\n      \"ir\": \"define i16 @test(i16 %a, i16 %b, i16 %c) {\\n  %x = mul nsw i16 %a, %b\\n  %y = mul nuw i16 %x, %c\\n  ret i16 %y\\n}\",\n      \"expected_optimized_ir\": \"define i16 @test(i16 %a, i16 %b, i16 %c) {\\n  %x = mul i16 %c, %b\\n  %y = mul nuw i16 %x, %a\\n  ret i16 %y\\n}\",\n      \"why\": \"Checks that only the root flags (nuw) are preserved, and inner flags (nsw) are correctly stripped/dropped.\"\n    },\n    {\n      \"name\": \"Commutative Input Variant\",\n      \"ir\": \"define i32 @test(i32 %a, i32 %b, i32 %c) {\\n  %x = mul nsw nuw i32 %b, %a ; commuted\\n  %y = mul nsw nuw i32 %c, %x ; commuted\\n  ret i32 %y\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %a, i32 %b, i32 %c) {\\n  %x = mul i32 %b, %c\\n  %y = mul nsw nuw i32 %x, %a\\n  ret i32 %y\\n}\",\n      \"why\": \"Tests if the pattern matcher handles commuted inputs gracefully.\"\n    },\n    {\n      \"name\": \"Large Bitwidth (i64)\",\n      \"ir\": \"define i64 @test(i64 %a, i64 %b, i64 %c) {\\n  %x = mul i64 %a, %b\\n  %y = mul i64 %x, %c\\n  ret i64 %y\\n}\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %a, i64 %b, i64 %c) {\\n  %x = mul i64 %c, %b\\n  %y = mul i64 %x, %a\\n  ret i64 %y\\n}\",\n      \"why\": \"Checks behavior with no flags (pure reassociation).\"\n    },\n    {\n      \"name\": \"Deep Nesting\",\n      \"ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\\n  %x = mul i8 %a, %b\\n  %y = mul i8 %x, %c\\n  %z = mul i8 %y, %d\\n  ret i8 %z\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\\n  %x = mul i8 %d, %c\\n  %y = mul i8 %x, %b\\n  %z = mul i8 %y, %a\\n  ret i8 %z\\n}\",\n      \"why\": \"Tests if the logic can be applied iteratively or handles deeper trees.\"\n    },\n    {\n      \"name\": \"Negative Case - Freeze\",\n      \"ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n  %f = freeze i8 %b\\n  %x = mul nsw i8 %a, %f\\n  %y = mul nsw i8 %x, %c\\n  ret i8 %y\\n}\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %a, i8 %b, i8 %c) {\\n  %f = freeze i8 %b\\n  %x = mul nsw i8 %a, %f\\n  %y = mul nsw i8 %x, %c\\n  ret i8 %y\\n}\",\n      \"why\": \"Reassociation across a freeze might be restricted or handled differently; this checks for crashes or incorrect folds involving freeze.\"\n    }\n  ],\n  \"implementation_notes\": \"Implement this in `InstCombinerImpl::visitMul` (or `visitOverflowingBinaryOperator` if generalized).\\n\\n1. **Match**: Identify `mul` instructions where one operand is also a `mul`. e.g., `I = mul (mul A, B), C`.\\n2. **Analyze Flags**: The instruction `I` has flags `F_root`. The inner `mul` has flags `F_inner`.\\n3. **Reorder Strategy**: Decide on a canonical order (e.g., constants first, or rotate variables). In the user's example, `C` and `B` are grouped, and `A` is moved to the root.\\n4. **Construct**:\\n   - Create `NewInner = Builder.CreateMul(C, B)`. **Crucially**, do not set `nsw`/`nuw` on `NewInner`. Even if `A*B` was safe, `C*B` is not guaranteed to be safe.\\n   - Create `NewRoot = Builder.CreateMul(NewInner, A)`. Copy `F_root` (nsw/nuw) to `NewRoot`. This is valid because the original computation `(A*B)*C` was guaranteed not to wrap, and the result is mathematically identical.\\n5. **Replace**: Replace `I` with `NewRoot`. If the inner `mul` becomes dead, DCE will remove it.\\n\\n**Pitfalls**:\\n- **Infinite Loops**: Ensure the new form is \\\"simpler\\\" or canonical according to InstCombine's worklist logic to avoid ping-ponging between `(A*B)*C` and `(C*B)*A`.\\n- **One-Use Check**: While not strictly required for correctness (we can create new nodes), it is often a profitability heuristic. If the inner `mul` has multiple uses, we might not want to change it unless the new form enables a significant fold (like constant folding).\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` on the provided IR. The test should verify that the instructions are reordered and that `nsw`/`nuw` flags are present on the final `mul` but absent on the intermediate `mul` in the optimized output.\",\n  \"clarifying_questions\": [\n    \"Is the specific reordering (C*B)*A intended to be a generic 'rotate right' canonicalization, or simply a placeholder for 'any reordering that enables constant folding'?\",\n    \"Should this transformation fire only if constants are present (profitability), or should it always canonicalize the tree structure (canonicalization)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "InstCombine misses the opportunity to reassociate multiplication chains (mul) when nsw/nuw flags are present. While mathematically valid, reassociating (A * B) * C requires stripping overflow flags from intermediate operations (as B * C might wrap even if (A*B)*C does not) but can preserve flags on the final result. This enables canonicalization or constant folding that is currently missed due to conservatism with flags.",
+    "before_after": {
+      "input": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n    %x = mul nsw nuw i8 %a, %b\n    %y = mul nsw nuw i8 %x, %c\n    ret i8 %y\n}",
+      "expected": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n    %x = mul i8 %c, %b\n    %y = mul nsw nuw i8 %x, %a\n    ret i8 %y\n}"
+    },
+    "preconditions": [
+      "The operation is integer multiplication (associative and commutative).",
+      "The input is a tree of multiplications (e.g., (A * B) * C).",
+      "The root multiplication has nsw/nuw flags indicating the final result does not wrap.",
+      "Safety: Flags on intermediate nodes must be dropped in the new tree because the new intermediate operation (e.g., C * B) is not guaranteed to be wrap-free just because the original intermediate (A * B) or the final result was.",
+      "Legality: The transformation is valid even if the intermediate mul has multiple uses (we create a new node), but profitability usually requires simplification or single-use of the replaced node."
+    ],
+    "pattern": "Reassociate `mul` trees to a canonical form (e.g., sorting operands, grouping constants, or rotating the tree).\n\nGeneral Form:\n  %1 = mul [flags1] %A, %B\n  %2 = mul [flags2] %1, %C\n\nRewritten to (example reordering):\n  %3 = mul %C, %B          ; flags stripped\n  %4 = mul [flags2] %3, %A ; flags from root %2 preserved",
+    "testcases": [
+      {
+        "name": "Basic Reordering (i8)",
+        "ir": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul nsw nuw i8 %a, %b\n  %y = mul nsw nuw i8 %x, %c\n  ret i8 %y\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}",
+        "why": "Verifies the basic pattern matching and reordering logic."
+      },
+      {
+        "name": "Constant Folding Opportunity",
+        "ir": "define i32 @test(i32 %a) {\n  %x = mul nsw i32 %a, 10\n  %y = mul nsw i32 %x, 3\n  ret i32 %y\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a) {\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}",
+        "why": "Demonstrates that reassociation enables constant folding (10*3=30), which is the primary motivation for such passes."
+      },
+      {
+        "name": "Vector Type",
+        "ir": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n  %x = mul nuw <4 x i32> %a, %b\n  %y = mul nuw <4 x i32> %x, %c\n  ret <4 x i32> %y\n}",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n  %x = mul <4 x i32> %c, %b\n  %y = mul nuw <4 x i32> %x, %a\n  ret <4 x i32> %y\n}",
+        "why": "Ensures the transformation works for vector types (scalable or fixed)."
+      },
+      {
+        "name": "Mixed Flags (NSW then NUW)",
+        "ir": "define i16 @test(i16 %a, i16 %b, i16 %c) {\n  %x = mul nsw i16 %a, %b\n  %y = mul nuw i16 %x, %c\n  ret i16 %y\n}",
+        "expected_optimized_ir": "define i16 @test(i16 %a, i16 %b, i16 %c) {\n  %x = mul i16 %c, %b\n  %y = mul nuw i16 %x, %a\n  ret i16 %y\n}",
+        "why": "Checks that only the root flags (nuw) are preserved, and inner flags (nsw) are correctly stripped/dropped."
+      },
+      {
+        "name": "Commutative Input Variant",
+        "ir": "define i32 @test(i32 %a, i32 %b, i32 %c) {\n  %x = mul nsw nuw i32 %b, %a ; commuted\n  %y = mul nsw nuw i32 %c, %x ; commuted\n  ret i32 %y\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %a, i32 %b, i32 %c) {\n  %x = mul i32 %b, %c\n  %y = mul nsw nuw i32 %x, %a\n  ret i32 %y\n}",
+        "why": "Tests if the pattern matcher handles commuted inputs gracefully."
+      },
+      {
+        "name": "Large Bitwidth (i64)",
+        "ir": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}",
+        "expected_optimized_ir": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}",
+        "why": "Checks behavior with no flags (pure reassociation)."
+      },
+      {
+        "name": "Deep Nesting",
+        "ir": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}",
+        "why": "Tests if the logic can be applied iteratively or handles deeper trees."
+      },
+      {
+        "name": "Negative Case - Freeze",
+        "ir": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+        "expected_optimized_ir": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+        "why": "Reassociation across a freeze might be restricted or handled differently; this checks for crashes or incorrect folds involving freeze."
+      }
+    ],
+    "implementation_notes": "Implement this in `InstCombinerImpl::visitMul` (or `visitOverflowingBinaryOperator` if generalized).\n\n1. **Match**: Identify `mul` instructions where one operand is also a `mul`. e.g., `I = mul (mul A, B), C`.\n2. **Analyze Flags**: The instruction `I` has flags `F_root`. The inner `mul` has flags `F_inner`.\n3. **Reorder Strategy**: Decide on a canonical order (e.g., constants first, or rotate variables). In the user's example, `C` and `B` are grouped, and `A` is moved to the root.\n4. **Construct**:\n   - Create `NewInner = Builder.CreateMul(C, B)`. **Crucially**, do not set `nsw`/`nuw` on `NewInner`. Even if `A*B` was safe, `C*B` is not guaranteed to be safe.\n   - Create `NewRoot = Builder.CreateMul(NewInner, A)`. Copy `F_root` (nsw/nuw) to `NewRoot`. This is valid because the original computation `(A*B)*C` was guaranteed not to wrap, and the result is mathematically identical.\n5. **Replace**: Replace `I` with `NewRoot`. If the inner `mul` becomes dead, DCE will remove it.\n\n**Pitfalls**:\n- **Infinite Loops**: Ensure the new form is \"simpler\" or canonical according to InstCombine's worklist logic to avoid ping-ponging between `(A*B)*C` and `(C*B)*A`.\n- **One-Use Check**: While not strictly required for correctness (we can create new nodes), it is often a profitability heuristic. If the inner `mul` has multiple uses, we might not want to change it unless the new form enables a significant fold (like constant folding).",
+    "regression_test_notes": "Use `opt -instcombine -S` on the provided IR. The test should verify that the instructions are reordered and that `nsw`/`nuw` flags are present on the final `mul` but absent on the intermediate `mul` in the optimized output.",
+    "clarifying_questions": [
+      "Is the specific reordering (C*B)*A intended to be a generic 'rotate right' canonicalization, or simply a placeholder for 'any reordering that enables constant folding'?",
+      "Should this transformation fire only if constants are present (profitability), or should it always canonicalize the tree structure (canonicalization)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "Basic Reordering (i8)",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul nsw nuw i8 %a, %b\n  %y = mul nsw nuw i8 %x, %c\n  ret i8 %y\n}",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul nsw nuw i8 %a, %b\n  %y = mul nsw nuw i8 %x, %c\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul nuw nsw i8 %a, %b\n  %y = mul nuw nsw i8 %x, %c\n  ret i8 %y\n}\n",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul nsw nuw i8 %a, %b\n  %y = mul nsw nuw i8 %x, %c\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n  %x = mul nuw nsw i8 %a, %b\n  %y = mul nuw nsw i8 %x, %c\n  ret i8 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul i8 %c, %b\n  %y = mul nsw nuw i8 %x, %a\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %x = mul nsw nuw i8 %a, %b\n  %y = mul nsw nuw i8 %x, %c\n  ret i8 %y\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni8 %a = #x0c (12)\ni8 %b = #x0c (12)\ni8 %c = #x00 (0)\n\nSource:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\n\nTarget:\ni8 %x = poison\ni8 %y = poison\nSource value: #x00 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Constant Folding Opportunity",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a) {\n  %x = mul nsw i32 %a, 10\n  %y = mul nsw i32 %x, 3\n  ret i32 %y\n}",
+          "tgt": "define i32 @test(i32 %a) {\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\n#0:\n  %x = mul nsw i32 %a, 10\n  %y = mul nsw i32 %x, 3\n  ret i32 %y\n}\n=>\ndefine i32 @test(i32 %a) {\n#0:\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\n  %y = mul i32 %a, 30\n  ret i32 %y\n}\n",
+          "tgt": "define i32 @test(i32 %a) {\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\n#0:\n  %y = mul i32 %a, 30\n  ret i32 %y\n}\n=>\ndefine i32 @test(i32 %a) {\n#0:\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %a = #x0459a000 (72982528)\n\nSource:\ni32 %y = #x8280c000 (2189475840, -2105491456)\n\nTarget:\ni32 %y = poison\nSource value: #x8280c000 (2189475840, -2105491456)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %a) {\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %a) {\n  %y = mul i32 %a, 30\n  ret i32 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a) {\n#0:\n  %y = mul nsw i32 %a, 30\n  ret i32 %y\n}\n=>\ndefine i32 @test(i32 %a) {\n#0:\n  %y = mul i32 %a, 30\n  ret i32 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector Type",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n  %x = mul nuw <4 x i32> %a, %b\n  %y = mul nuw <4 x i32> %x, %c\n  ret <4 x i32> %y\n}",
+          "tgt": "define <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n  %x = mul <4 x i32> %c, %b\n  %y = mul nuw <4 x i32> %x, %a\n  ret <4 x i32> %y\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n#0:\n  %x = mul nuw <4 x i32> %a, %b\n  %y = mul nuw <4 x i32> %x, %c\n  ret <4 x i32> %y\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) {\n#0:\n  %x = mul <4 x i32> %c, %b\n  %y = mul nuw <4 x i32> %x, %a\n  ret <4 x i32> %y\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Mixed Flags (NSW then NUW)",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i16 @test(i16 %a, i16 %b, i16 %c) {\n  %x = mul nsw i16 %a, %b\n  %y = mul nuw i16 %x, %c\n  ret i16 %y\n}",
+          "tgt": "define i16 @test(i16 %a, i16 %b, i16 %c) {\n  %x = mul i16 %c, %b\n  %y = mul nuw i16 %x, %a\n  ret i16 %y\n}",
+          "log": "\n----------------------------------------\ndefine i16 @test(i16 %a, i16 %b, i16 %c) {\n#0:\n  %x = mul nsw i16 %a, %b\n  %y = mul nuw i16 %x, %c\n  ret i16 %y\n}\n=>\ndefine i16 @test(i16 %a, i16 %b, i16 %c) {\n#0:\n  %x = mul i16 %c, %b\n  %y = mul nuw i16 %x, %a\n  ret i16 %y\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni16 %a = #xf400 (62464, -3072)\ni16 %b = #x0009 (9)\ni16 %c = #x0001 (1)\n\nSource:\ni16 %x = #x9400 (37888, -27648)\ni16 %y = #x9400 (37888, -27648)\n\nTarget:\ni16 %x = #x0009 (9)\ni16 %y = poison\nSource value: #x9400 (37888, -27648)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Commutative Input Variant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %a, i32 %b, i32 %c) {\n  %x = mul nsw nuw i32 %b, %a ; commuted\n  %y = mul nsw nuw i32 %c, %x ; commuted\n  ret i32 %y\n}",
+          "tgt": "define i32 @test(i32 %a, i32 %b, i32 %c) {\n  %x = mul i32 %b, %c\n  %y = mul nsw nuw i32 %x, %a\n  ret i32 %y\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %a, i32 %b, i32 %c) {\n#0:\n  %x = mul nsw nuw i32 %b, %a\n  %y = mul nsw nuw i32 %c, %x\n  ret i32 %y\n}\n=>\ndefine i32 @test(i32 %a, i32 %b, i32 %c) {\n#0:\n  %x = mul i32 %b, %c\n  %y = mul nsw nuw i32 %x, %a\n  ret i32 %y\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Large Bitwidth (i64)",
+      "missed_optimization": true,
+      "cost": {
+        "source": 3,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 3\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}",
+          "tgt": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}\n=>\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}\n",
+          "tgt": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}\n=>\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %c, %b\n  %y = mul i64 %x, %a\n  ret i64 %y\n}\n=>\ndefine i64 @test(i64 %a, i64 %b, i64 %c) {\n#0:\n  %x = mul i64 %a, %b\n  %y = mul i64 %x, %c\n  ret i64 %y\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Deep Nesting",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}\n",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %d, %c\n  %y = mul i8 %x, %b\n  %z = mul i8 %y, %a\n  ret i8 %z\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c, i8 %d) {\n#0:\n  %x = mul i8 %a, %b\n  %y = mul i8 %x, %c\n  %z = mul i8 %y, %d\n  ret i8 %z\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Negative Case - Freeze",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\n",
+          "tgt": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\n=>\ndefine i8 @test(i8 %a, i8 %b, i8 %c) {\n#0:\n  %f = freeze i8 %b\n  %x = mul nsw i8 %a, %f\n  %y = mul nsw i8 %x, %c\n  ret i8 %y\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

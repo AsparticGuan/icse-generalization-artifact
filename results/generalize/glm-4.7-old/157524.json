@@ -1,0 +1,988 @@
+{
+  "issue_id": "157524",
+  "dataset_file": "157524.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and “noise” operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate “only under some constraints” and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn’t fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., “only bitwidth changes”, then “only flags changes”), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i32 @test_umin(i32 %arg0, i32 %arg1) {\n  %v0 = tail call i32 @llvm.umin.i32(i32 %arg0, i32 %arg1)\n  %v1 = add nuw i32 %arg0, 1\n  %v2 = tail call i32 @llvm.umin.i32(i32 %v1, i32 %arg1)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\ndefine i32 @test_umin(i32 %arg0, i32 %arg1) {\n  %1 = icmp ult i32 %arg0, %arg1\n  %v3 = zext i1 %1 to i32\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+  "model_output": "```json\n{\n  \"summary\": \"Missed optimization: umin(add nuw x, 1, y) - umin(x, y) should fold to zext(icmp ult x, y). This pattern appears when computing the difference between adjacent umin operations and simplifies to a boolean comparison.\",\n  \"before_after\": \"Transforms: sub (umin (add nuw x, 1), y), (umin x, y)  =>  zext (icmp ult x, y). Also handles commuted operands and select-based umin patterns.\",\n  \"preconditions\": [\n    \"The add must have 'nuw' flag to prevent unsigned wrap (x != UINT_MAX)\",\n    \"The sub result type must match the umin operand type\",\n    \"Both umin operations must use the same pair of operands (x, y)\",\n    \"The constant in add must be exactly 1 (not other constants)\",\n    \"No additional uses of intermediate values that would prevent DCE\",\n    \"For the 'sub' variant (umin(x,y) - umin(sub nuw x, 1, y)), x must not be 0 due to nuw\"\n  ],\n  \"pattern\": {\n    \"primary\": \"umin(add nuw x, 1, y) - umin(x, y) => zext(icmp ult x, y)\",\n    \"symmetric_sub\": \"umin(x, y) - umin(sub nuw x, 1, y) => zext(icmp ule x, y)\",\n    \"second_operand_sub\": \"umin(x, y) - umin(x, sub nuw y, 1) => zext(icmp uge x, y)\",\n    \"signed_variants\": [\n      \"smin(add nsw x, 1, y) - smin(x, y) => zext(icmp slt x, y)\",\n      \"smin(x, y) - smin(sub nsw x, 1, y) => zext(icmp sle x, y)\",\n      \"smin(x, y) - smin(x, sub nsw y, 1) => zext(icmp sge x, y)\"\n    ],\n    \"equivalent_identities\": [\n      \"umin(add nuw x, 1, y) - umin(x, sub nuw y, 1) => 1\",\n      \"smin(add nsw x, 1, y) - smin(x, sub nsw y, 1) => 1\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"basic_umin_add_nuw\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Basic case: umin(add nuw x, 1, y) - umin(x, y) folds to comparison\"\n    },\n    {\n      \"name\": \"umin_add_nuw_commuted_add\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 1, %x\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Add operands can be commuted (add nuw 1, x)\"\n    },\n    {\n      \"name\": \"umin_add_nuw_commuted_umin_first\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %y, i32 %v1)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"First umin operands can be commuted\"\n    },\n    {\n      \"name\": \"umin_add_nuw_commuted_umin_second\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %y, i32 %x)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Second umin operands can be commuted\"\n    },\n    {\n      \"name\": \"select_based_umin\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp0 = icmp ult i32 %x, %y\\n  %v0 = select i1 %cmp0, i32 %x, i32 %y\\n  %v1 = add nuw i32 %x, 1\\n  %cmp1 = icmp ult i32 %v1, %y\\n  %v2 = select i1 %cmp1, i32 %v1, i32 %y\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp0 = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp0 to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Pattern works with select-based umin (not just llvm.umin intrinsic)\"\n    },\n    {\n      \"name\": \"i8_type\",\n      \"ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %v0 = call i8 @llvm.umin.i8(i8 %x, i8 %y)\\n  %v1 = add nuw i8 %x, 1\\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 %y)\\n  %v3 = sub i8 %v2, %v0\\n  ret i8 %v3\\n}\\ndeclare i8 @llvm.umin.i8(i8, i8)\",\n      \"expected_optimized_ir\": \"define i8 @test(i8 %x, i8 %y) {\\n  %cmp = icmp ult i8 %x, %y\\n  %v3 = zext i1 %cmp to i8\\n  ret i8 %v3\\n}\",\n      \"why\": \"Works with different integer type (i8)\"\n    },\n    {\n      \"name\": \"i64_type\",\n      \"ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %v0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\\n  %v1 = add nuw i64 %x, 1\\n  %v2 = call i64 @llvm.umin.i64(i64 %v1, i64 %y)\\n  %v3 = sub i64 %v2, %v0\\n  ret i64 %v3\\n}\\ndeclare i64 @llvm.umin.i64(i64, i64)\",\n      \"expected_optimized_ir\": \"define i64 @test(i64 %x, i64 %y) {\\n  %cmp = icmp ult i64 %x, %y\\n  %v3 = zext i1 %cmp to i64\\n  ret i64 %v3\\n}\",\n      \"why\": \"Works with different integer type (i64)\"\n    },\n    {\n      \"name\": \"vector_i32x4\",\n      \"ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\\n  %v0 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %x, <4 x i32> %y)\\n  %v1 = add nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\\n  %v2 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %v1, <4 x i32> %y)\\n  %v3 = sub <4 x i32> %v2, %v0\\n  ret <4 x i32> %v3\\n}\\ndeclare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)\",\n      \"expected_optimized_ir\": \"define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\\n  %cmp = icmp ult <4 x i32> %x, %y\\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\\n  ret <4 x i32> %v3\\n}\",\n      \"why\": \"Works with vector types\"\n    },\n    {\n      \"name\": \"with_noise_xor_zero\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %x0 = xor i32 %x, 0\\n  %v0 = call i32 @llvm.umin.i32(i32 %x0, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Transparent xor 0 should not prevent the fold\"\n    },\n    {\n      \"name\": \"with_noise_and_allones\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %y0 = and i32 %y, -1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y0)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Transparent and -1 should not prevent the fold\"\n    },\n    {\n      \"name\": \"without_nuw_no_fold\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"why\": \"Without nuw flag, the fold is not valid (x could be UINT_MAX causing overflow)\"\n    },\n    {\n      \"name\": \"wrong_constant_no_fold\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 2\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 2\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"why\": \"Constant must be exactly 1; other constants don't simplify to a comparison\"\n    },\n    {\n      \"name\": \"multiple_use_no_fold\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32* %ptr) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  store i32 %v0, i32* %ptr\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32* %ptr) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  store i32 %v0, i32* %ptr\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"why\": \"Multiple uses of v0 prevent full optimization (could still fold sub if we create new umin)\"\n    },\n    {\n      \"name\": \"umin_sub_nuw_x\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v1 = sub nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v3 = sub i32 %v0, %v2\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ule i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Symmetric pattern: umin(x, y) - umin(sub nuw x, 1, y) => zext(icmp ule x, y)\"\n    },\n    {\n      \"name\": \"umin_sub_nuw_y\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = sub nuw i32 %y, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\\n  %v3 = sub i32 %v0, %v2\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp uge i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Pattern: umin(x, y) - umin(x, sub nuw y, 1) => zext(icmp uge x, y)\"\n    },\n    {\n      \"name\": \"smin_add_nsw\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %v1 = add nsw i32 %x, 1\\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.smin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp slt i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Signed variant: smin(add nsw x, 1, y) - smin(x, y) => zext(icmp slt x, y)\"\n    },\n    {\n      \"name\": \"smin_sub_nsw_x\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v1 = sub nsw i32 %x, 1\\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %v3 = sub i32 %v0, %v2\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.smin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp sle i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Signed variant: smin(x, y) - smin(sub nsw x, 1, y) => zext(icmp sle x, y)\"\n    },\n    {\n      \"name\": \"smin_sub_nsw_y\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\\n  %v1 = sub nsw i32 %y, 1\\n  %v2 = call i32 @llvm.smin.i32(i32 %x, i32 %v1)\\n  %v3 = sub i32 %v0, %v2\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.smin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp sge i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Signed variant: smin(x, y) - smin(x, sub nsw y, 1) => zext(icmp sge x, y)\"\n    },\n    {\n      \"name\": \"sub_nsw_flag_preserved\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub nsw i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Original sub had nsw flag; result is 0 or 1 which is always valid for nsw in i32+\"\n    },\n    {\n      \"name\": \"identity_umin_add_sub_both\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %v1 = sub nuw i32 %y, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\\n  %v3 = add nuw i32 %x, 1\\n  %v4 = call i32 @llvm.umin.i32(i32 %v3, i32 %y)\\n  %v5 = sub i32 %v4, %v2\\n  ret i32 %v5\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  ret i32 1\\n}\",\n      \"why\": \"Identity: umin(add nuw x, 1, y) - umin(x, sub nuw y, 1) always equals 1\"\n    },\n    {\n      \"name\": \"boundary_x_max\",\n      \"ir\": \"define i32 @test(i32 %y) {\\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\\ndeclare i32 @llvm.umax.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %y) {\\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\\n  %cmp = icmp ult i32 %x, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Boundary case: x is near max value but nuw ensures no overflow\"\n    },\n    {\n      \"name\": \"boundary_y_zero\",\n      \"ir\": \"define i32 @test(i32 %x) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 0)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 0)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x) {\\n  %cmp = icmp ult i32 %x, 0\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Boundary case: y is 0; result is always 0 since x >= 0 for nuw add\"\n    },\n    {\n      \"name\": \"freeze_operand\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %xf = freeze i32 %x\\n  %v0 = call i32 @llvm.umin.i32(i32 %xf, i32 %y)\\n  %v1 = add nuw i32 %xf, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y) {\\n  %xf = freeze i32 %x\\n  %cmp = icmp ult i32 %xf, %y\\n  %v3 = zext i1 %cmp to i32\\n  ret i32 %v3\\n}\",\n      \"why\": \"Freeze on operand should not prevent the fold\"\n    },\n    {\n      \"name\": \"negative_test_different_operands\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %z, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %z, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"why\": \"Negative: different operand in add (z instead of x) breaks the pattern\"\n    },\n    {\n      \"name\": \"negative_test_different_second_operand\",\n      \"ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\\ndeclare i32 @llvm.umin.i32(i32, i32)\",\n      \"expected_optimized_ir\": \"define i32 @test(i32 %x, i32 %y, i32 %z) {\\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\\n  %v1 = add nuw i32 %x, 1\\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\\n  %v3 = sub i32 %v2, %v0\\n  ret i32 %v3\\n}\",\n      \"why\": \"Negative: different second operand in umin (z instead of y) breaks the pattern\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"match_strategy\": \"Match the sub instruction and verify both operands are umin/select operations with the correct relationship. One umin should have (add nuw X, 1) and Y, the other should have X and Y.\",\n    \"key_checks\": [\n      \"Verify add has nuw flag and constant operand is exactly 1\",\n      \"Handle both llvm.umin intrinsic and select-based umin patterns\",\n      \"Handle commuted operands in both umin and add\",\n      \"Match Value* equality for X and Y across the two umin operations\",\n      \"Use IRBuilder to create icmp and zext\",\n      \"Consider preserving nuw/nsw flags from original sub if applicable\"\n    ],\n    \"potential_pitfalls\": [\n      \"Multiple uses of intermediate values: if umin or add has other uses, we may need to be more careful or skip the fold\",\n      \"Poison values: nuw flag ensures no overflow, but if other constraints are violated, we might introduce UB\",\n      \"Type consistency: ensure result type matches operand types\",\n      \"Vector types: handle splat constants and vector icmp correctly\",\n      \"Dead code elimination: after folding, the umin and add instructions should become dead and be cleaned up\"\n    ],\n    \"code_sketch\": \"In visitSub(): match LHS = umin(add nuw X, 1, Y) and RHS = umin(X, Y). If match succeeds, replace sub with zext(icmp ult X, Y). Handle commuted operands and both intrinsic/select forms of umin. Also handle the symmetric patterns with sub nuw.\"\n  },\n  \"regression_test_notes\": {\n    \"file_location\": \"llvm/test/Transforms/InstCombine/umin-umin-diff.ll\",\n    \"check_directives\": [\n      \"CHECK-LABEL: @test_basic\",\n      \"CHECK: icmp ult\",\n      \"CHECK: zext\",\n      \"CHECK-NOT: llvm.umin\",\n      \"CHECK-NOT: add nuw\"\n    ],\n    \"coverage\": \"Test should cover: basic cases, all 6 patterns, vector types, different integer widths, boundary values, and negative cases (no nuw, wrong constant, different operands).\"\n  },\n  \"clarifying_questions\": [\n    \"Should the fold fire when the umin operations have multiple uses, requiring us to potentially duplicate the umin computation?\",\n    \"Should we preserve nuw/nsw flags from the original sub instruction on the new zext result (which is always safe for i32+)?\",\n    \"Are there any target-specific considerations where this fold might be undesirable (e.g., on targets where umin is a single instruction but icmp+zext is more expensive)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Missed optimization: umin(add nuw x, 1, y) - umin(x, y) should fold to zext(icmp ult x, y). This pattern appears when computing the difference between adjacent umin operations and simplifies to a boolean comparison.",
+    "before_after": "Transforms: sub (umin (add nuw x, 1), y), (umin x, y)  =>  zext (icmp ult x, y). Also handles commuted operands and select-based umin patterns.",
+    "preconditions": [
+      "The add must have 'nuw' flag to prevent unsigned wrap (x != UINT_MAX)",
+      "The sub result type must match the umin operand type",
+      "Both umin operations must use the same pair of operands (x, y)",
+      "The constant in add must be exactly 1 (not other constants)",
+      "No additional uses of intermediate values that would prevent DCE",
+      "For the 'sub' variant (umin(x,y) - umin(sub nuw x, 1, y)), x must not be 0 due to nuw"
+    ],
+    "pattern": {
+      "primary": "umin(add nuw x, 1, y) - umin(x, y) => zext(icmp ult x, y)",
+      "symmetric_sub": "umin(x, y) - umin(sub nuw x, 1, y) => zext(icmp ule x, y)",
+      "second_operand_sub": "umin(x, y) - umin(x, sub nuw y, 1) => zext(icmp uge x, y)",
+      "signed_variants": [
+        "smin(add nsw x, 1, y) - smin(x, y) => zext(icmp slt x, y)",
+        "smin(x, y) - smin(sub nsw x, 1, y) => zext(icmp sle x, y)",
+        "smin(x, y) - smin(x, sub nsw y, 1) => zext(icmp sge x, y)"
+      ],
+      "equivalent_identities": [
+        "umin(add nuw x, 1, y) - umin(x, sub nuw y, 1) => 1",
+        "smin(add nsw x, 1, y) - smin(x, sub nsw y, 1) => 1"
+      ]
+    },
+    "testcases": [
+      {
+        "name": "basic_umin_add_nuw",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Basic case: umin(add nuw x, 1, y) - umin(x, y) folds to comparison"
+      },
+      {
+        "name": "umin_add_nuw_commuted_add",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 1, %x\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Add operands can be commuted (add nuw 1, x)"
+      },
+      {
+        "name": "umin_add_nuw_commuted_umin_first",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "First umin operands can be commuted"
+      },
+      {
+        "name": "umin_add_nuw_commuted_umin_second",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %y, i32 %x)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Second umin operands can be commuted"
+      },
+      {
+        "name": "select_based_umin",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v0 = select i1 %cmp0, i32 %x, i32 %y\n  %v1 = add nuw i32 %x, 1\n  %cmp1 = icmp ult i32 %v1, %y\n  %v2 = select i1 %cmp1, i32 %v1, i32 %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}",
+        "why": "Pattern works with select-based umin (not just llvm.umin intrinsic)"
+      },
+      {
+        "name": "i8_type",
+        "ir": "define i8 @test(i8 %x, i8 %y) {\n  %v0 = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %v1 = add nuw i8 %x, 1\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 %y)\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\ndeclare i8 @llvm.umin.i8(i8, i8)",
+        "expected_optimized_ir": "define i8 @test(i8 %x, i8 %y) {\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}",
+        "why": "Works with different integer type (i8)"
+      },
+      {
+        "name": "i64_type",
+        "ir": "define i64 @test(i64 %x, i64 %y) {\n  %v0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %v1 = add nuw i64 %x, 1\n  %v2 = call i64 @llvm.umin.i64(i64 %v1, i64 %y)\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\ndeclare i64 @llvm.umin.i64(i64, i64)",
+        "expected_optimized_ir": "define i64 @test(i64 %x, i64 %y) {\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}",
+        "why": "Works with different integer type (i64)"
+      },
+      {
+        "name": "vector_i32x4",
+        "ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %v0 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %x, <4 x i32> %y)\n  %v1 = add nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %v2 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %v1, <4 x i32> %y)\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\ndeclare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)",
+        "expected_optimized_ir": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}",
+        "why": "Works with vector types"
+      },
+      {
+        "name": "with_noise_xor_zero",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %x0 = xor i32 %x, 0\n  %v0 = call i32 @llvm.umin.i32(i32 %x0, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Transparent xor 0 should not prevent the fold"
+      },
+      {
+        "name": "with_noise_and_allones",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %y0 = and i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y0)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Transparent and -1 should not prevent the fold"
+      },
+      {
+        "name": "without_nuw_no_fold",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "why": "Without nuw flag, the fold is not valid (x could be UINT_MAX causing overflow)"
+      },
+      {
+        "name": "wrong_constant_no_fold",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "why": "Constant must be exactly 1; other constants don't simplify to a comparison"
+      },
+      {
+        "name": "multiple_use_no_fold",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "why": "Multiple uses of v0 prevent full optimization (could still fold sub if we create new umin)"
+      },
+      {
+        "name": "umin_sub_nuw_x",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Symmetric pattern: umin(x, y) - umin(sub nuw x, 1, y) => zext(icmp ule x, y)"
+      },
+      {
+        "name": "umin_sub_nuw_y",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = sub nuw i32 %y, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Pattern: umin(x, y) - umin(x, sub nuw y, 1) => zext(icmp uge x, y)"
+      },
+      {
+        "name": "smin_add_nsw",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Signed variant: smin(add nsw x, 1, y) - smin(x, y) => zext(icmp slt x, y)"
+      },
+      {
+        "name": "smin_sub_nsw_x",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Signed variant: smin(x, y) - smin(sub nsw x, 1, y) => zext(icmp sle x, y)"
+      },
+      {
+        "name": "smin_sub_nsw_y",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = sub nsw i32 %y, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Signed variant: smin(x, y) - smin(x, sub nsw y, 1) => zext(icmp sge x, y)"
+      },
+      {
+        "name": "sub_nsw_flag_preserved",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Original sub had nsw flag; result is 0 or 1 which is always valid for nsw in i32+"
+      },
+      {
+        "name": "identity_umin_add_sub_both",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nuw i32 %y, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = add nuw i32 %x, 1\n  %v4 = call i32 @llvm.umin.i32(i32 %v3, i32 %y)\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  ret i32 1\n}",
+        "why": "Identity: umin(add nuw x, 1, y) - umin(x, sub nuw y, 1) always equals 1"
+      },
+      {
+        "name": "boundary_x_max",
+        "ir": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)\ndeclare i32 @llvm.umax.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Boundary case: x is near max value but nuw ensures no overflow"
+      },
+      {
+        "name": "boundary_y_zero",
+        "ir": "define i32 @test(i32 %x) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 0)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 0)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x) {\n  %cmp = icmp ult i32 %x, 0\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Boundary case: y is 0; result is always 0 since x >= 0 for nuw add"
+      },
+      {
+        "name": "freeze_operand",
+        "ir": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %v0 = call i32 @llvm.umin.i32(i32 %xf, i32 %y)\n  %v1 = add nuw i32 %xf, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+        "why": "Freeze on operand should not prevent the fold"
+      },
+      {
+        "name": "negative_test_different_operands",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "why": "Negative: different operand in add (z instead of x) breaks the pattern"
+      },
+      {
+        "name": "negative_test_different_second_operand",
+        "ir": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+        "expected_optimized_ir": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+        "why": "Negative: different second operand in umin (z instead of y) breaks the pattern"
+      }
+    ],
+    "implementation_notes": {
+      "match_strategy": "Match the sub instruction and verify both operands are umin/select operations with the correct relationship. One umin should have (add nuw X, 1) and Y, the other should have X and Y.",
+      "key_checks": [
+        "Verify add has nuw flag and constant operand is exactly 1",
+        "Handle both llvm.umin intrinsic and select-based umin patterns",
+        "Handle commuted operands in both umin and add",
+        "Match Value* equality for X and Y across the two umin operations",
+        "Use IRBuilder to create icmp and zext",
+        "Consider preserving nuw/nsw flags from original sub if applicable"
+      ],
+      "potential_pitfalls": [
+        "Multiple uses of intermediate values: if umin or add has other uses, we may need to be more careful or skip the fold",
+        "Poison values: nuw flag ensures no overflow, but if other constraints are violated, we might introduce UB",
+        "Type consistency: ensure result type matches operand types",
+        "Vector types: handle splat constants and vector icmp correctly",
+        "Dead code elimination: after folding, the umin and add instructions should become dead and be cleaned up"
+      ],
+      "code_sketch": "In visitSub(): match LHS = umin(add nuw X, 1, Y) and RHS = umin(X, Y). If match succeeds, replace sub with zext(icmp ult X, Y). Handle commuted operands and both intrinsic/select forms of umin. Also handle the symmetric patterns with sub nuw."
+    },
+    "regression_test_notes": {
+      "file_location": "llvm/test/Transforms/InstCombine/umin-umin-diff.ll",
+      "check_directives": [
+        "CHECK-LABEL: @test_basic",
+        "CHECK: icmp ult",
+        "CHECK: zext",
+        "CHECK-NOT: llvm.umin",
+        "CHECK-NOT: add nuw"
+      ],
+      "coverage": "Test should cover: basic cases, all 6 patterns, vector types, different integer widths, boundary values, and negative cases (no nuw, wrong constant, different operands)."
+    },
+    "clarifying_questions": [
+      "Should the fold fire when the umin operations have multiple uses, requiring us to potentially duplicate the umin computation?",
+      "Should we preserve nuw/nsw flags from the original sub instruction on the new zext result (which is always safe for i32+)?",
+      "Are there any target-specific considerations where this fold might be undesirable (e.g., on targets where umin is a single instruction but icmp+zext is more expensive)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_umin_add_nuw",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umin_add_nuw_commuted_add",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 1, %x\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 1, %x\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umin_add_nuw_commuted_umin_first",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %y, %v1\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %y, %v1\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %y, %v1\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umin_add_nuw_commuted_umin_second",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %y, i32 %x)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %y, %x\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %y, i32 %x)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %y, %x\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %y, i32 %x)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %y, %x\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "select_based_umin",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v0 = select i1 %cmp0, i32 %x, i32 %y\n  %v1 = add nuw i32 %x, 1\n  %cmp1 = icmp ult i32 %v1, %y\n  %v2 = select i1 %cmp1, i32 %v1, i32 %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp0 = icmp ult i32 %x, %y\n  %v0 = select i1 %cmp0, i32 %x, i32 %y\n  %v1 = add nuw i32 %x, 1\n  %cmp1 = icmp ult i32 %v1, %y\n  %v2 = select i1 %cmp1, i32 %v1, i32 %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp0 = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp0 to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp0 = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8_type",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %v0 = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %v1 = add nuw i8 %x, 1\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 %y)\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\ndeclare i8 @llvm.umin.i8(i8, i8)",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %v0 = umin i8 %x, %y\n  %v1 = add nuw i8 %x, 1\n  %v2 = umin i8 %v1, %y\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %v0 = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %v1 = add nuw i8 %x, 1\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 %y)\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i8 @test(i8 %x, i8 %y) {\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %v0 = umin i8 %x, %y\n  %v1 = add nuw i8 %x, 1\n  %v2 = umin i8 %v1, %y\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i8 @test(i8 %x, i8 %y) {\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i8 @test(i8 %x, i8 %y) {\n  %v0 = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %v1 = add nuw i8 %x, 1\n  %v2 = call i8 @llvm.umin.i8(i8 %v1, i8 %y)\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %cmp = icmp ult i8 %x, %y\n  %v3 = zext i1 %cmp to i8\n  ret i8 %v3\n}\n=>\ndefine i8 @test(i8 %x, i8 %y) {\n#0:\n  %v0 = umin i8 %x, %y\n  %v1 = add nuw i8 %x, 1\n  %v2 = umin i8 %v1, %y\n  %v3 = sub i8 %v2, %v0\n  ret i8 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni8 %x = #xff (255, -1)\ni8 %y = #x03 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni8 %v3 = #x00 (0)\n\nTarget:\ni8 %v0 = #x03 (3)\ni8 %v1 = poison\ni8 %v2 = poison\ni8 %v3 = poison\nSource value: #x00 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i64_type",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %v0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %v1 = add nuw i64 %x, 1\n  %v2 = call i64 @llvm.umin.i64(i64 %v1, i64 %y)\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\ndeclare i64 @llvm.umin.i64(i64, i64)",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %v0 = umin i64 %x, %y\n  %v1 = add nuw i64 %x, 1\n  %v2 = umin i64 %v1, %y\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %v0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %v1 = add nuw i64 %x, 1\n  %v2 = call i64 @llvm.umin.i64(i64 %v1, i64 %y)\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i64 @test(i64 %x, i64 %y) {\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %v0 = umin i64 %x, %y\n  %v1 = add nuw i64 %x, 1\n  %v2 = umin i64 %v1, %y\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i64 @test(i64 %x, i64 %y) {\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i64 @test(i64 %x, i64 %y) {\n  %v0 = call i64 @llvm.umin.i64(i64 %x, i64 %y)\n  %v1 = add nuw i64 %x, 1\n  %v2 = call i64 @llvm.umin.i64(i64 %v1, i64 %y)\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %cmp = icmp ult i64 %x, %y\n  %v3 = zext i1 %cmp to i64\n  ret i64 %v3\n}\n=>\ndefine i64 @test(i64 %x, i64 %y) {\n#0:\n  %v0 = umin i64 %x, %y\n  %v1 = add nuw i64 %x, 1\n  %v2 = umin i64 %v1, %y\n  %v3 = sub i64 %v2, %v0\n  ret i64 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni64 %x = #xffffffffffffffff (18446744073709551615, -1)\ni64 %y = #x0000000000000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni64 %v3 = #x0000000000000000 (0)\n\nTarget:\ni64 %v0 = #x0000000000000003 (3)\ni64 %v1 = poison\ni64 %v2 = poison\ni64 %v3 = poison\nSource value: #x0000000000000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_i32x4",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %v0 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %x, <4 x i32> %y)\n  %v1 = add nuw <4 x i32> %x, <i32 1, i32 1, i32 1, i32 1>\n  %v2 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %v1, <4 x i32> %y)\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\ndeclare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %v0 = umin <4 x i32> %x, %y\n  %v1 = add nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %v2 = umin <4 x i32> %v1, %y\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %v0 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %x, <4 x i32> %y)\n  %v1 = add nuw <4 x i32> %x, splat (i32 1)\n  %v2 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %v1, <4 x i32> %y)\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %v0 = umin <4 x i32> %x, %y\n  %v1 = add nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %v2 = umin <4 x i32> %v1, %y\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n  %v0 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %x, <4 x i32> %y)\n  %v1 = add nuw <4 x i32> %x, splat (i32 1)\n  %v2 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %v1, <4 x i32> %y)\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %cmp = icmp ult <4 x i32> %x, %y\n  %v3 = zext <4 x i1> %cmp to <4 x i32>\n  ret <4 x i32> %v3\n}\n=>\ndefine <4 x i32> @test(<4 x i32> %x, <4 x i32> %y) {\n#0:\n  %v0 = umin <4 x i32> %x, %y\n  %v1 = add nuw <4 x i32> %x, { 1, 1, 1, 1 }\n  %v2 = umin <4 x i32> %v1, %y\n  %v3 = sub <4 x i32> %v2, %v0\n  ret <4 x i32> %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i32> %x = < #x00000000 (0), #xffffffff (4294967295, -1), #x00000000 (0), #x00000000 (0) >\n<4 x i32> %y = < #x00000003 (3), #x00000003 (3), #x00000003 (3), #x00000003 (3) >\n\nSource:\n<4 x i1> %cmp = < #x1 (1), #x0 (0), #x1 (1), #x1 (1) >\n<4 x i32> %v3 = < #x00000001 (1), #x00000000 (0), #x00000001 (1), #x00000001 (1) >\n\nTarget:\n<4 x i32> %v0 = < #x00000000 (0), #x00000003 (3), #x00000000 (0), #x00000000 (0) >\n<4 x i32> %v1 = < #x00000001 (1), poison, #x00000001 (1), #x00000001 (1) >\n<4 x i32> %v2 = < #x00000001 (1), poison, #x00000001 (1), #x00000001 (1) >\n<4 x i32> %v3 = < #x00000001 (1), poison, #x00000001 (1), #x00000001 (1) >\nSource value: < #x00000001 (1), #x00000000 (0), #x00000001 (1), #x00000001 (1) >\nTarget value: < #x00000001 (1), poison, #x00000001 (1), #x00000001 (1) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_noise_xor_zero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %x0 = xor i32 %x, 0\n  %v0 = call i32 @llvm.umin.i32(i32 %x0, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %x0 = xor i32 %x, 0\n  %v0 = umin i32 %x0, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_noise_and_allones",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %y0 = and i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y0)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %y0 = and i32 %y, 4294967295\n  %v2 = umin i32 %v1, %y0\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "without_nuw_no_fold",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "wrong_constant_no_fold",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 2\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 2\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multiple_use_no_fold",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 9,
+        "current_opt": 9,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 9\n",
+        "current_opt_log": "Cost: 9\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i32 @test(i32 %x, i32 %y, i32* %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, i32* %ptr\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, ptr %ptr) {\n#0:\n  %v0 = umin i32 %x, %y\n  store i32 %v0, ptr %ptr, align 4\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umin_sub_nuw_x",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = sub nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v0 = umin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add i32 %x, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add i32 %x, 4294967295\n  %v2 = umin i32 %v1, %y\n  %v0 = umin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %v1 = #xffffffff (4294967295, -1)\ni32 %v2 = #x00000000 (0)\ni32 %v0 = #x00000000 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\nSource value: #x00000000 (0)\nTarget value: #x00000001 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add i32 %x, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ule i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add i32 %x, 4294967295\n  %v2 = umin i32 %v1, %y\n  %v0 = umin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\n\nTarget:\ni32 %v1 = #xffffffff (4294967295, -1)\ni32 %v2 = #x00000000 (0)\ni32 %v0 = #x00000000 (0)\ni32 %v3 = #x00000000 (0)\nSource value: #x00000001 (1)\nTarget value: #x00000000 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "umin_sub_nuw_y",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = sub nuw i32 %y, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = sub nuw i32 %y, 1\n  %v2 = umin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %y, 4294967295\n  %v2 = umin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %v0 = #x00000000 (0)\ni32 %v1 = #xffffffff (4294967295, -1)\ni32 %v2 = #x00000000 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\nSource value: #x00000000 (0)\nTarget value: #x00000001 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp uge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add i32 %y, 4294967295\n  %v2 = umin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\n\nTarget:\ni32 %v0 = #x00000000 (0)\ni32 %v1 = #xffffffff (4294967295, -1)\ni32 %v2 = #x00000000 (0)\ni32 %v3 = #x00000000 (0)\nSource value: #x00000001 (1)\nTarget value: #x00000000 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "smin_add_nsw",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = add nsw i32 %x, 1\n  %v2 = smin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = add nsw i32 %x, 1\n  %v2 = smin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp slt i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = add nsw i32 %x, 1\n  %v2 = smin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x7fffffff (2147483647)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "smin_sub_nsw_x",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nsw i32 %x, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = sub nsw i32 %x, 1\n  %v2 = smin i32 %v1, %y\n  %v0 = smin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add nsw i32 %x, -1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add nsw i32 %x, 4294967295\n  %v2 = smin i32 %v1, %y\n  %v0 = smin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add nsw i32 %x, -1\n  %v2 = call i32 @llvm.smin.i32(i32 %v1, i32 %y)\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sle i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add nsw i32 %x, 4294967295\n  %v2 = smin i32 %v1, %y\n  %v0 = smin i32 %x, %y\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x80000000 (2147483648, -2147483648)\ni32 %y = #x00000003 (3)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\n\nTarget:\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v0 = #x80000000 (2147483648, -2147483648)\ni32 %v3 = poison\nSource value: #x00000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "smin_sub_nsw_y",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = sub nsw i32 %y, 1\n  %v2 = call i32 @llvm.smin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\ndeclare i32 @llvm.smin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = sub nsw i32 %y, 1\n  %v2 = smin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %y, -1\n  %v2 = call i32 @llvm.smin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = add nsw i32 %y, 4294967295\n  %v2 = smin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %v1 = add nsw i32 %y, -1\n  %v2 = call i32 @llvm.smin.i32(i32 %x, i32 %v1)\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp sge i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = smin i32 %x, %y\n  %v1 = add nsw i32 %y, 4294967295\n  %v2 = smin i32 %x, %v1\n  %v3 = sub i32 %v0, %v2\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %x = #x00000003 (3)\ni32 %y = #x80000000 (2147483648, -2147483648)\n\nSource:\ni1 %cmp = #x1 (1)\ni32 %v3 = #x00000001 (1)\n\nTarget:\ni32 %v0 = #x80000000 (2147483648, -2147483648)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sub_nsw_flag_preserved",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub nsw i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000000 (0)\n\nSource:\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %v0 = #x00000000 (0)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "identity_umin_add_sub_both",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %v1 = sub nuw i32 %y, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = add nuw i32 %x, 1\n  %v4 = call i32 @llvm.umin.i32(i32 %v3, i32 %y)\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  ret i32 1\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = sub nuw i32 %y, 1\n  %v2 = umin i32 %x, %v1\n  %v3 = add nuw i32 %x, 1\n  %v4 = umin i32 %v3, %y\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  ret i32 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = add nuw i32 %x, 1\n  %v4 = call i32 @llvm.umin.i32(i32 %v3, i32 %y)\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  ret i32 1\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add i32 %y, 4294967295\n  %v2 = umin i32 %x, %v1\n  %v3 = add nuw i32 %x, 1\n  %v4 = umin i32 %v3, %y\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  ret i32 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000000 (0)\n\nSource:\ni32 %v1 = #xffffffff (4294967295, -1)\ni32 %v2 = #x00000000 (0)\ni32 %v3 = #x00000001 (1)\ni32 %v4 = #x00000000 (0)\ni32 %v5 = #x00000000 (0)\n\nTarget:\nSource value: #x00000000 (0)\nTarget value: #x00000001 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  ret i32 1\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %v1 = add i32 %y, -1\n  %v2 = call i32 @llvm.umin.i32(i32 %x, i32 %v1)\n  %v3 = add nuw i32 %x, 1\n  %v4 = call i32 @llvm.umin.i32(i32 %v3, i32 %y)\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  ret i32 1\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %v1 = add i32 %y, 4294967295\n  %v2 = umin i32 %x, %v1\n  %v3 = add nuw i32 %x, 1\n  %v4 = umin i32 %v3, %y\n  %v5 = sub i32 %v4, %v2\n  ret i32 %v5\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %y = #x00000003 (3)\n\nSource:\n\nTarget:\ni32 %v1 = #x00000002 (2)\ni32 %v2 = #x00000002 (2)\ni32 %v3 = poison\ni32 %v4 = poison\ni32 %v5 = poison\nSource value: #x00000001 (1)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "boundary_x_max",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)\ndeclare i32 @llvm.umax.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %v1 = add nuw i32 %x, 1\n  %1 = call i32 @llvm.usub.sat.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 0, %1\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %v1 = add nuw i32 %x, 1\n  %#1 = usub_sat i32 %y, %v1\n  %v3 = sub i32 0, %#1\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %y) {\n  %x = call i32 @llvm.umax.i32(i32 %y, i32 2147483647)\n  %v1 = add nuw i32 %x, 1\n  %1 = call i32 @llvm.usub.sat.i32(i32 %y, i32 %v1)\n  %v3 = sub i32 0, %1\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %cmp = icmp ult i32 %x, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %y) {\n#0:\n  %x = umax i32 %y, 2147483647\n  %v1 = add nuw i32 %x, 1\n  %#1 = usub_sat i32 %y, %v1\n  %v3 = sub i32 0, %#1\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nNOTE: The counterexample is unique.\n\nExample:\ni32 %y = #xffffffff (4294967295, -1)\n\nSource:\ni32 %x = #xffffffff (4294967295, -1)\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %x = #xffffffff (4294967295, -1)\ni32 %v1 = poison\ni32 %#1 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "boundary_y_zero",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 3,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "ok": true,
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "freeze_operand",
+      "missed_optimization": false,
+      "cost": {
+        "expected": 4,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %v0 = call i32 @llvm.umin.i32(i32 %xf, i32 %y)\n  %v1 = add nuw i32 %xf, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %v0 = umin i32 %xf, %y\n  %v1 = add nuw i32 %xf, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %v0 = call i32 @llvm.umin.i32(i32 %xf, i32 %y)\n  %v1 = add nuw i32 %xf, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %v0 = umin i32 %xf, %y\n  %v1 = add nuw i32 %xf, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y) {\n  %xf = freeze i32 %x\n  %v0 = call i32 @llvm.umin.i32(i32 %xf, i32 %y)\n  %v1 = add nuw i32 %xf, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %cmp = icmp ult i32 %xf, %y\n  %v3 = zext i1 %cmp to i32\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y) {\n#0:\n  %xf = freeze i32 %x\n  %v0 = umin i32 %xf, %y\n  %v1 = add nuw i32 %xf, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni32 %x = poison\ni32 %y = #x00000003 (3)\n\nSource:\ni32 %xf = #x00000003 (3)\ni1 %cmp = #x0 (0)\ni32 %v3 = #x00000000 (0)\n\nTarget:\ni32 %xf = #xffffffff (4294967295, -1)\ni32 %v0 = #x00000003 (3)\ni32 %v1 = poison\ni32 %v2 = poison\ni32 %v3 = poison\nSource value: #x00000000 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_test_different_operands",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %z, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %y)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %z, 1\n  %v2 = umin i32 %v1, %y\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_test_different_second_operand",
+      "missed_optimization": true,
+      "cost": {
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "ok": true,
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\ndeclare i32 @llvm.umin.i32(i32, i32)",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n  %v0 = call i32 @llvm.umin.i32(i32 %x, i32 %y)\n  %v1 = add nuw i32 %x, 1\n  %v2 = call i32 @llvm.umin.i32(i32 %v1, i32 %z)\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\n=>\ndefine i32 @test(i32 %x, i32 %y, i32 %z) {\n#0:\n  %v0 = umin i32 %x, %y\n  %v1 = add nuw i32 %x, 1\n  %v2 = umin i32 %v1, %z\n  %v3 = sub i32 %v2, %v0\n  ret i32 %v3\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.1s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

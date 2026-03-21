@@ -1,0 +1,382 @@
+{
+  "issue_id": "85823",
+  "dataset_file": "85823.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @and_mask4(i32 %conv) {\nentry:\n  %and = and i32 %conv, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %conv, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n\ndefine i1 @and_mask4(i32 %conv) {\nentry:\n  %and = and i32 %conv, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Optimization of bitwise mask comparisons dominated by a condition on the same value. Specifically, if a block is reached based on a mask check (e.g., `(x & M1) != 0`), subsequent checks in that block (e.g., `(x & M2) == 0`) can be folded to constants if the masks satisfy a subset/superset relationship.\",\n  \"before_after\": \"Before:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %T, label %F\\nF:\\n  %and1 = and i32 %x, 7\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\nAfter:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %T, label %F\\nF:\\n  ret i1 false\",\n  \"preconditions\": \"1. The current block must have a single predecessor that terminates in a conditional branch.\\n2. The branch condition must be an `icmp` of the form `(Op & Mask1) pred 0`.\\n3. The instruction to be simplified must be an `icmp` of the form `(Op & Mask2) pred 0`.\\n4. The `Op` value must be the same in both checks (modulo bitcasts/noise).\\n5. The masks (Mask1, Mask2) must be constants.\\n6. Logical implication must hold based on the predecessor edge taken and the masks involved.\",\n  \"pattern\": \"Given:\\n  Edge `E` from `Pred` to `Curr`.\\n  `Pred` terminator: `br i1 (icmp PredType (and X, M1), 0), ...`\\n  `Curr` instruction: `icmp TargetType (and X, M2), 0`\\n\\nIf `E` is the False edge:\\n  We know `(X & M1) != 0`.\\n  If `(M1 & M2) != 0`, then `(X & M2)` must be non-zero.\\n    -> `icmp eq (and X, M2), 0` folds to `false`.\\n    -> `icmp ne (and X, M2), 0` folds to `true`.\\n\\nIf `E` is the True edge:\\n  We know `(X & M1) == 0`.\\n  If `(M1 & M2) == M2` (M2 is a subset of M1), then `(X & M2)` must be zero.\\n    -> `icmp eq (and X, M2), 0` folds to `true`.\\n    -> `icmp ne (and X, M2), 0` folds to `false`.\",\n  \"testcases\": [\n    {\n      \"name\": \"Original_Mask4_vs_Mask7\",\n      \"ir\": \"define i1 @test(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  %and1 = and i32 %x, 7\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"why\": \"If (x & 4) != 0 in else, then (x & 7) cannot be 0 because 4 is a subset of 7.\"\n    },\n    {\n      \"name\": \"I8_Subset_Check\",\n      \"ir\": \"define i1 @test_i8(i8 %x) {\\nentry:\\n  %and = and i8 %x, 16\\n  %cmp = icmp ne i8 %and, 0\\n  br i1 %cmp, label %taken, label %untaken\\n\\ntaken:\\n  %and1 = and i8 %x, 31\\n  %cmp1 = icmp eq i8 %and1, 0\\n  ret i1 %cmp1\\n\\nuntaken:\\n  ret i1 true\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_i8(i8 %x) {\\nentry:\\n  %and = and i8 %x, 16\\n  %cmp = icmp ne i8 %and, 0\\n  br i1 %cmp, label %taken, label %untaken\\n\\ntaken:\\n  ret i1 false\\n\\nuntaken:\\n  ret i1 true\\n}\",\n      \"why\": \"16 (0b10000) is subset of 31 (0b11111). In taken block, bit 4 is set, so (x & 31) != 0.\"\n    },\n    {\n      \"name\": \"Vector_Mask_Simple\",\n      \"ir\": \"define <4 x i1> @test_vec(<4 x i32> %x) {\\nentry:\\n  %and = and <4 x i32> %x, <i32 1, i32 2, i32 4, i32 8>\\n  %cmp = icmp eq <4 x i32> %and, zeroinitializer\\n  %sel = select <4 x i1> %cmp, <4 x i1> zeroinitializer, <4 x i1> %cmp2\\n  ret <4 x i1> %sel\\n\\nfalse_block:\\n  %and2 = and <4 x i32> %x, <i32 1, i32 3, i32 4, i32 15>\\n  %cmp2 = icmp ne <4 x i32> %and2, zeroinitializer\\n  ret <4 x i1> %cmp2\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test_vec(<4 x i32> %x) {\\nentry:\\n  %and = and <4 x i32> %x, <i32 1, i32 2, i32 4, i32 8>\\n  %cmp = icmp eq <4 x i32> %and, zeroinitializer\\n  %sel = select <4 x i1> %cmp, <4 x i1> zeroinitializer, <4 x i1> <i1 true, i1 true, i1 true, i1 true>\\n  ret <4 x i1> %sel\\n}\",\n      \"why\": \"Vector equivalent of the scalar case. In false path (select false arm), we know specific bits are set. The masks in false_block are supersets of entry masks, so result is true.\"\n    },\n    {\n      \"name\": \"True_Branch_Superset\",\n      \"ir\": \"define i1 @test_true(i32 %x) {\\nentry:\\n  %and = and i32 %x, 7\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  %and1 = and i32 %x, 4\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_true(i32 %x) {\\nentry:\\n  %and = and i32 %x, 7\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 true\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"why\": \"In then, (x & 7) == 0. 4 is subset of 7, so (x & 4) must be 0.\"\n    },\n    {\n      \"name\": \"Disjoint_Masks_No_Fold\",\n      \"ir\": \"define i1 @test_no_fold(i32 %x) {\\nentry:\\n  %and = and i32 %x, 1\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %else, label %then\\n\\nelse:\\n  %and1 = and i32 %x, 2\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n\\nthen:\\n  ret i1 true\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_no_fold(i32 %x) {\\nentry:\\n  %and = and i32 %x, 1\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %else, label %then\\n\\nelse:\\n  %and1 = and i32 %x, 2\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n\\nthen:\\n  ret i1 true\\n}\",\n      \"why\": \"Masks 1 and 2 are disjoint. Knowing bit 0 is set gives no info about bit 1.\"\n    },\n    {\n      \"name\": \"Commutative_And\",\n      \"ir\": \"define i1 @test_commute(i32 %x) {\\nentry:\\n  %and = and i32 4, %x\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  %and1 = and i32 %x, 7\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_commute(i32 %x) {\\nentry:\\n  %and = and i32 4, %x\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"why\": \"AND is commutative. Pattern matching should handle swapped operands.\"\n    },\n    {\n      \"name\": \"Noise_Operations\",\n      \"ir\": \"define i1 @test_noise(i32 %x) {\\nentry:\\n  %add = add i32 %x, 0\\n  %and = and i32 %add, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  %xor = xor i32 %x, 0\\n  %and1 = and i32 %xor, 7\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_noise(i32 %x) {\\nentry:\\n  %add = add i32 %x, 0\\n  %and = and i32 %add, 4\\n  %cmp = icmp eq i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"why\": \"Xor 0 and Add 0 are no-ops and should be looked through.\"\n    },\n    {\n      \"name\": \"True_Branch_NE_Check\",\n      \"ir\": \"define i1 @test_ne(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  %and1 = and i32 %x, 4\\n  %cmp1 = icmp ne i32 %and1, 0\\n  ret i1 %cmp1\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_ne(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ret i1 true\\n\\nelse:\\n  ret i1 false\\n}\",\n      \"why\": \"If (x & 4) != 0 is true to enter, then checking (x & 4) != 0 again is trivially true.\"\n    },\n    {\n      \"name\": \"Select_Based\",\n      \"ir\": \"define i1 @test_select(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  %and1 = and i32 %x, 7\\n  %cmp1 = icmp eq i32 %and1, 0\\n  %sel = select i1 %cmp, i1 false, i1 %cmp1\\n  ret i1 %sel\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_select(i32 %x) {\\nentry:\\n  %and = and i32 %x, 4\\n  %cmp = icmp eq i32 %and, 0\\n  %sel = select i1 %cmp, i1 false, i1 false\\n  ret i1 %sel\\n}\",\n      \"why\": \"The logic holds for select as well. If %cmp is false, %cmp1 is false.\"\n    },\n    {\n      \"name\": \"Partial_Overlap_No_Fold\",\n      \"ir\": \"define i1 @test_partial(i32 %x) {\\nentry:\\n  %and = and i32 %x, 6\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %else, label %then\\n\\nelse:\\n  %and1 = and i32 %x, 5\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n\\nthen:\\n  ret i1 true\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_partial(i32 %x) {\\nentry:\\n  %and = and i32 %x, 6\\n  %cmp = icmp ne i32 %and, 0\\n  br i1 %cmp, label %else, label %then\\n\\nelse:\\n  %and1 = and i32 %x, 5\\n  %cmp1 = icmp eq i32 %and1, 0\\n  ret i1 %cmp1\\n\\nthen:\\n  ret i1 true\\n}\",\n      \"why\": \"Masks 6 (110) and 5 (101). Overlap is 4 (100). If bit 2 is set, we know (x&5)!=0. If only bit 1 is set, (x&5)==0. Cannot fold.\"\n    }\n  ],\n  \"implementation_notes\": \"Implementation should likely reside in InstCombine's visitICmpInst or visitSelectInst. \\n1. When visiting an ICMP, check if the parent block has a single predecessor.\\n2. If so, get the predecessor's terminator. If it is a conditional branch, get the condition.\\n3. Verify the branch condition is an ICMP involving an AND with a constant mask.\\n4. Verify the current ICMP involves an AND with a constant mask on the same operand.\\n5. Determine which successor edge we are on (True/False).\\n6. Apply the subset/superset logic:\\n   - False Edge (Cond is False): Implies (X & M1) != 0. \\n     - If (M1 & M2) != 0, then (X & M2) != 0. \\n   - True Edge (Cond is True): Implies (X & M1) == 0.\\n     - If (M1 & M2) == M2, then (X & M2) == 0.\\n7. If implication matches the current ICMP predicate, replace with constant; if contradicts, replace with opposite constant.\",\n  \"regression_test_notes\": \"Tests should be added to llvm/test/Transforms/InstCombine/icmp-mask.ll or similar. \\nUse 'opt -instcombine -S' to verify. \\nEnsure FileCheck checks for the specific constant returns and verifies that the 'and' instructions are not removed if they are still needed for the branch condition itself.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Optimization of bitwise mask comparisons dominated by a condition on the same value. Specifically, if a block is reached based on a mask check (e.g., `(x & M1) != 0`), subsequent checks in that block (e.g., `(x & M2) == 0`) can be folded to constants if the masks satisfy a subset/superset relationship.",
+    "before_after": "Before:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %T, label %F\nF:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\nAfter:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %T, label %F\nF:\n  ret i1 false",
+    "preconditions": "1. The current block must have a single predecessor that terminates in a conditional branch.\n2. The branch condition must be an `icmp` of the form `(Op & Mask1) pred 0`.\n3. The instruction to be simplified must be an `icmp` of the form `(Op & Mask2) pred 0`.\n4. The `Op` value must be the same in both checks (modulo bitcasts/noise).\n5. The masks (Mask1, Mask2) must be constants.\n6. Logical implication must hold based on the predecessor edge taken and the masks involved.",
+    "pattern": "Given:\n  Edge `E` from `Pred` to `Curr`.\n  `Pred` terminator: `br i1 (icmp PredType (and X, M1), 0), ...`\n  `Curr` instruction: `icmp TargetType (and X, M2), 0`\n\nIf `E` is the False edge:\n  We know `(X & M1) != 0`.\n  If `(M1 & M2) != 0`, then `(X & M2)` must be non-zero.\n    -> `icmp eq (and X, M2), 0` folds to `false`.\n    -> `icmp ne (and X, M2), 0` folds to `true`.\n\nIf `E` is the True edge:\n  We know `(X & M1) == 0`.\n  If `(M1 & M2) == M2` (M2 is a subset of M1), then `(X & M2)` must be zero.\n    -> `icmp eq (and X, M2), 0` folds to `true`.\n    -> `icmp ne (and X, M2), 0` folds to `false`.",
+    "testcases": [
+      {
+        "name": "Original_Mask4_vs_Mask7",
+        "ir": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+        "why": "If (x & 4) != 0 in else, then (x & 7) cannot be 0 because 4 is a subset of 7."
+      },
+      {
+        "name": "I8_Subset_Check",
+        "ir": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:\n  ret i1 true\n}",
+        "expected_optimized_ir": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  ret i1 false\n\nuntaken:\n  ret i1 true\n}",
+        "why": "16 (0b10000) is subset of 31 (0b11111). In taken block, bit 4 is set, so (x & 31) != 0."
+      },
+      {
+        "name": "Vector_Mask_Simple",
+        "ir": "define <4 x i1> @test_vec(<4 x i32> %x) {\nentry:\n  %and = and <4 x i32> %x, <i32 1, i32 2, i32 4, i32 8>\n  %cmp = icmp eq <4 x i32> %and, zeroinitializer\n  %sel = select <4 x i1> %cmp, <4 x i1> zeroinitializer, <4 x i1> %cmp2\n  ret <4 x i1> %sel\n\nfalse_block:\n  %and2 = and <4 x i32> %x, <i32 1, i32 3, i32 4, i32 15>\n  %cmp2 = icmp ne <4 x i32> %and2, zeroinitializer\n  ret <4 x i1> %cmp2\n}",
+        "expected_optimized_ir": "define <4 x i1> @test_vec(<4 x i32> %x) {\nentry:\n  %and = and <4 x i32> %x, <i32 1, i32 2, i32 4, i32 8>\n  %cmp = icmp eq <4 x i32> %and, zeroinitializer\n  %sel = select <4 x i1> %cmp, <4 x i1> zeroinitializer, <4 x i1> <i1 true, i1 true, i1 true, i1 true>\n  ret <4 x i1> %sel\n}",
+        "why": "Vector equivalent of the scalar case. In false path (select false arm), we know specific bits are set. The masks in false_block are supersets of entry masks, so result is true."
+      },
+      {
+        "name": "True_Branch_Superset",
+        "ir": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nelse:\n  ret i1 false\n}",
+        "expected_optimized_ir": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+        "why": "In then, (x & 7) == 0. 4 is subset of 7, so (x & 4) must be 0."
+      },
+      {
+        "name": "Disjoint_Masks_No_Fold",
+        "ir": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+        "expected_optimized_ir": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+        "why": "Masks 1 and 2 are disjoint. Knowing bit 0 is set gives no info about bit 1."
+      },
+      {
+        "name": "Commutative_And",
+        "ir": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+        "expected_optimized_ir": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+        "why": "AND is commutative. Pattern matching should handle swapped operands."
+      },
+      {
+        "name": "Noise_Operations",
+        "ir": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %xor = xor i32 %x, 0\n  %and1 = and i32 %xor, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+        "expected_optimized_ir": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+        "why": "Xor 0 and Add 0 are no-ops and should be looked through."
+      },
+      {
+        "name": "True_Branch_NE_Check",
+        "ir": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp ne i32 %and1, 0\n  ret i1 %cmp1\n\nelse:\n  ret i1 false\n}",
+        "expected_optimized_ir": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+        "why": "If (x & 4) != 0 is true to enter, then checking (x & 4) != 0 again is trivially true."
+      },
+      {
+        "name": "Select_Based",
+        "ir": "define i1 @test_select(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  %sel = select i1 %cmp, i1 false, i1 %cmp1\n  ret i1 %sel\n}",
+        "expected_optimized_ir": "define i1 @test_select(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  %sel = select i1 %cmp, i1 false, i1 false\n  ret i1 %sel\n}",
+        "why": "The logic holds for select as well. If %cmp is false, %cmp1 is false."
+      },
+      {
+        "name": "Partial_Overlap_No_Fold",
+        "ir": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+        "expected_optimized_ir": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+        "why": "Masks 6 (110) and 5 (101). Overlap is 4 (100). If bit 2 is set, we know (x&5)!=0. If only bit 1 is set, (x&5)==0. Cannot fold."
+      }
+    ],
+    "implementation_notes": "Implementation should likely reside in InstCombine's visitICmpInst or visitSelectInst. \n1. When visiting an ICMP, check if the parent block has a single predecessor.\n2. If so, get the predecessor's terminator. If it is a conditional branch, get the condition.\n3. Verify the branch condition is an ICMP involving an AND with a constant mask.\n4. Verify the current ICMP involves an AND with a constant mask on the same operand.\n5. Determine which successor edge we are on (True/False).\n6. Apply the subset/superset logic:\n   - False Edge (Cond is False): Implies (X & M1) != 0. \n     - If (M1 & M2) != 0, then (X & M2) != 0. \n   - True Edge (Cond is True): Implies (X & M1) == 0.\n     - If (M1 & M2) == M2, then (X & M2) == 0.\n7. If implication matches the current ICMP predicate, replace with constant; if contradicts, replace with opposite constant.",
+    "regression_test_notes": "Tests should be added to llvm/test/Transforms/InstCombine/icmp-mask.ll or similar. \nUse 'opt -instcombine -S' to verify. \nEnsure FileCheck checks for the specific constant returns and verifies that the 'and' instructions are not removed if they are still needed for the branch condition itself.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "Original_Mask4_vs_Mask7",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+          "tgt": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "tgt": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "I8_Subset_Check",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:\n  ret i1 true\n}",
+          "tgt": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  ret i1 false\n\nuntaken:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\nuntaken:\n  ret i1 1\n\ntaken:\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\nuntaken:\n  ret i1 1\n\ntaken:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp.not = icmp eq i8 %and, 0\n  br i1 %cmp.not, label %untaken, label %taken\n\ntaken:                                            ; preds = %entry\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:                                          ; preds = %entry\n  ret i1 true\n}\n",
+          "tgt": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  ret i1 false\n\nuntaken:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp.not = icmp eq i8 %and, 0\n  br i1 %cmp.not, label %untaken, label %taken\n\ntaken:\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:\n  ret i1 1\n}\n=>\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\nuntaken:\n  ret i1 1\n\ntaken:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\ntaken:\n  ret i1 false\n\nuntaken:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp.not = icmp eq i8 %and, 0\n  br i1 %cmp.not, label %untaken, label %taken\n\ntaken:                                            ; preds = %entry\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:                                          ; preds = %entry\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp = icmp ne i8 %and, 0\n  br i1 %cmp, label %taken, label %untaken\n\nuntaken:\n  ret i1 1\n\ntaken:\n  ret i1 0\n}\n=>\ndefine i1 @test_i8(i8 %x) {\nentry:\n  %and = and i8 %x, 16\n  %cmp.not = icmp eq i8 %and, 0\n  br i1 %cmp.not, label %untaken, label %taken\n\ntaken:\n  %and1 = and i8 %x, 31\n  %cmp1 = icmp eq i8 %and1, 0\n  ret i1 %cmp1\n\nuntaken:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Vector_Mask_Simple",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "True_Branch_Superset",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nelse:\n  ret i1 false\n}",
+          "tgt": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 true\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\n=>\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 true\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\n=>\ndefine i1 @test_true(i32 %x) {\nentry:\n  %and = and i32 %x, 7\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Disjoint_Masks_No_Fold",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "tgt": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:                                             ; preds = %entry\n  ret i1 true\n}\n",
+          "tgt": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 1\n}\n=>\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:                                             ; preds = %entry\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_no_fold(i32 %x) {\nentry:\n  %and = and i32 %x, 1\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 2\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Commutative_And",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+          "tgt": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "tgt": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 4, %x\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_commute(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Noise_Operations",
+      "missed_optimization": true,
+      "cost": {
+        "source": 9,
+        "expected": 6,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  %xor = xor i32 %x, 0\n  %and1 = and i32 %xor, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}",
+          "tgt": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %xor = xor i32 %x, 0\n  %and1 = and i32 %xor, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "tgt": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %add = add i32 %x, 0\n  %and = and i32 %add, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @test_noise(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp eq i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 7\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "True_Branch_NE_Check",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp ne i32 %and1, 0\n  ret i1 %cmp1\n\nelse:\n  ret i1 false\n}",
+          "tgt": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %and1 = and i32 %x, 4\n  %cmp1 = icmp ne i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  ret i1 true\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  ret i1 true\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\n=>\ndefine i1 @test_ne(i32 %x) {\nentry:\n  %and = and i32 %x, 4\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "Select_Based",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 4,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "Partial_Overlap_No_Fold",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "tgt": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:                                             ; preds = %entry\n  ret i1 true\n}\n",
+          "tgt": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 1\n}\n=>\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 true\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:                                             ; preds = %entry\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp = icmp ne i32 %and, 0\n  br i1 %cmp, label %else, label %then\n\nthen:\n  ret i1 1\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n}\n=>\ndefine i1 @test_partial(i32 %x) {\nentry:\n  %and = and i32 %x, 6\n  %cmp.not = icmp eq i32 %and, 0\n  br i1 %cmp.not, label %then, label %else\n\nelse:\n  %and1 = and i32 %x, 5\n  %cmp1 = icmp eq i32 %and1, 0\n  ret i1 %cmp1\n\nthen:\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

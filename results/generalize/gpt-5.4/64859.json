@@ -1,0 +1,1405 @@
+{
+  "issue_id": "64859",
+  "dataset_file": "64859.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue was one very specific boolean-arithmetic compare:  \n`icmp eq (add (zext i1 %a), (zext i1 %b)), 1`, i.e. “exactly one of two booleans is true”. That sum can only be `{0,1,2}`, so comparing it to `1` is just `xor %a, %b`. The bug/opportunity was that InstCombine only handled narrow ad hoc cases and missed the broader “sum of boolean extends compared to a constant” family.\n\nThe patch lifts this into a generic optimization inside `foldICmpAddConstant()`. It matches:\n- `icmp Pred (add Ext0(Op0), Ext1(Op1)), C`\n- where `Ext0/Ext1` are `zext` or `sext`\n- and `Op0/Op1` are `i1` (or `<N x i1>`).  \n\nIt then evaluates the compare for the 4 input combinations `(0,0),(0,1),(1,0),(1,1)`, forming a 4-bit truth table. `createLogicFromTable()` maps that table to a minimal boolean expression (`false/true`, operand passthrough, `and/or/xor/not`, and one-use-only forms like `~(x|y)`, `x&~y`, etc.). This generalizes beyond the old special-case code in `foldICmpUsingBoolRange()` and supports all compare predicates uniformly.\n\n`dev_tests` broaden coverage from the single motivating `zext+zext == 1` case to:\n- all extend combinations: `zext+zext`, `sext+sext`, `zext+sext`, `sext+zext`\n- many predicates: `eq/ne`, signed/unsigned `<,<=,>,>=`\n- constants across the reachable ranges and outside them: `-2,-1,0,1,2`\n- commuted add operands\n- one-use vs extra-use cases (to gate transforms requiring new negations)\n- non-direct producer shapes (load/store path in `test_cvt_icmp1`)\n- vector-capable matching via `i1`/`int-or-int-vector-ty(1)` support.  \n\nThis is a good template for turning one boolean-range fold into a truth-table-driven InstCombine rule.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %i = zext i1 %arg to i32\r\n  %i2 = zext i1 %arg1 to i32\r\n  %i3 = add nuw nsw i32 %i2, %i\r\n  %i4 = icmp eq i32 %i3, 1\r\n  ret i1 %i4\r\n}\n\ndefine i1 @test(i1 %arg, i1 %arg1) {\r\nbb:\r\n  %xor = xor i1 %arg, %arg1\r\n  ret i1 %xor\r\n}\n",
+  "model_output": "{\"pattern\":{\"summary\":\"Fold comparisons of an add of two boolean extends into a pure boolean expression.\",\"match\":\"icmp Pred Ty (add (Ext0 i1|<N x i1> X to Ty), (Ext1 i1|<N x i1> Y to Ty)), C\",\"conditions\":[\"Ext0 and Ext1 are integer extends from i1 or <N x i1>: zext or sext.\",\"The add may have flags such as nuw/nsw; they are irrelevant to correctness of the fold.\",\"Ty is an integer or integer vector type matching the extends.\",\"C is a constant integer or splat vector constant of type Ty.\",\"The transformation is lane-wise for vectors.\"],\"rationale\":\"Because each operand is a boolean extended to Ty, each addend has only two possible values. Therefore the sum has only 4 possible input combinations, so any comparison against a constant is a 2-input boolean function of X and Y. Compute the truth table for (X,Y) in {(0,0),(0,1),(1,0),(1,1)} under the chosen extends and predicate, then synthesize a minimal boolean expression.\",\"implementation_shape\":\"General InstCombine fold in compare/add canonicalization: build 4-bit truth table by evaluating icmp Pred (Ext0(x)+Ext1(y)), C for the four boolean assignments. Then lower the table to a boolean expression using constants, operand passthrough, not, and/or/xor, and one-use-sensitive forms such as nor and masked terms (x & ~y), (~x & y), etc.\",\"reachable_ranges\":{\"zext_zext\":\"sum in {0,1,2}\",\"sext_sext\":\"sum in {0,-1,-2}\",\"zext_sext\":\"sum in {0,1,-1}\",\"sext_zext\":\"sum in {0,-1,1}\"},\"examples\":[{\"input\":\"icmp eq (add (zext i1 %a to i32), (zext i1 %b to i32)), 1\",\"output\":\"xor i1 %a, %b\"},{\"input\":\"icmp eq (add (sext i1 %a to i32), (sext i1 %b to i32)), -1\",\"output\":\"xor i1 %a, %b\"},{\"input\":\"icmp slt (add (sext i1 %a to i32), (sext i1 %b to i32)), 0\",\"output\":\"or i1 %a, %b\"},{\"input\":\"icmp ult (add (zext i1 %a to i32), (zext i1 %b to i32)), 2\",\"output\":\"not(and i1 %a, %b)\"}]},\"testcases\":[{\"name\":\"zz_eq_1_xor_i32\",\"ir\":\"define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add nuw nsw i32 %x, %y\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_eq_1_xor_commuted_i32\",\"ir\":\"define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %y, %x\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_ne_1_not_xor_i32\",\"ir\":\"define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ne i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_eq_0_nor_i32\",\"ir\":\"define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\\nentry:\\n  %o = or i1 %a, %b\\n  %n = xor i1 %o, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_ne_0_or_i32\",\"ir\":\"define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ne i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = or i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_eq_2_and_i32\",\"ir\":\"define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 2\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_ne_2_not_and_i32\",\"ir\":\"define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ne i32 %s, 2\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_ult_1_eq0_i32\",\"ir\":\"define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ult i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\\nentry:\\n  %o = or i1 %a, %b\\n  %n = xor i1 %o, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_ule_1_le1_i32\",\"ir\":\"define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ule i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_ugt_1_eq2_i32\",\"ir\":\"define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ugt i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_sgt_1_eq2_i32\",\"ir\":\"define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp sgt i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_slt_2_ne2_i32\",\"ir\":\"define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp slt i32 %s, 2\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zz_eq_1_xor_i8\",\"ir\":\"define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i8\\n  %y = zext i1 %b to i8\\n  %s = add i8 %x, %y\\n  %c = icmp eq i8 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zz_eq_1_xor_i64\",\"ir\":\"define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i64\\n  %y = zext i1 %b to i64\\n  %s = add nuw i64 %x, %y\\n  %c = icmp eq i64 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"ss_eq_m1_xor_i32\",\"ir\":\"define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add nsw i32 %x, %y\\n  %c = icmp eq i32 %s, -1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"ss_eq_0_nor_i32\",\"ir\":\"define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\\nentry:\\n  %o = or i1 %a, %b\\n  %n = xor i1 %o, true\\n  ret i1 %n\\n}\"},{\"name\":\"ss_eq_m2_and_i32\",\"ir\":\"define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, -2\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"ss_slt_0_or_i32\",\"ir\":\"define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp slt i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = or i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"ss_sle_m1_or_i32\",\"ir\":\"define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp sle i32 %s, -1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = or i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"ss_sgt_m2_ne_and_i32\",\"ir\":\"define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp sgt i32 %s, -2\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = and i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zs_eq_m1_a_and_notb_i32\",\"ir\":\"define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, -1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %nb = xor i1 %b, true\\n  %r = and i1 %a, %nb\\n  ret i1 %r\\n}\"},{\"name\":\"zs_eq_1_nota_and_b_i32\",\"ir\":\"define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\\nentry:\\n  %na = xor i1 %a, true\\n  %r = and i1 %na, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zs_eq_0_xnor_i32\",\"ir\":\"define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"zs_ne_0_xor_i32\",\"ir\":\"define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ne i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zs_slt_0_b_and_nota_i32\",\"ir\":\"define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp slt i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\\nentry:\\n  %na = xor i1 %a, true\\n  %r = and i1 %na, %b\\n  ret i1 %r\\n}\"},{\"name\":\"zs_sgt_0_a_and_notb_i32\",\"ir\":\"define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = sext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp sgt i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %nb = xor i1 %b, true\\n  %r = and i1 %a, %nb\\n  ret i1 %r\\n}\"},{\"name\":\"sz_eq_m1_nota_and_b_i32\",\"ir\":\"define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, -1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\\nentry:\\n  %na = xor i1 %a, true\\n  %r = and i1 %na, %b\\n  ret i1 %r\\n}\"},{\"name\":\"sz_eq_1_a_and_notb_i32\",\"ir\":\"define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\\nentry:\\n  %nb = xor i1 %b, true\\n  %r = and i1 %a, %nb\\n  ret i1 %r\\n}\"},{\"name\":\"sz_eq_0_xnor_i32\",\"ir\":\"define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  %n = xor i1 %r, true\\n  ret i1 %n\\n}\"},{\"name\":\"sz_ne_0_xor_i32\",\"ir\":\"define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = sext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp ne i32 %s, 0\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\\nentry:\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"vector_zz_eq_1_xor_v4i1\",\"ir\":\"define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\\nentry:\\n  %x = zext <4 x i1> %a to <4 x i8>\\n  %y = zext <4 x i1> %b to <4 x i8>\\n  %s = add <4 x i8> %x, %y\\n  %c = icmp eq <4 x i8> %s, <i8 1, i8 1, i8 1, i8 1>\\n  ret <4 x i1> %c\\n}\",\"expected_optimized_ir\":\"define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\\nentry:\\n  %r = xor <4 x i1> %a, %b\\n  ret <4 x i1> %r\\n}\"},{\"name\":\"vector_ss_eq_m1_xor_v2i1\",\"ir\":\"define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\\nentry:\\n  %x = sext <2 x i1> %a to <2 x i16>\\n  %y = sext <2 x i1> %b to <2 x i16>\\n  %s = add <2 x i16> %x, %y\\n  %c = icmp eq <2 x i16> %s, <i16 -1, i16 -1>\\n  ret <2 x i1> %c\\n}\",\"expected_optimized_ir\":\"define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\\nentry:\\n  %r = xor <2 x i1> %a, %b\\n  ret <2 x i1> %r\\n}\"},{\"name\":\"vector_zs_eq_0_xnor_v8i1\",\"ir\":\"define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\\nentry:\\n  %x = zext <8 x i1> %a to <8 x i32>\\n  %y = sext <8 x i1> %b to <8 x i32>\\n  %s = add <8 x i32> %x, %y\\n  %c = icmp eq <8 x i32> %s, zeroinitializer\\n  ret <8 x i1> %c\\n}\",\"expected_optimized_ir\":\"define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\\nentry:\\n  %r = xor <8 x i1> %a, %b\\n  %n = xor <8 x i1> %r, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\\n  ret <8 x i1> %n\\n}\"},{\"name\":\"vector_sz_eq_1_a_and_notb_v4i1\",\"ir\":\"define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\\nentry:\\n  %x = sext <4 x i1> %a to <4 x i64>\\n  %y = zext <4 x i1> %b to <4 x i64>\\n  %s = add <4 x i64> %x, %y\\n  %c = icmp eq <4 x i64> %s, <i64 1, i64 1, i64 1, i64 1>\\n  ret <4 x i1> %c\\n}\",\"expected_optimized_ir\":\"define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\\nentry:\\n  %nb = xor <4 x i1> %b, <i1 true, i1 true, i1 true, i1 true>\\n  %r = and <4 x i1> %a, %nb\\n  ret <4 x i1> %r\\n}\"},{\"name\":\"load_based_zz_eq_1_xor_i32\",\"ir\":\"define i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\\nentry:\\n  %a = load i1, ptr %pa, align 1\\n  %b = load i1, ptr %pb, align 1\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\\nentry:\\n  %a = load i1, ptr %pa, align 1\\n  %b = load i1, ptr %pb, align 1\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"},{\"name\":\"one_extra_uses_of_exts_still_fold_compare_i32\",\"ir\":\"define i1 @one_extra_uses_of_exts_still_fold_compare_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %u1 = add i32 %x, 5\\n  %u2 = sub i32 7, %y\\n  %s = add i32 %x, %y\\n  %c = icmp eq i32 %s, 1\\n  ret i1 %c\\n}\",\"expected_optimized_ir\":\"define i1 @one_extra_uses_of_exts_still_fold_compare_i32(i1 %a, i1 %b) {\\nentry:\\n  %x = zext i1 %a to i32\\n  %y = zext i1 %b to i32\\n  %u1 = add i32 %x, 5\\n  %u2 = sub i32 7, %y\\n  %r = xor i1 %a, %b\\n  ret i1 %r\\n}\"}]}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold comparisons of an add of two boolean extends into a pure boolean expression.",
+      "match": "icmp Pred Ty (add (Ext0 i1|<N x i1> X to Ty), (Ext1 i1|<N x i1> Y to Ty)), C",
+      "conditions": [
+        "Ext0 and Ext1 are integer extends from i1 or <N x i1>: zext or sext.",
+        "The add may have flags such as nuw/nsw; they are irrelevant to correctness of the fold.",
+        "Ty is an integer or integer vector type matching the extends.",
+        "C is a constant integer or splat vector constant of type Ty.",
+        "The transformation is lane-wise for vectors."
+      ],
+      "rationale": "Because each operand is a boolean extended to Ty, each addend has only two possible values. Therefore the sum has only 4 possible input combinations, so any comparison against a constant is a 2-input boolean function of X and Y. Compute the truth table for (X,Y) in {(0,0),(0,1),(1,0),(1,1)} under the chosen extends and predicate, then synthesize a minimal boolean expression.",
+      "implementation_shape": "General InstCombine fold in compare/add canonicalization: build 4-bit truth table by evaluating icmp Pred (Ext0(x)+Ext1(y)), C for the four boolean assignments. Then lower the table to a boolean expression using constants, operand passthrough, not, and/or/xor, and one-use-sensitive forms such as nor and masked terms (x & ~y), (~x & y), etc.",
+      "reachable_ranges": {
+        "zext_zext": "sum in {0,1,2}",
+        "sext_sext": "sum in {0,-1,-2}",
+        "zext_sext": "sum in {0,1,-1}",
+        "sext_zext": "sum in {0,-1,1}"
+      },
+      "examples": [
+        {
+          "input": "icmp eq (add (zext i1 %a to i32), (zext i1 %b to i32)), 1",
+          "output": "xor i1 %a, %b"
+        },
+        {
+          "input": "icmp eq (add (sext i1 %a to i32), (sext i1 %b to i32)), -1",
+          "output": "xor i1 %a, %b"
+        },
+        {
+          "input": "icmp slt (add (sext i1 %a to i32), (sext i1 %b to i32)), 0",
+          "output": "or i1 %a, %b"
+        },
+        {
+          "input": "icmp ult (add (zext i1 %a to i32), (zext i1 %b to i32)), 2",
+          "output": "not(and i1 %a, %b)"
+        }
+      ]
+    },
+    "testcases": [
+      {
+        "name": "zz_eq_1_xor_i32",
+        "ir": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_eq_1_xor_commuted_i32",
+        "ir": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_ne_1_not_xor_i32",
+        "ir": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_eq_0_nor_i32",
+        "ir": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_ne_0_or_i32",
+        "ir": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_eq_2_and_i32",
+        "ir": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_ne_2_not_and_i32",
+        "ir": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_ult_1_eq0_i32",
+        "ir": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ult i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_ule_1_le1_i32",
+        "ir": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ule i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_ugt_1_eq2_i32",
+        "ir": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_sgt_1_eq2_i32",
+        "ir": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_slt_2_ne2_i32",
+        "ir": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 2\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zz_eq_1_xor_i8",
+        "ir": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zz_eq_1_xor_i64",
+        "ir": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nuw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "ss_eq_m1_xor_i32",
+        "ir": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "ss_eq_0_nor_i32",
+        "ir": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "ss_eq_m2_and_i32",
+        "ir": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -2\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "ss_slt_0_or_i32",
+        "ir": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "ss_sle_m1_or_i32",
+        "ir": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sle i32 %s, -1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "ss_sgt_m2_ne_and_i32",
+        "ir": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, -2\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zs_eq_m1_a_and_notb_i32",
+        "ir": "define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zs_eq_1_nota_and_b_i32",
+        "ir": "define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zs_eq_0_xnor_i32",
+        "ir": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "zs_ne_0_xor_i32",
+        "ir": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zs_slt_0_b_and_nota_i32",
+        "ir": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "zs_sgt_0_a_and_notb_i32",
+        "ir": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}"
+      },
+      {
+        "name": "sz_eq_m1_nota_and_b_i32",
+        "ir": "define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "sz_eq_1_a_and_notb_i32",
+        "ir": "define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}"
+      },
+      {
+        "name": "sz_eq_0_xnor_i32",
+        "ir": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}"
+      },
+      {
+        "name": "sz_ne_0_xor_i32",
+        "ir": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "vector_zz_eq_1_xor_v4i1",
+        "ir": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i1> %c\n}",
+        "expected_optimized_ir": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}"
+      },
+      {
+        "name": "vector_ss_eq_m1_xor_v2i1",
+        "ir": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, <i16 -1, i16 -1>\n  ret <2 x i1> %c\n}",
+        "expected_optimized_ir": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}"
+      },
+      {
+        "name": "vector_zs_eq_0_xnor_v8i1",
+        "ir": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %x = zext <8 x i1> %a to <8 x i32>\n  %y = sext <8 x i1> %b to <8 x i32>\n  %s = add <8 x i32> %x, %y\n  %c = icmp eq <8 x i32> %s, zeroinitializer\n  ret <8 x i1> %c\n}",
+        "expected_optimized_ir": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %n\n}"
+      },
+      {
+        "name": "vector_sz_eq_1_a_and_notb_v4i1",
+        "ir": "define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = sext <4 x i1> %a to <4 x i64>\n  %y = zext <4 x i1> %b to <4 x i64>\n  %s = add <4 x i64> %x, %y\n  %c = icmp eq <4 x i64> %s, <i64 1, i64 1, i64 1, i64 1>\n  ret <4 x i1> %c\n}",
+        "expected_optimized_ir": "define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %nb = xor <4 x i1> %b, <i1 true, i1 true, i1 true, i1 true>\n  %r = and <4 x i1> %a, %nb\n  ret <4 x i1> %r\n}"
+      },
+      {
+        "name": "load_based_zz_eq_1_xor_i32",
+        "ir": "define i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      },
+      {
+        "name": "one_extra_uses_of_exts_still_fold_compare_i32",
+        "ir": "define i1 @one_extra_uses_of_exts_still_fold_compare_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %u1 = add i32 %x, 5\n  %u2 = sub i32 7, %y\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+        "expected_optimized_ir": "define i1 @one_extra_uses_of_exts_still_fold_compare_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %u1 = add i32 %x, 5\n  %u2 = sub i32 7, %y\n  %r = xor i1 %a, %b\n  ret i1 %r\n}"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "zz_eq_1_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_eq_1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_eq_1_xor_commuted_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_eq_1_xor_commuted_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %y, %x\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ne_1_not_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_ne_1_not_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ne i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_eq_0_nor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ne_0_or_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "tgt": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\n=>\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_ne_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_eq_2_and_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_eq_2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 2\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ne_2_not_and_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_ne_2_not_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ne i32 %s, 2\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ult_1_eq0_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ult i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ult i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_ult_1_eq0_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ule_1_le1_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ule i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ule i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_ule_1_le1_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_ugt_1_eq2_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_ugt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_sgt_1_eq2_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_sgt_1_eq2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ugt i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_slt_2_ne2_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 2\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n=>\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zz_slt_2_ne2_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp ult i32 %s, 2\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_eq_1_xor_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add nuw nsw i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add nsw nuw i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add nuw nsw i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_eq_1_xor_i8(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i8\n  %y = zext i1 %b to i8\n  %s = add nsw nuw i8 %x, %y\n  %c = icmp eq i8 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zz_eq_1_xor_i64",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nuw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nuw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nuw nsw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nsw nuw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nuw nsw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zz_eq_1_xor_i64(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %s = add nsw nuw i64 %x, %y\n  %c = icmp eq i64 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_eq_m1_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, 4294967295\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, 4294967295\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @ss_eq_m1_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, 4294967295\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_eq_0_nor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %o = or i1 %a, %b\n  %n = xor i1 %o, 1\n  ret i1 %n\n}\n=>\ndefine i1 @ss_eq_0_nor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_eq_m2_and_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -2\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 4294967294\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, 4294967294\n  ret i1 %c\n}\n=>\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, -2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @ss_eq_m2_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp eq i32 %s, 4294967294\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_slt_0_or_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "tgt": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\n=>\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @ss_slt_0_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_sle_m1_or_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sle i32 %s, -1\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sle i32 %s, 4294967295\n  ret i1 %c\n}\n=>\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "tgt": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\n=>\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %0 = or i1 %a, %b\n  ret i1 %0\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %r = or i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @ss_sle_m1_or_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = or i1 %a, %b\n  ret i1 %#0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ss_sgt_m2_ne_and_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, -2\n  ret i1 %c\n}",
+          "tgt": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 4294967294\n  ret i1 %c\n}\n=>\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp sgt i32 %s, -2\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp sgt i32 %s, 4294967294\n  ret i1 %c\n}\n=>\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp sgt i32 %s, -2\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %r = and i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @ss_sgt_m2_ne_and_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add nsw i32 %x, %y\n  %c = icmp sgt i32 %s, 4294967294\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zs_eq_m1_a_and_notb_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 4294967295\n  ret i1 %c\n}\n=>\ndefine i1 @zs_eq_m1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, 1\n  %r = and i1 %a, %nb\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x1 (1)\n\nSource:\ni32 %x = #x00000000 (0)\ni32 %y = #xffffffff (4294967295, -1)\ni32 %s = #xffffffff (4294967295, -1)\ni1 %c = #x1 (1)\n\nTarget:\ni1 %nb = #x0 (0)\ni1 %r = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "zs_eq_1_nota_and_b_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zs_eq_1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, 1\n  %r = and i1 %na, %b\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x1 (1)\n\nSource:\ni32 %x = #x00000000 (0)\ni32 %y = #xffffffff (4294967295, -1)\ni32 %s = #xffffffff (4294967295, -1)\ni1 %c = #x0 (0)\n\nTarget:\ni1 %na = #x1 (1)\ni1 %r = #x1 (1)\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "zs_eq_0_xnor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\n=>\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @zs_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zs_ne_0_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n=>\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zs_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zs_slt_0_b_and_nota_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp slt i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, 1\n  %r = and i1 %na, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, true\n  %c = and i1 %0, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, 1\n  %c = and i1 %#0, %b\n  ret i1 %c\n}\n=>\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, 1\n  %r = and i1 %na, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, true\n  %c = and i1 %0, %b\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, 1\n  %r = and i1 %na, %b\n  ret i1 %r\n}\n=>\ndefine i1 @zs_slt_0_b_and_nota_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, 1\n  %c = and i1 %#0, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "zs_sgt_0_a_and_notb_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = zext i1 %a to i32\n  %y = sext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp sgt i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, 1\n  %r = and i1 %a, %nb\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %b, true\n  %c = and i1 %0, %a\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %b, 1\n  %c = and i1 %#0, %a\n  ret i1 %c\n}\n=>\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, 1\n  %r = and i1 %a, %nb\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %b, true\n  %c = and i1 %0, %a\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, 1\n  %r = and i1 %a, %nb\n  ret i1 %r\n}\n=>\ndefine i1 @zs_sgt_0_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %b, 1\n  %c = and i1 %#0, %a\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sz_eq_m1_nota_and_b_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, -1\n  ret i1 %c\n}",
+          "tgt": "define i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, true\n  %r = and i1 %na, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 4294967295\n  ret i1 %c\n}\n=>\ndefine i1 @sz_eq_m1_nota_and_b_i32(i1 %a, i1 %b) {\nentry:\n  %na = xor i1 %a, 1\n  %r = and i1 %na, %b\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x1 (1)\n\nSource:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000001 (1)\ni32 %s = #x00000001 (1)\ni1 %c = #x0 (0)\n\nTarget:\ni1 %na = #x1 (1)\ni1 %r = #x1 (1)\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "sz_eq_1_a_and_notb_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "define i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, true\n  %r = and i1 %a, %nb\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @sz_eq_1_a_and_notb_i32(i1 %a, i1 %b) {\nentry:\n  %nb = xor i1 %b, 1\n  %r = and i1 %a, %nb\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni1 %a = #x0 (0)\ni1 %b = #x1 (1)\n\nSource:\ni32 %x = #x00000000 (0)\ni32 %y = #x00000001 (1)\ni32 %s = #x00000001 (1)\ni1 %c = #x1 (1)\n\nTarget:\ni1 %nb = #x0 (0)\ni1 %r = #x0 (0)\nSource value: #x1 (1)\nTarget value: #x0 (0)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "sz_eq_0_xnor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\n=>\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, true\n  ret i1 %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %0 = xor i1 %a, %b\n  %c = xor i1 %0, true\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  %n = xor i1 %r, 1\n  ret i1 %n\n}\n=>\ndefine i1 @sz_eq_0_xnor_i32(i1 %a, i1 %b) {\nentry:\n  %#0 = xor i1 %a, %b\n  %c = xor i1 %#0, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "sz_ne_0_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}",
+          "tgt": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %x = sext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp ne i32 %s, 0\n  ret i1 %c\n}\n=>\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n",
+          "tgt": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n=>\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @sz_ne_0_xor_i32(i1 %a, i1 %b) {\nentry:\n  %c = xor i1 %a, %b\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_zz_eq_1_xor_v4i1",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i1> %c\n}",
+          "tgt": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, { 1, 1, 1, 1 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add nuw nsw <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i1> %c\n}\n",
+          "tgt": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add nsw nuw <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, { 1, 1, 1, 1 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add nuw nsw <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, <i8 1, i8 1, i8 1, i8 1>\n  ret <4 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %r = xor <4 x i1> %a, %b\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_zz_eq_1_xor_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = zext <4 x i1> %a to <4 x i8>\n  %y = zext <4 x i1> %b to <4 x i8>\n  %s = add nsw nuw <4 x i8> %x, %y\n  %c = icmp eq <4 x i8> %s, { 1, 1, 1, 1 }\n  ret <4 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_ss_eq_m1_xor_v2i1",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, <i16 -1, i16 -1>\n  ret <2 x i1> %c\n}",
+          "tgt": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, { 65535, 65535 }\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add nsw <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, <i16 -1, i16 -1>\n  ret <2 x i1> %c\n}\n",
+          "tgt": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add nsw <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, { 65535, 65535 }\n  ret <2 x i1> %c\n}\n=>\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add nsw <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, <i16 -1, i16 -1>\n  ret <2 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %r = xor <2 x i1> %a, %b\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_ss_eq_m1_xor_v2i1(<2 x i1> %a, <2 x i1> %b) {\nentry:\n  %x = sext <2 x i1> %a to <2 x i16>\n  %y = sext <2 x i1> %b to <2 x i16>\n  %s = add nsw <2 x i16> %x, %y\n  %c = icmp eq <2 x i16> %s, { 65535, 65535 }\n  ret <2 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_zs_eq_0_xnor_v8i1",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %x = zext <8 x i1> %a to <8 x i32>\n  %y = sext <8 x i1> %b to <8 x i32>\n  %s = add <8 x i32> %x, %y\n  %c = icmp eq <8 x i32> %s, zeroinitializer\n  ret <8 x i1> %c\n}",
+          "tgt": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %n\n}",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %x = zext <8 x i1> %a to <8 x i32>\n  %y = sext <8 x i1> %b to <8 x i32>\n  %s = add <8 x i32> %x, %y\n  %c = icmp eq <8 x i32> %s, { 0, 0, 0, 0, 0, 0, 0, 0 }\n  ret <8 x i1> %c\n}\n=>\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, { 1, 1, 1, 1, 1, 1, 1, 1 }\n  ret <8 x i1> %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %0 = xor <8 x i1> %a, %b\n  %c = xor <8 x i1> %0, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %c\n}\n",
+          "tgt": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %n\n}",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %#0 = xor <8 x i1> %a, %b\n  %c = xor <8 x i1> %#0, { 1, 1, 1, 1, 1, 1, 1, 1 }\n  ret <8 x i1> %c\n}\n=>\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, { 1, 1, 1, 1, 1, 1, 1, 1 }\n  ret <8 x i1> %n\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %n\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %0 = xor <8 x i1> %a, %b\n  %c = xor <8 x i1> %0, <i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>\n  ret <8 x i1> %c\n}\n",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %r = xor <8 x i1> %a, %b\n  %n = xor <8 x i1> %r, { 1, 1, 1, 1, 1, 1, 1, 1 }\n  ret <8 x i1> %n\n}\n=>\ndefine <8 x i1> @vector_zs_eq_0_xnor_v8i1(<8 x i1> %a, <8 x i1> %b) {\nentry:\n  %#0 = xor <8 x i1> %a, %b\n  %c = xor <8 x i1> %#0, { 1, 1, 1, 1, 1, 1, 1, 1 }\n  ret <8 x i1> %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_sz_eq_1_a_and_notb_v4i1",
+      "missed_optimization": false,
+      "cost": {
+        "source": 5,
+        "expected": 3,
+        "current_opt": 3,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 3\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = sext <4 x i1> %a to <4 x i64>\n  %y = zext <4 x i1> %b to <4 x i64>\n  %s = add <4 x i64> %x, %y\n  %c = icmp eq <4 x i64> %s, <i64 1, i64 1, i64 1, i64 1>\n  ret <4 x i1> %c\n}",
+          "tgt": "define <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %nb = xor <4 x i1> %b, <i1 true, i1 true, i1 true, i1 true>\n  %r = and <4 x i1> %a, %nb\n  ret <4 x i1> %r\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %x = sext <4 x i1> %a to <4 x i64>\n  %y = zext <4 x i1> %b to <4 x i64>\n  %s = add <4 x i64> %x, %y\n  %c = icmp eq <4 x i64> %s, { 1, 1, 1, 1 }\n  ret <4 x i1> %c\n}\n=>\ndefine <4 x i1> @vector_sz_eq_1_a_and_notb_v4i1(<4 x i1> %a, <4 x i1> %b) {\nentry:\n  %nb = xor <4 x i1> %b, { 1, 1, 1, 1 }\n  %r = and <4 x i1> %a, %nb\n  ret <4 x i1> %r\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\n<4 x i1> %a = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n<4 x i1> %b = < #x1 (1), #x0 (0), #x0 (0), #x0 (0) >\n\nSource:\n<4 x i64> %x = < #x0000000000000000 (0), #x0000000000000000 (0), #x0000000000000000 (0), #x0000000000000000 (0) >\n<4 x i64> %y = < #x0000000000000001 (1), #x0000000000000000 (0), #x0000000000000000 (0), #x0000000000000000 (0) >\n<4 x i64> %s = < #x0000000000000001 (1), #x0000000000000000 (0), #x0000000000000000 (0), #x0000000000000000 (0) >\n<4 x i1> %c = < #x1 (1), #x0 (0), #x0 (0), #x0 (0) >\n\nTarget:\n<4 x i1> %nb = < #x0 (0), #x1 (1), #x1 (1), #x1 (1) >\n<4 x i1> %r = < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\nSource value: < #x1 (1), #x0 (0), #x0 (0), #x0 (0) >\nTarget value: < #x0 (0), #x0 (0), #x0 (0), #x0 (0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "load_based_zz_eq_1_xor_i32",
+      "missed_optimization": true,
+      "cost": {
+        "source": 13,
+        "expected": 10,
+        "current_opt": 13,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 13\n",
+        "expected_log": "Cost: 10\n",
+        "current_opt_log": "Cost: 13\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "log": "\n----------------------------------------\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n=>\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nuw nsw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %r = xor i1 %a, %b\n  ret i1 %r\n}\n=>\ndefine i1 @load_based_zz_eq_1_xor_i32(ptr %pa, ptr %pb) {\nentry:\n  %a = load i1, ptr %pa, align 1\n  %b = load i1, ptr %pb, align 1\n  %x = zext i1 %a to i32\n  %y = zext i1 %b to i32\n  %s = add nsw nuw i32 %x, %y\n  %c = icmp eq i32 %s, 1\n  ret i1 %c\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "one_extra_uses_of_exts_still_fold_compare_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 6,
+        "current_opt": 5,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- git version: v0.0.0 normalized to 0.0.0\n-- Version: 1.6.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Configuring done (2.6s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

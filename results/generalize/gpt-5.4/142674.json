@@ -1,0 +1,416 @@
+{
+  "issue_id": "142674",
+  "dataset_file": "142674.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue is a very specific redundant-overflow pattern:\n\n- `%mwo = umul.with.overflow(x, C1)`\n- extract `%mul` and `%ovf`\n- compute `icmp ugt %mul, C2`\n- return `or %ovf, %cmp`\n\nSemantically, this asks: “is the full mathematical product `x*C1` greater than `C2`?” If overflow happens, the answer is already true for sufficiently large products, so the pair `(overflow || truncated_product > C2)` can be reduced to a single compare on the original operand. In the motivating case, that becomes `icmp ugt x, floor(C2 / C1)`.\n\nThe patch generalizes this into `foldOrUnsignedUMulOverflowICmp()` in InstCombine. It pattern-matches a `umul_with_overflow` with one constant operand, matches the two `extractvalue`s, requires the compare to be `icmp ugt` on the result value against a constant, accepts either operand order in the `or` via `m_c_Or`, and only folds when the compare is one-use and `C1 != 0`. The rewrite is:\n`or ovf, icmp ugt mul, C2  -->  icmp ugt x, udiv(C2, C1)`.\n\nThe dev tests broaden coverage well beyond the original scalar i64 case: constant-zero multiplier, commuted `or`, `or disjoint`, different bitwidth (`i8`), vector splats, non-splat vectors, poison lanes, and several negative tests where folding must not happen (`ult`, wrong boolean op `and`, multi-use overflow/cmp/mul/call result). This is a good template for turning a bug-triggering peephole into a reusable InstCombine fold plus robustness tests.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i64 %0) {\n  %2 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 168)\n  %3 = extractvalue { i64, i1 } %2, 0\n  %4 = extractvalue { i64, i1 } %2, 1\n  %5 = icmp ugt i64 %3, -16\n  %6 = or i1 %4, %5\n  ret i1 %6\n}\n\ndefine i1 @test(i64 %0) {\n  %2 = icmp ugt i64 %0, 109802048057794950\n  ret i1 %2\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Fold an unsigned multiply-with-overflow followed by `overflow OR (truncated-product > constant)` into a single compare on the non-constant multiplicand.\",\n    \"match\": [\n      \"A call to `llvm.umul.with.overflow.*(X, C1)` or `llvm.umul.with.overflow.*(C1, X)` where `C1` is a non-zero integer constant or constant vector.\",\n      \"Extract the product result `%mul = extractvalue %mwo, 0`.\",\n      \"Extract the overflow flag `%ovf = extractvalue %mwo, 1`.\",\n      \"Form `%cmp = icmp ugt %mul, C2` where `C2` is a constant of the same type as `%mul`.\",\n      \"Form `%r = or i1 %ovf, %cmp` for scalar, or `or <N x i1> %ovf, %cmp` for vector. Operand order of the `or` is irrelevant.\"\n    ],\n    \"rewrite\": [\n      \"Replace `or %ovf, icmp ugt %mul, C2` with `icmp ugt X, udiv(C2, C1)`.\",\n      \"For vectors, compute the division lane-wise when valid.\"\n    ],\n    \"reasoning\": \"Let the full mathematical product be P = X * C1 in unsigned arithmetic, with `%mul` the low bits and `%ovf` indicating whether P exceeds the type range. The expression `(%ovf || (%mul > C2))` is true exactly when the full product P is greater than C2. For non-zero unsigned constant C1, `X * C1 > C2` is equivalent to `X > floor(C2 / C1)`.\",\n    \"preconditions\": [\n      \"The multiply intrinsic must be unsigned: `llvm.umul.with.overflow`.\",\n      \"`C1 != 0` in every folded lane.\",\n      \"The compare predicate is exactly `icmp ugt`.\",\n      \"The compare must be against the extracted multiply result, not an arbitrary derived value.\",\n      \"Only positive folds are listed here; implementation may additionally require one-use constraints to avoid duplication.\"\n    ],\n    \"notes\": [\n      \"If `C1 == 1`, the fold becomes `or ovf(false), icmp ugt X, C2` -> `icmp ugt X, C2`.\",\n      \"If `C2` is the maximum unsigned value for the type, then `udiv(C2, C1)` is the largest X such that `X*C1 <= max`; the fold still holds and often becomes a pure overflow threshold test.\",\n      \"The motivating example uses `C1 = 168`, `C2 = -16` on i64, i.e. `C2 = 18446744073709551600`, yielding `floor(C2/168) = 109802048057794950`.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"scalar_i64_original_like\",\n      \"ir\": \"declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\\n\\ndefine i1 @scalar_i64_original_like(i64 %x) {\\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\\n  %mul = extractvalue { i64, i1 } %mwo, 0\\n  %ovf = extractvalue { i64, i1 } %mwo, 1\\n  %cmp = icmp ugt i64 %mul, -16\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_original_like(i64 %x) {\\n  %r = icmp ugt i64 %x, 109802048057794950\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_commuted_mul_constant_first\",\n      \"ir\": \"declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\\n\\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 168, i64 %x)\\n  %mul = extractvalue { i64, i1 } %mwo, 0\\n  %ovf = extractvalue { i64, i1 } %mwo, 1\\n  %cmp = icmp ugt i64 %mul, -16\\n  %r = or i1 %cmp, %ovf\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\\n  %r = icmp ugt i64 %x, 109802048057794950\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_multiplier_one\",\n      \"ir\": \"declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\\n\\ndefine i1 @scalar_i64_multiplier_one(i64 %x) {\\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 1)\\n  %mul = extractvalue { i64, i1 } %mwo, 0\\n  %ovf = extractvalue { i64, i1 } %mwo, 1\\n  %cmp = icmp ugt i64 %mul, i64 123456789\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_multiplier_one(i64 %x) {\\n  %r = icmp ugt i64 %x, 123456789\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_max_threshold_overflow_boundary\",\n      \"ir\": \"declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\\n\\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 3)\\n  %mul = extractvalue { i64, i1 } %mwo, 0\\n  %ovf = extractvalue { i64, i1 } %mwo, 1\\n  %cmp = icmp ugt i64 %mul, -1\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\\n  %r = icmp ugt i64 %x, 6148914691236517205\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_basic\",\n      \"ir\": \"declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\\n\\ndefine i1 @scalar_i32_basic(i32 %x) {\\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 10)\\n  %mul = extractvalue { i32, i1 } %mwo, 0\\n  %ovf = extractvalue { i32, i1 } %mwo, 1\\n  %cmp = icmp ugt i32 %mul, i32 99\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_basic(i32 %x) {\\n  %r = icmp ugt i32 %x, 9\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_nontrivial_floor_div\",\n      \"ir\": \"declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\\n\\ndefine i1 @scalar_i32_nontrivial_floor_div(i32 %x) {\\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 7)\\n  %mul = extractvalue { i32, i1 } %mwo, 0\\n  %ovf = extractvalue { i32, i1 } %mwo, 1\\n  %cmp = icmp ugt i32 %mul, i32 100\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_nontrivial_floor_div(i32 %x) {\\n  %r = icmp ugt i32 %x, 14\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i16_basic\",\n      \"ir\": \"declare { i16, i1 } @llvm.umul.with.overflow.i16(i16, i16)\\n\\ndefine i1 @scalar_i16_basic(i16 %x) {\\n  %mwo = call { i16, i1 } @llvm.umul.with.overflow.i16(i16 %x, i16 5)\\n  %mul = extractvalue { i16, i1 } %mwo, 0\\n  %ovf = extractvalue { i16, i1 } %mwo, 1\\n  %cmp = icmp ugt i16 %mul, i16 24\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i16_basic(i16 %x) {\\n  %r = icmp ugt i16 %x, 4\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_basic\",\n      \"ir\": \"declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\\n\\ndefine i1 @scalar_i8_basic(i8 %x) {\\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 9)\\n  %mul = extractvalue { i8, i1 } %mwo, 0\\n  %ovf = extractvalue { i8, i1 } %mwo, 1\\n  %cmp = icmp ugt i8 %mul, i8 100\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_basic(i8 %x) {\\n  %r = icmp ugt i8 %x, 11\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_threshold_zero\",\n      \"ir\": \"declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\\n\\ndefine i1 @scalar_i8_threshold_zero(i8 %x) {\\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 13)\\n  %mul = extractvalue { i8, i1 } %mwo, 0\\n  %ovf = extractvalue { i8, i1 } %mwo, 1\\n  %cmp = icmp ugt i8 %mul, i8 0\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_threshold_zero(i8 %x) {\\n  %r = icmp ugt i8 %x, 0\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i64_large_even_constant\",\n      \"ir\": \"declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\\n\\ndefine i1 @scalar_i64_large_even_constant(i64 %x) {\\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 1024)\\n  %mul = extractvalue { i64, i1 } %mwo, 0\\n  %ovf = extractvalue { i64, i1 } %mwo, 1\\n  %cmp = icmp ugt i64 %mul, i64 65535\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i64_large_even_constant(i64 %x) {\\n  %r = icmp ugt i64 %x, 63\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_splat_constants\",\n      \"ir\": \"declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\\n\\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 9, i8 9, i8 9, i8 9>)\\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\\n  %cmp = icmp ugt <4 x i8> %mul, <i8 100, i8 100, i8 100, i8 100>\\n  %r = or <4 x i1> %ovf, %cmp\\n  ret <4 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\\n  %r = icmp ugt <4 x i8> %x, <i8 11, i8 11, i8 11, i8 11>\\n  ret <4 x i1> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v4i8_nonsplat_constants\",\n      \"ir\": \"declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\\n\\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 2, i8 3, i8 5, i8 7>)\\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\\n  %cmp = icmp ugt <4 x i8> %mul, <i8 9, i8 10, i8 24, i8 100>\\n  %r = or <4 x i1> %ovf, %cmp\\n  ret <4 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\\n  %r = icmp ugt <4 x i8> %x, <i8 4, i8 3, i8 4, i8 14>\\n  ret <4 x i1> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v2i16_splat_max_threshold\",\n      \"ir\": \"declare { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16>, <2 x i16>)\\n\\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\\n  %mwo = call { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16> %x, <2 x i16> <i16 3, i16 3>)\\n  %mul = extractvalue { <2 x i16>, <2 x i1> } %mwo, 0\\n  %ovf = extractvalue { <2 x i16>, <2 x i1> } %mwo, 1\\n  %cmp = icmp ugt <2 x i16> %mul, <i16 -1, i16 -1>\\n  %r = or <2 x i1> %cmp, %ovf\\n  ret <2 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\\n  %r = icmp ugt <2 x i16> %x, <i16 21845, i16 21845>\\n  ret <2 x i1> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"vector_v2i32_constant_first\",\n      \"ir\": \"declare { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32>, <2 x i32>)\\n\\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\\n  %mwo = call { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32> <i32 10, i32 7>, <2 x i32> %x)\\n  %mul = extractvalue { <2 x i32>, <2 x i1> } %mwo, 0\\n  %ovf = extractvalue { <2 x i32>, <2 x i1> } %mwo, 1\\n  %cmp = icmp ugt <2 x i32> %mul, <i32 99, i32 100>\\n  %r = or <2 x i1> %ovf, %cmp\\n  ret <2 x i1> %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\\n  %r = icmp ugt <2 x i32> %x, <i32 9, i32 14>\\n  ret <2 x i1> %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i32_power_of_two_multiplier\",\n      \"ir\": \"declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\\n\\ndefine i1 @scalar_i32_power_of_two_multiplier(i32 %x) {\\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 256)\\n  %mul = extractvalue { i32, i1 } %mwo, 0\\n  %ovf = extractvalue { i32, i1 } %mwo, 1\\n  %cmp = icmp ugt i32 %mul, i32 65535\\n  %r = or i1 %cmp, %ovf\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i32_power_of_two_multiplier(i32 %x) {\\n  %r = icmp ugt i32 %x, 255\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i16_compare_near_max\",\n      \"ir\": \"declare { i16, i1 } @llvm.umul.with.overflow.i16(i16, i16)\\n\\ndefine i1 @scalar_i16_compare_near_max(i16 %x) {\\n  %mwo = call { i16, i1 } @llvm.umul.with.overflow.i16(i16 %x, i16 9)\\n  %mul = extractvalue { i16, i1 } %mwo, 0\\n  %ovf = extractvalue { i16, i1 } %mwo, 1\\n  %cmp = icmp ugt i16 %mul, i16 65520\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i16_compare_near_max(i16 %x) {\\n  %r = icmp ugt i16 %x, 7280\\n  ret i1 %r\\n}\\n\"\n    },\n    {\n      \"name\": \"scalar_i8_full_overflow_style\",\n      \"ir\": \"declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\\n\\ndefine i1 @scalar_i8_full_overflow_style(i8 %x) {\\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 2)\\n  %mul = extractvalue { i8, i1 } %mwo, 0\\n  %ovf = extractvalue { i8, i1 } %mwo, 1\\n  %cmp = icmp ugt i8 %mul, i8 254\\n  %r = or i1 %ovf, %cmp\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @scalar_i8_full_overflow_style(i8 %x) {\\n  %r = icmp ugt i8 %x, 127\\n  ret i1 %r\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Fold an unsigned multiply-with-overflow followed by `overflow OR (truncated-product > constant)` into a single compare on the non-constant multiplicand.",
+      "match": [
+        "A call to `llvm.umul.with.overflow.*(X, C1)` or `llvm.umul.with.overflow.*(C1, X)` where `C1` is a non-zero integer constant or constant vector.",
+        "Extract the product result `%mul = extractvalue %mwo, 0`.",
+        "Extract the overflow flag `%ovf = extractvalue %mwo, 1`.",
+        "Form `%cmp = icmp ugt %mul, C2` where `C2` is a constant of the same type as `%mul`.",
+        "Form `%r = or i1 %ovf, %cmp` for scalar, or `or <N x i1> %ovf, %cmp` for vector. Operand order of the `or` is irrelevant."
+      ],
+      "rewrite": [
+        "Replace `or %ovf, icmp ugt %mul, C2` with `icmp ugt X, udiv(C2, C1)`.",
+        "For vectors, compute the division lane-wise when valid."
+      ],
+      "reasoning": "Let the full mathematical product be P = X * C1 in unsigned arithmetic, with `%mul` the low bits and `%ovf` indicating whether P exceeds the type range. The expression `(%ovf || (%mul > C2))` is true exactly when the full product P is greater than C2. For non-zero unsigned constant C1, `X * C1 > C2` is equivalent to `X > floor(C2 / C1)`.",
+      "preconditions": [
+        "The multiply intrinsic must be unsigned: `llvm.umul.with.overflow`.",
+        "`C1 != 0` in every folded lane.",
+        "The compare predicate is exactly `icmp ugt`.",
+        "The compare must be against the extracted multiply result, not an arbitrary derived value.",
+        "Only positive folds are listed here; implementation may additionally require one-use constraints to avoid duplication."
+      ],
+      "notes": [
+        "If `C1 == 1`, the fold becomes `or ovf(false), icmp ugt X, C2` -> `icmp ugt X, C2`.",
+        "If `C2` is the maximum unsigned value for the type, then `udiv(C2, C1)` is the largest X such that `X*C1 <= max`; the fold still holds and often becomes a pure overflow threshold test.",
+        "The motivating example uses `C1 = 168`, `C2 = -16` on i64, i.e. `C2 = 18446744073709551600`, yielding `floor(C2/168) = 109802048057794950`."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "scalar_i64_original_like",
+        "ir": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_original_like(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_original_like(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_commuted_mul_constant_first",
+        "ir": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 168, i64 %x)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_multiplier_one",
+        "ir": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_multiplier_one(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 1)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, i64 123456789\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_multiplier_one(i64 %x) {\n  %r = icmp ugt i64 %x, 123456789\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_max_threshold_overflow_boundary",
+        "ir": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 3)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -1\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_basic",
+        "ir": "declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\n\ndefine i1 @scalar_i32_basic(i32 %x) {\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 10)\n  %mul = extractvalue { i32, i1 } %mwo, 0\n  %ovf = extractvalue { i32, i1 } %mwo, 1\n  %cmp = icmp ugt i32 %mul, i32 99\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_basic(i32 %x) {\n  %r = icmp ugt i32 %x, 9\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_nontrivial_floor_div",
+        "ir": "declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\n\ndefine i1 @scalar_i32_nontrivial_floor_div(i32 %x) {\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 7)\n  %mul = extractvalue { i32, i1 } %mwo, 0\n  %ovf = extractvalue { i32, i1 } %mwo, 1\n  %cmp = icmp ugt i32 %mul, i32 100\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_nontrivial_floor_div(i32 %x) {\n  %r = icmp ugt i32 %x, 14\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i16_basic",
+        "ir": "declare { i16, i1 } @llvm.umul.with.overflow.i16(i16, i16)\n\ndefine i1 @scalar_i16_basic(i16 %x) {\n  %mwo = call { i16, i1 } @llvm.umul.with.overflow.i16(i16 %x, i16 5)\n  %mul = extractvalue { i16, i1 } %mwo, 0\n  %ovf = extractvalue { i16, i1 } %mwo, 1\n  %cmp = icmp ugt i16 %mul, i16 24\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i16_basic(i16 %x) {\n  %r = icmp ugt i16 %x, 4\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i8_basic",
+        "ir": "declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\n\ndefine i1 @scalar_i8_basic(i8 %x) {\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 9)\n  %mul = extractvalue { i8, i1 } %mwo, 0\n  %ovf = extractvalue { i8, i1 } %mwo, 1\n  %cmp = icmp ugt i8 %mul, i8 100\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_basic(i8 %x) {\n  %r = icmp ugt i8 %x, 11\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i8_threshold_zero",
+        "ir": "declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\n\ndefine i1 @scalar_i8_threshold_zero(i8 %x) {\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 13)\n  %mul = extractvalue { i8, i1 } %mwo, 0\n  %ovf = extractvalue { i8, i1 } %mwo, 1\n  %cmp = icmp ugt i8 %mul, i8 0\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_threshold_zero(i8 %x) {\n  %r = icmp ugt i8 %x, 0\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i64_large_even_constant",
+        "ir": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_large_even_constant(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 1024)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, i64 65535\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i64_large_even_constant(i64 %x) {\n  %r = icmp ugt i64 %x, 63\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "vector_v4i8_splat_constants",
+        "ir": "declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 9, i8 9, i8 9, i8 9>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 100, i8 100, i8 100, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 11, i8 11, i8 11, i8 11>\n  ret <4 x i1> %r\n}\n"
+      },
+      {
+        "name": "vector_v4i8_nonsplat_constants",
+        "ir": "declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 2, i8 3, i8 5, i8 7>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 9, i8 10, i8 24, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 4, i8 3, i8 4, i8 14>\n  ret <4 x i1> %r\n}\n"
+      },
+      {
+        "name": "vector_v2i16_splat_max_threshold",
+        "ir": "declare { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16>, <2 x i16>)\n\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %mwo = call { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16> %x, <2 x i16> <i16 3, i16 3>)\n  %mul = extractvalue { <2 x i16>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i16>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i16> %mul, <i16 -1, i16 -1>\n  %r = or <2 x i1> %cmp, %ovf\n  ret <2 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %r = icmp ugt <2 x i16> %x, <i16 21845, i16 21845>\n  ret <2 x i1> %r\n}\n"
+      },
+      {
+        "name": "vector_v2i32_constant_first",
+        "ir": "declare { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32>, <2 x i32>)\n\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %mwo = call { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32> <i32 10, i32 7>, <2 x i32> %x)\n  %mul = extractvalue { <2 x i32>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i32>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, <i32 99, i32 100>\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n",
+        "expected_optimized_ir": "define <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %r = icmp ugt <2 x i32> %x, <i32 9, i32 14>\n  ret <2 x i1> %r\n}\n"
+      },
+      {
+        "name": "scalar_i32_power_of_two_multiplier",
+        "ir": "declare { i32, i1 } @llvm.umul.with.overflow.i32(i32, i32)\n\ndefine i1 @scalar_i32_power_of_two_multiplier(i32 %x) {\n  %mwo = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %x, i32 256)\n  %mul = extractvalue { i32, i1 } %mwo, 0\n  %ovf = extractvalue { i32, i1 } %mwo, 1\n  %cmp = icmp ugt i32 %mul, i32 65535\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i32_power_of_two_multiplier(i32 %x) {\n  %r = icmp ugt i32 %x, 255\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i16_compare_near_max",
+        "ir": "declare { i16, i1 } @llvm.umul.with.overflow.i16(i16, i16)\n\ndefine i1 @scalar_i16_compare_near_max(i16 %x) {\n  %mwo = call { i16, i1 } @llvm.umul.with.overflow.i16(i16 %x, i16 9)\n  %mul = extractvalue { i16, i1 } %mwo, 0\n  %ovf = extractvalue { i16, i1 } %mwo, 1\n  %cmp = icmp ugt i16 %mul, i16 65520\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i16_compare_near_max(i16 %x) {\n  %r = icmp ugt i16 %x, 7280\n  ret i1 %r\n}\n"
+      },
+      {
+        "name": "scalar_i8_full_overflow_style",
+        "ir": "declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)\n\ndefine i1 @scalar_i8_full_overflow_style(i8 %x) {\n  %mwo = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %x, i8 2)\n  %mul = extractvalue { i8, i1 } %mwo, 0\n  %ovf = extractvalue { i8, i1 } %mwo, 1\n  %cmp = icmp ugt i8 %mul, i8 254\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @scalar_i8_full_overflow_style(i8 %x) {\n  %r = icmp ugt i8 %x, 127\n  ret i1 %r\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "scalar_i64_original_like",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_original_like(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @scalar_i64_original_like(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 168\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_original_like(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_i64_original_like(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 168\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i64_original_like(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_original_like(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_original_like(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 168\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i64_commuted_mul_constant_first",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 168, i64 %x)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 168, %x\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 168\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 168)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 109802048057794950\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_commuted_mul_constant_first(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 168\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -16\n  %r = or i1 %cmp, %ovf\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i64_multiplier_one",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i64_max_threshold_overflow_boundary",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %mwo = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %x, i64 3)\n  %mul = extractvalue { i64, i1 } %mwo, 0\n  %ovf = extractvalue { i64, i1 } %mwo, 1\n  %cmp = icmp ugt i64 %mul, -1\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %mwo = umul_overflow i64 %x, 3\n  %mul = extractvalue {i64, i1, i24} %mwo, 0\n  %ovf = extractvalue {i64, i1, i24} %mwo, 1\n  %cmp = icmp ugt i64 %mul, -1\n  %r = or i1 %ovf, %cmp\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %ovf = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %ovf\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %ovf = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %ovf\n}\n=>\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #0\n\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n  %ovf = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %ovf\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %r = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %r\n}\n=>\ndefine i1 @scalar_i64_max_threshold_overflow_boundary(i64 %x) {\n#0:\n  %ovf = icmp ugt i64 %x, 6148914691236517205\n  ret i1 %ovf\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_basic",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i32_nontrivial_floor_div",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i16_basic",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i8_basic",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i8_threshold_zero",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i64_large_even_constant",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "vector_v4i8_splat_constants",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 9, i8 9, i8 9, i8 9>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 100, i8 100, i8 100, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 11, i8 11, i8 11, i8 11>\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 9, 9, 9, 9 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 100, 100, 100, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 11, 11, 11, 11 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> splat (i8 9))\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, splat (i8 100)\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 11, i8 11, i8 11, i8 11>\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 9, 9, 9, 9 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 100, 100, 100, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 11, 11, 11, 11 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 11, i8 11, i8 11, i8 11>\n  ret <4 x i1> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> splat (i8 9))\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, splat (i8 100)\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 11, 11, 11, 11 }\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_splat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 9, 9, 9, 9 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 100, 100, 100, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v4i8_nonsplat_constants",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>)\n\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 2, i8 3, i8 5, i8 7>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 9, i8 10, i8 24, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n",
+          "tgt": "define <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 4, i8 3, i8 4, i8 14>\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 2, 3, 5, 7 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 9, 10, 24, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 4, 3, 4, 14 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 2, i8 3, i8 5, i8 7>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 9, i8 10, i8 24, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 4, i8 3, i8 4, i8 14>\n  ret <4 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 2, 3, 5, 7 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 9, 10, 24, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 4, 3, 4, 14 }\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %r = icmp ugt <4 x i8> %x, <i8 4, i8 3, i8 4, i8 14>\n  ret <4 x i1> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8>, <4 x i8>) #0\n\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n  %mwo = call { <4 x i8>, <4 x i1> } @llvm.umul.with.overflow.v4i8(<4 x i8> %x, <4 x i8> <i8 2, i8 3, i8 5, i8 7>)\n  %mul = extractvalue { <4 x i8>, <4 x i1> } %mwo, 0\n  %ovf = extractvalue { <4 x i8>, <4 x i1> } %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, <i8 9, i8 10, i8 24, i8 100>\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %r = icmp ugt <4 x i8> %x, { 4, 3, 4, 14 }\n  ret <4 x i1> %r\n}\n=>\ndefine <4 x i1> @vector_v4i8_nonsplat_constants(<4 x i8> %x) {\n#0:\n  %mwo = umul_overflow <4 x i8> %x, { 2, 3, 5, 7 }\n  %mul = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<4 x i8>, <4 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <4 x i8> %mul, { 9, 10, 24, 100 }\n  %r = or <4 x i1> %ovf, %cmp\n  ret <4 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v2i16_splat_max_threshold",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 2,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 2\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16>, <2 x i16>)\n\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %mwo = call { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16> %x, <2 x i16> <i16 3, i16 3>)\n  %mul = extractvalue { <2 x i16>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i16>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i16> %mul, <i16 -1, i16 -1>\n  %r = or <2 x i1> %cmp, %ovf\n  ret <2 x i1> %r\n}\n",
+          "tgt": "define <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %r = icmp ugt <2 x i16> %x, <i16 21845, i16 21845>\n  ret <2 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %mwo = umul_overflow <2 x i16> %x, { 3, 3 }\n  %mul = extractvalue {<2 x i16>, <2 x i1>, i24} %mwo, 0\n  %ovf = extractvalue {<2 x i16>, <2 x i1>, i24} %mwo, 1\n  %cmp = icmp ugt <2 x i16> %mul, { 65535, 65535 }\n  %r = or <2 x i1> %cmp, %ovf\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %r = icmp ugt <2 x i16> %x, { 21845, 21845 }\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16>, <2 x i16>) #0\n\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %ovf = icmp ugt <2 x i16> %x, splat (i16 21845)\n  ret <2 x i1> %ovf\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %r = icmp ugt <2 x i16> %x, <i16 21845, i16 21845>\n  ret <2 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %ovf = icmp ugt <2 x i16> %x, { 21845, 21845 }\n  ret <2 x i1> %ovf\n}\n=>\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %r = icmp ugt <2 x i16> %x, { 21845, 21845 }\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %r = icmp ugt <2 x i16> %x, <i16 21845, i16 21845>\n  ret <2 x i1> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <2 x i16>, <2 x i1> } @llvm.umul.with.overflow.v2i16(<2 x i16>, <2 x i16>) #0\n\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n  %ovf = icmp ugt <2 x i16> %x, splat (i16 21845)\n  ret <2 x i1> %ovf\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %r = icmp ugt <2 x i16> %x, { 21845, 21845 }\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_v2i16_splat_max_threshold(<2 x i16> %x) {\n#0:\n  %ovf = icmp ugt <2 x i16> %x, { 21845, 21845 }\n  ret <2 x i1> %ovf\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_v2i32_constant_first",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 2,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32>, <2 x i32>)\n\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %mwo = call { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32> <i32 10, i32 7>, <2 x i32> %x)\n  %mul = extractvalue { <2 x i32>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i32>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, <i32 99, i32 100>\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n",
+          "tgt": "define <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %r = icmp ugt <2 x i32> %x, <i32 9, i32 14>\n  ret <2 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %mwo = umul_overflow <2 x i32> { 10, 7 }, %x\n  %mul = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 0\n  %ovf = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, { 99, 100 }\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %r = icmp ugt <2 x i32> %x, { 9, 14 }\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32>, <2 x i32>) #0\n\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %mwo = call { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32> %x, <2 x i32> <i32 10, i32 7>)\n  %mul = extractvalue { <2 x i32>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i32>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, <i32 99, i32 100>\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "tgt": "define <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %r = icmp ugt <2 x i32> %x, <i32 9, i32 14>\n  ret <2 x i1> %r\n}\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %mwo = umul_overflow <2 x i32> %x, { 10, 7 }\n  %mul = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 0\n  %ovf = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, { 99, 100 }\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %r = icmp ugt <2 x i32> %x, { 9, 14 }\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %r = icmp ugt <2 x i32> %x, <i32 9, i32 14>\n  ret <2 x i1> %r\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind speculatable willreturn memory(none)\ndeclare { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32>, <2 x i32>) #0\n\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n  %mwo = call { <2 x i32>, <2 x i1> } @llvm.umul.with.overflow.v2i32(<2 x i32> %x, <2 x i32> <i32 10, i32 7>)\n  %mul = extractvalue { <2 x i32>, <2 x i1> } %mwo, 0\n  %ovf = extractvalue { <2 x i32>, <2 x i1> } %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, <i32 99, i32 100>\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\n\nattributes #0 = { nocallback nosync nounwind speculatable willreturn memory(none) }\n",
+          "log": "\n----------------------------------------\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %r = icmp ugt <2 x i32> %x, { 9, 14 }\n  ret <2 x i1> %r\n}\n=>\ndefine <2 x i1> @vector_v2i32_constant_first(<2 x i32> %x) {\n#0:\n  %mwo = umul_overflow <2 x i32> %x, { 10, 7 }\n  %mul = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 0\n  %ovf = extractvalue {<2 x i32>, <2 x i1>, i56} %mwo, 1\n  %cmp = icmp ugt <2 x i32> %mul, { 99, 100 }\n  %r = or <2 x i1> %ovf, %cmp\n  ret <2 x i1> %r\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_i32_power_of_two_multiplier",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i16_compare_near_max",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "scalar_i8_full_overflow_style",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.6s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

@@ -1,0 +1,931 @@
+{
+  "issue_id": "121701",
+  "dataset_file": "121701.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @bitwise_and_logical_and_masked_icmp_allzeros_poison2(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n\ndefine i1 @bitwise_and_logical_and_masked_icmp_allzeros_poison2(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Missed optimization: Combining masked ICMP checks with a select-and pattern into a single masked check. Specifically, `(select (icmp eq (and x, C), 0), %c, false) AND (icmp eq (and x, y), 0)` can be transformed into `select (icmp eq (and x, (or C, y)), 0), %c, false`.\",\n  \"before_after\": {\n    \"before\": \"%x.m1 = and i32 %x, 8; %c1 = icmp eq i32 %x.m1, 0; %and1 = select i1 %c1, i1 %c, i1 false; %x.m2 = and i32 %x, %y; %c2 = icmp eq i32 %x.m2, 0; %and2 = and i1 %and1, %c2; ret i1 %and2\",\n    \"after\": \"%m = or i32 %y, 8; %t = and i32 %x, %m; %c = icmp eq i32 %t, 0; %r = select i1 %c, i1 %c_input, i1 false; ret i1 %r\"\n  },\n  \"preconditions\": [\n    \"Both icmp instructions must be 'eq' comparisons against zero\",\n    \"Both and instructions must share the same first operand (%x)\",\n    \"One and instruction must have a constant second operand\",\n    \"The select must return the predicate value (%c) on true and false constant on false\",\n    \"The final and combines the select result with the second icmp result\",\n    \"No extra uses of intermediate values that would prevent DCE\",\n    \"Types must be compatible (same bitwidth for and operands, i1 for icmp results)\"\n  ],\n  \"pattern\": {\n    \"canonical_form\": \"Pattern: `and (select (icmp eq (and %x, %C), 0), %c, false), (icmp eq (and %x, %y), 0)` where %C is a constant\",\n    \"rewrite\": \"Transforms to: `select (icmp eq (and %x, (or %C, %y)), 0), %c, false`\",\n    \"algebraic_insight\": \"The two conditions `(and x, C) == 0` and `(and x, y) == 0` are equivalent to `(and x, (or C, y)) == 0`. The select pattern `select cond, %c, false` is equivalent to `and cond, %c`, allowing us to combine the AND chain.\"\n  },\n  \"testcases\": [\n    {\n      \"name\": \"basic_case_i32\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Original reproducer case with i32 bitwidth\"\n    },\n    {\n      \"name\": \"commuted_and_operands\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 8, %x\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %y, %x\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"and is commutative, should handle both operand orders\"\n    },\n    {\n      \"name\": \"commuted_final_and\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %c2, %and1\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Final and operands can be in either order\"\n    },\n    {\n      \"name\": \"commuted_icmp_eq\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 0, %x.m1\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"icmp eq is commutative, should match 0 == x as well as x == 0\"\n    },\n    {\n      \"name\": \"multi_bit_constant\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 15\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 15\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Constant with multiple bits set should work\"\n    },\n    {\n      \"name\": \"i64_bitwidth\",\n      \"ir\": \"define i1 @test(i1 %c, i64 %x, i64 %y) {\\n  %x.m1 = and i64 %x, 8\\n  %c1 = icmp eq i64 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i64 %x, %y\\n  %c2 = icmp eq i64 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i64 %x, i64 %y) {\\n  %1 = or i64 %y, 8\\n  %2 = and i64 %x, %1\\n  %3 = icmp eq i64 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Different bitwidth (i64) should work\"\n    },\n    {\n      \"name\": \"i8_bitwidth\",\n      \"ir\": \"define i1 @test(i1 %c, i8 %x, i8 %y) {\\n  %x.m1 = and i8 %x, 8\\n  %c1 = icmp eq i8 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i8 %x, %y\\n  %c2 = icmp eq i8 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i8 %x, i8 %y) {\\n  %1 = or i8 %y, 8\\n  %2 = and i8 %x, %1\\n  %3 = icmp eq i8 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Smaller bitwidth (i8) should work\"\n    },\n    {\n      \"name\": \"i1_bitwidth\",\n      \"ir\": \"define i1 @test(i1 %c, i1 %x, i1 %y) {\\n  %x.m1 = and i1 %x, true\\n  %c1 = icmp eq i1 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i1 %x, %y\\n  %c2 = icmp eq i1 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i1 %x, i1 %y) {\\n  %1 = or i1 %y, true\\n  %2 = and i1 %x, %1\\n  %3 = icmp eq i1 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Smallest bitwidth (i1) should work\"\n    },\n    {\n      \"name\": \"vector_i32_4x\",\n      \"ir\": \"define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\\n  %x.m1 = and <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\\n  %c1 = icmp eq <4 x i32> %x.m1, zeroinitializer\\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> zeroinitializer\\n  %x.m2 = and <4 x i32> %x, %y\\n  %c2 = icmp eq <4 x i32> %x.m2, zeroinitializer\\n  %and2 = and <4 x i1> %and1, %c2\\n  ret <4 x i1> %and2\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\\n  %1 = or <4 x i32> %y, <i32 8, i32 8, i32 8, i32 8>\\n  %2 = and <4 x i32> %x, %1\\n  %3 = icmp eq <4 x i32> %2, zeroinitializer\\n  %and2 = select <4 x i1> %3, <4 x i1> %c, <4 x i1> zeroinitializer\\n  ret <4 x i1> %and2\\n}\",\n      \"why\": \"Vector types should work element-wise\"\n    },\n    {\n      \"name\": \"negative_icmp_ne\",\n      \"ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp ne i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp ne i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"why\": \"icmp ne breaks the pattern, should not transform\"\n    },\n    {\n      \"name\": \"negative_icmp_nonzero\",\n      \"ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 1\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 1\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"why\": \"Comparing against non-zero constant breaks the pattern\"\n    },\n    {\n      \"name\": \"negative_different_and_operands\",\n      \"ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %z, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %z, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"why\": \"and instructions don't share first operand, should not transform\"\n    },\n    {\n      \"name\": \"negative_select_wrong_false_value\",\n      \"ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 true\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 true\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"why\": \"select returns true instead of false, breaks the equivalence to AND\"\n    },\n    {\n      \"name\": \"negative_select_swapped_arms\",\n      \"ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 false, i1 %c\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 false, i1 %c\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"why\": \"select arms are swapped, not equivalent to simple AND pattern\"\n    },\n    {\n      \"name\": \"constant_zero_mask\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 0\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = select i1 %c2, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Constant mask of 0 makes first icmp always true, select simplifies to %c\"\n    },\n    {\n      \"name\": \"constant_all_ones_mask\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, -1\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, -1\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Constant mask of -1 works, or with -1 is identity\"\n    },\n    {\n      \"name\": \"high_bit_constant\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, -2147483648\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, -2147483648\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"High bit (sign bit) constant should work\"\n    },\n    {\n      \"name\": \"alternating_bits_constant\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 1431655765\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 1431655765\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Alternating bits pattern (0x55555555) should work\"\n    },\n    {\n      \"name\": \"unusual_bitwidth_i16\",\n      \"ir\": \"define i1 @test(i1 %c, i16 %x, i16 %y) {\\n  %x.m1 = and i16 %x, 8\\n  %c1 = icmp eq i16 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i16 %x, %y\\n  %c2 = icmp eq i16 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i16 %x, i16 %y) {\\n  %1 = or i16 %y, 8\\n  %2 = and i16 %x, %1\\n  %3 = icmp eq i16 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Unusual but valid bitwidth (i16)\"\n    },\n    {\n      \"name\": \"with_freeze\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.fr = freeze i32 %x\\n  %x.m1 = and i32 %x.fr, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x.fr, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.fr = freeze i32 %x\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x.fr, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Freeze should not prevent the optimization as long as it's on shared operand\"\n    },\n    {\n      \"name\": \"chained_two_constants\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %s1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, 16\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %s2 = and i1 %s1, %c2\\n  %x.m3 = and i32 %x, %y\\n  %c3 = icmp eq i32 %x.m3, 0\\n  %and2 = and i1 %s2, %c3\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %1 = or i32 %y, 24\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Chained pattern with two constants (8 | 16 = 24)\"\n    },\n    {\n      \"name\": \"multiple_uses_intermediate\",\n      \"ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %and1 = select i1 %c1, i1 %c, i1 false\\n  %x.m2 = and i32 %x, %y\\n  %c2 = icmp eq i32 %x.m2, 0\\n  %and2 = and i1 %and1, %c2\\n  %use = xor i32 %x.m2, 8\\n  ret i1 %and2\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %c, i32 %x, i32 %y) {\\n  %x.m1 = and i32 %x, 8\\n  %c1 = icmp eq i32 %x.m1, 0\\n  %x.m2 = and i32 %x, %y\\n  %use = xor i32 %x.m2, 8\\n  %1 = or i32 %y, 8\\n  %2 = and i32 %x, %1\\n  %3 = icmp eq i32 %2, 0\\n  %and2 = select i1 %3, i1 %c, i1 false\\n  ret i1 %and2\\n}\",\n      \"why\": \"Extra use of %x.m2 should prevent its elimination but optimization still valid for result\"\n    }\n  ],\n  \"implementation_notes\": {\n    \"match_strategy\": \"Match the final 'and i1' instruction, then check if one operand is a select with the specific pattern and the other is an icmp eq against zero. Verify both icmps check and instructions with the same first operand, where one and has a constant second operand.\",\n    \"fold_steps\": [\n      \"1. Match: %r = and i1 %select_result, %icmp_result\",\n      \"2. Verify %select_result = select i1 %cond1, i1 %c, i1 false\",\n      \"3. Verify %icmp_result = icmp eq %and2_val, 0\",\n      \"4. Verify %cond1 = icmp eq %and1_val, 0\",\n      \"5. Verify %and1_val = and %x, %C (where %C is constant)\",\n      \"6. Verify %and2_val = and %x, %y (same %x)\",\n      \"7. Compute: %new_mask = or %y, %C\",\n      \"8. Create: %new_and = and %x, %new_mask\",\n      \"9. Create: %new_cond = icmp eq %new_and, 0\",\n      \"10. Create: %new_select = select i1 %new_cond, i1 %c, i1 false\",\n      \"11. Replace: %r with %new_select\"\n    ],\n    \"pitfalls\": [\n      \"Must check for multiple uses of intermediate values - only DCE if single use\",\n      \"Vectors vs scalars - handle both uniformly through Type::isVectorTy()\",\n      \"Commutativity - handle swapped operands in and and icmp\",\n      \"Poison safety - verify transformation preserves poison semantics (it does: or propagates poison, and propagates poison)\",\n      \"The constant could be in the second 'and' instead of first - handle both cases\",\n      \"Select with swapped arms (false, %c) instead of (%c, false) requires negated condition - different pattern\",\n      \"Need to ensure types match exactly when creating new instructions\",\n      \"The 'false' constant in select must be a ConstantInt::getFalse(), not just any zero i1\"\n    ],\n    \"location\": \"InstCombine::visitSelect or InstCombine::visitAnd - likely visitAnd since the pattern is anchored by the final AND\",\n    \"related_patterns\": [\n      \"Fold (icmp eq (and X, C1), 0) & (icmp eq (and X, C2), 0) -> icmp eq (and X, (or C1, C2)), 0\",\n      \"Fold (select A, B, false) & C -> select A, (B & C), false (when A and C independent)\",\n      \"Demorgan's law applications for combining icmp conditions\"\n    ]\n  },\n  \"regression_test_notes\": {\n    \"file_location\": \"llvm/test/Transforms/InstCombine/and-select-icmp-mask.ll\",\n    \"check_directives\": [\n      \"; CHECK-LABEL: @test_basic\",\n      \"; CHECK: %[[OR:.+]] = or i32 %y, 8\",\n      \"; CHECK: %[[AND:.+]] = and i32 %x, %[[OR]]\",\n      \"; CHECK: %[[ICMP:.+]] = icmp eq i32 %[[AND]], 0\",\n      \"; CHECK: select i1 %[[ICMP]], i1 %c, i1 false\"\n    ],\n    \"negative_test_directives\": [\n      \"; CHECK-NOT: or i32\",\n      \"; For negative tests, verify the original pattern remains\"\n    ],\n    \"run_command\": \"opt -passes=instcombine -S < test.ll\"\n  },\n  \"clarifying_questions\": [\n    \"Should this optimization also handle the case where the select returns (select cond, false, %c) with a negated condition?\",\n    \"Should we attempt to chain multiple constants iteratively (e.g., fold 3+ constant masks in one pass)?\",\n    \"Are there any specific target-dependent considerations (e.g., certain architectures where this transformation might be detrimental)?\"\n  ]\n}\n```",
+  "parsed": {
+    "summary": "Missed optimization: Combining masked ICMP checks with a select-and pattern into a single masked check. Specifically, `(select (icmp eq (and x, C), 0), %c, false) AND (icmp eq (and x, y), 0)` can be transformed into `select (icmp eq (and x, (or C, y)), 0), %c, false`.",
+    "before_after": {
+      "before": "%x.m1 = and i32 %x, 8; %c1 = icmp eq i32 %x.m1, 0; %and1 = select i1 %c1, i1 %c, i1 false; %x.m2 = and i32 %x, %y; %c2 = icmp eq i32 %x.m2, 0; %and2 = and i1 %and1, %c2; ret i1 %and2",
+      "after": "%m = or i32 %y, 8; %t = and i32 %x, %m; %c = icmp eq i32 %t, 0; %r = select i1 %c, i1 %c_input, i1 false; ret i1 %r"
+    },
+    "preconditions": [
+      "Both icmp instructions must be 'eq' comparisons against zero",
+      "Both and instructions must share the same first operand (%x)",
+      "One and instruction must have a constant second operand",
+      "The select must return the predicate value (%c) on true and false constant on false",
+      "The final and combines the select result with the second icmp result",
+      "No extra uses of intermediate values that would prevent DCE",
+      "Types must be compatible (same bitwidth for and operands, i1 for icmp results)"
+    ],
+    "pattern": {
+      "canonical_form": "Pattern: `and (select (icmp eq (and %x, %C), 0), %c, false), (icmp eq (and %x, %y), 0)` where %C is a constant",
+      "rewrite": "Transforms to: `select (icmp eq (and %x, (or %C, %y)), 0), %c, false`",
+      "algebraic_insight": "The two conditions `(and x, C) == 0` and `(and x, y) == 0` are equivalent to `(and x, (or C, y)) == 0`. The select pattern `select cond, %c, false` is equivalent to `and cond, %c`, allowing us to combine the AND chain."
+    },
+    "testcases": [
+      {
+        "name": "basic_case_i32",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Original reproducer case with i32 bitwidth"
+      },
+      {
+        "name": "commuted_and_operands",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 8, %x\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "and is commutative, should handle both operand orders"
+      },
+      {
+        "name": "commuted_final_and",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c2, %and1\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Final and operands can be in either order"
+      },
+      {
+        "name": "commuted_icmp_eq",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 0, %x.m1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "icmp eq is commutative, should match 0 == x as well as x == 0"
+      },
+      {
+        "name": "multi_bit_constant",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 15\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Constant with multiple bits set should work"
+      },
+      {
+        "name": "i64_bitwidth",
+        "ir": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %1 = or i64 %y, 8\n  %2 = and i64 %x, %1\n  %3 = icmp eq i64 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Different bitwidth (i64) should work"
+      },
+      {
+        "name": "i8_bitwidth",
+        "ir": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %1 = or i8 %y, 8\n  %2 = and i8 %x, %1\n  %3 = icmp eq i8 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Smaller bitwidth (i8) should work"
+      },
+      {
+        "name": "i1_bitwidth",
+        "ir": "define i1 @test(i1 %c, i1 %x, i1 %y) {\n  %x.m1 = and i1 %x, true\n  %c1 = icmp eq i1 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i1 %x, %y\n  %c2 = icmp eq i1 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i1 %x, i1 %y) {\n  %1 = or i1 %y, true\n  %2 = and i1 %x, %1\n  %3 = icmp eq i1 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Smallest bitwidth (i1) should work"
+      },
+      {
+        "name": "vector_i32_4x",
+        "ir": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %x.m1 = and <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c1 = icmp eq <4 x i32> %x.m1, zeroinitializer\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> zeroinitializer\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, zeroinitializer\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %1 = or <4 x i32> %y, <i32 8, i32 8, i32 8, i32 8>\n  %2 = and <4 x i32> %x, %1\n  %3 = icmp eq <4 x i32> %2, zeroinitializer\n  %and2 = select <4 x i1> %3, <4 x i1> %c, <4 x i1> zeroinitializer\n  ret <4 x i1> %and2\n}",
+        "why": "Vector types should work element-wise"
+      },
+      {
+        "name": "negative_icmp_ne",
+        "ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "why": "icmp ne breaks the pattern, should not transform"
+      },
+      {
+        "name": "negative_icmp_nonzero",
+        "ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "why": "Comparing against non-zero constant breaks the pattern"
+      },
+      {
+        "name": "negative_different_and_operands",
+        "ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "why": "and instructions don't share first operand, should not transform"
+      },
+      {
+        "name": "negative_select_wrong_false_value",
+        "ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "why": "select returns true instead of false, breaks the equivalence to AND"
+      },
+      {
+        "name": "negative_select_swapped_arms",
+        "ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "why": "select arms are swapped, not equivalent to simple AND pattern"
+      },
+      {
+        "name": "constant_zero_mask",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 0\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Constant mask of 0 makes first icmp always true, select simplifies to %c"
+      },
+      {
+        "name": "constant_all_ones_mask",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, -1\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -1\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Constant mask of -1 works, or with -1 is identity"
+      },
+      {
+        "name": "high_bit_constant",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, -2147483648\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -2147483648\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "High bit (sign bit) constant should work"
+      },
+      {
+        "name": "alternating_bits_constant",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 1431655765\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Alternating bits pattern (0x55555555) should work"
+      },
+      {
+        "name": "unusual_bitwidth_i16",
+        "ir": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %1 = or i16 %y, 8\n  %2 = and i16 %x, %1\n  %3 = icmp eq i16 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Unusual but valid bitwidth (i16)"
+      },
+      {
+        "name": "with_freeze",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %1 = or i32 %y, 8\n  %2 = and i32 %x.fr, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Freeze should not prevent the optimization as long as it's on shared operand"
+      },
+      {
+        "name": "chained_two_constants",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %s1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, 16\n  %c2 = icmp eq i32 %x.m2, 0\n  %s2 = and i1 %s1, %c2\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 24\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Chained pattern with two constants (8 | 16 = 24)"
+      },
+      {
+        "name": "multiple_uses_intermediate",
+        "ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  %use = xor i32 %x.m2, 8\n  ret i1 %and2\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %x.m2 = and i32 %x, %y\n  %use = xor i32 %x.m2, 8\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+        "why": "Extra use of %x.m2 should prevent its elimination but optimization still valid for result"
+      }
+    ],
+    "implementation_notes": {
+      "match_strategy": "Match the final 'and i1' instruction, then check if one operand is a select with the specific pattern and the other is an icmp eq against zero. Verify both icmps check and instructions with the same first operand, where one and has a constant second operand.",
+      "fold_steps": [
+        "1. Match: %r = and i1 %select_result, %icmp_result",
+        "2. Verify %select_result = select i1 %cond1, i1 %c, i1 false",
+        "3. Verify %icmp_result = icmp eq %and2_val, 0",
+        "4. Verify %cond1 = icmp eq %and1_val, 0",
+        "5. Verify %and1_val = and %x, %C (where %C is constant)",
+        "6. Verify %and2_val = and %x, %y (same %x)",
+        "7. Compute: %new_mask = or %y, %C",
+        "8. Create: %new_and = and %x, %new_mask",
+        "9. Create: %new_cond = icmp eq %new_and, 0",
+        "10. Create: %new_select = select i1 %new_cond, i1 %c, i1 false",
+        "11. Replace: %r with %new_select"
+      ],
+      "pitfalls": [
+        "Must check for multiple uses of intermediate values - only DCE if single use",
+        "Vectors vs scalars - handle both uniformly through Type::isVectorTy()",
+        "Commutativity - handle swapped operands in and and icmp",
+        "Poison safety - verify transformation preserves poison semantics (it does: or propagates poison, and propagates poison)",
+        "The constant could be in the second 'and' instead of first - handle both cases",
+        "Select with swapped arms (false, %c) instead of (%c, false) requires negated condition - different pattern",
+        "Need to ensure types match exactly when creating new instructions",
+        "The 'false' constant in select must be a ConstantInt::getFalse(), not just any zero i1"
+      ],
+      "location": "InstCombine::visitSelect or InstCombine::visitAnd - likely visitAnd since the pattern is anchored by the final AND",
+      "related_patterns": [
+        "Fold (icmp eq (and X, C1), 0) & (icmp eq (and X, C2), 0) -> icmp eq (and X, (or C1, C2)), 0",
+        "Fold (select A, B, false) & C -> select A, (B & C), false (when A and C independent)",
+        "Demorgan's law applications for combining icmp conditions"
+      ]
+    },
+    "regression_test_notes": {
+      "file_location": "llvm/test/Transforms/InstCombine/and-select-icmp-mask.ll",
+      "check_directives": [
+        "; CHECK-LABEL: @test_basic",
+        "; CHECK: %[[OR:.+]] = or i32 %y, 8",
+        "; CHECK: %[[AND:.+]] = and i32 %x, %[[OR]]",
+        "; CHECK: %[[ICMP:.+]] = icmp eq i32 %[[AND]], 0",
+        "; CHECK: select i1 %[[ICMP]], i1 %c, i1 false"
+      ],
+      "negative_test_directives": [
+        "; CHECK-NOT: or i32",
+        "; For negative tests, verify the original pattern remains"
+      ],
+      "run_command": "opt -passes=instcombine -S < test.ll"
+    },
+    "clarifying_questions": [
+      "Should this optimization also handle the case where the select returns (select cond, false, %c) with a negated condition?",
+      "Should we attempt to chain multiple constants iteratively (e.g., fold 3+ constant masks in one pass)?",
+      "Are there any specific target-dependent considerations (e.g., certain architectures where this transformation might be detrimental)?"
+    ]
+  },
+  "validation": [
+    {
+      "name": "basic_case_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x00000007 (7)\ni32 %y = #x00000007 (7)\n\nSource:\ni32 %#1 = #x0000000f (15)\ni32 %#2 = #x00000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x00000007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_and_operands",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 8, %x\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 8, %x\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %y, %x\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x00000007 (7)\ni32 %y = #x00000007 (7)\n\nSource:\ni32 %#1 = #x0000000f (15)\ni32 %#2 = #x00000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x00000007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_final_and",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c2, %and1\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c2, %and1\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_icmp_eq",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 0, %x.m1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 0, %x.m1\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 8\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x00000007 (7)\ni32 %y = #x00000007 (7)\n\nSource:\ni32 %#1 = #x0000000f (15)\ni32 %#2 = #x00000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x00000007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multi_bit_constant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 15\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 15\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 15\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 15\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 15\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 15\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 15\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x000000f0 (240)\ni32 %y = #x000000f0 (240)\n\nSource:\ni32 %#1 = #x000000ff (255)\ni32 %#2 = #x000000f0 (240)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x000000f0 (240)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i64_bitwidth",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %1 = or i64 %y, 8\n  %2 = and i64 %x, %1\n  %3 = icmp eq i64 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %#1 = or i64 %y, 8\n  %#2 = and i64 %x, %#1\n  %#3 = icmp eq i64 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %1 = or i64 %y, 8\n  %2 = and i64 %x, %1\n  %3 = icmp eq i64 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %#1 = or i64 %y, 8\n  %#2 = and i64 %x, %#1\n  %#3 = icmp eq i64 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i64 %x, i64 %y) {\n  %1 = or i64 %y, 8\n  %2 = and i64 %x, %1\n  %3 = icmp eq i64 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %#1 = or i64 %y, 8\n  %#2 = and i64 %x, %#1\n  %#3 = icmp eq i64 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i64 %x, i64 %y) {\n#0:\n  %x.m1 = and i64 %x, 8\n  %c1 = icmp eq i64 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i64 %x, %y\n  %c2 = icmp eq i64 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni64 %x = #x0000000000000007 (7)\ni64 %y = #x0000000000000007 (7)\n\nSource:\ni64 %#1 = #x000000000000000f (15)\ni64 %#2 = #x0000000000000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni64 %x.m1 = #x0000000000000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni64 %x.m2 = #x0000000000000007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i8_bitwidth",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %1 = or i8 %y, 8\n  %2 = and i8 %x, %1\n  %3 = icmp eq i8 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %#1 = or i8 %y, 8\n  %#2 = and i8 %x, %#1\n  %#3 = icmp eq i8 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %1 = or i8 %y, 8\n  %2 = and i8 %x, %1\n  %3 = icmp eq i8 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %#1 = or i8 %y, 8\n  %#2 = and i8 %x, %#1\n  %#3 = icmp eq i8 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i8 %x, i8 %y) {\n  %1 = or i8 %y, 8\n  %2 = and i8 %x, %1\n  %3 = icmp eq i8 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %#1 = or i8 %y, 8\n  %#2 = and i8 %x, %#1\n  %#3 = icmp eq i8 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i8 %x, i8 %y) {\n#0:\n  %x.m1 = and i8 %x, 8\n  %c1 = icmp eq i8 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i8 %x, %y\n  %c2 = icmp eq i8 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni8 %x = #x07 (7)\ni8 %y = #x07 (7)\n\nSource:\ni8 %#1 = #x0f (15)\ni8 %#2 = #x07 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni8 %x.m1 = #x00 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni8 %x.m2 = #x07 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i1_bitwidth",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 3,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 3\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "vector_i32_4x",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %x.m1 = and <4 x i32> %x, <i32 8, i32 8, i32 8, i32 8>\n  %c1 = icmp eq <4 x i32> %x.m1, zeroinitializer\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> zeroinitializer\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, zeroinitializer\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}",
+          "tgt": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %1 = or <4 x i32> %y, <i32 8, i32 8, i32 8, i32 8>\n  %2 = and <4 x i32> %x, %1\n  %3 = icmp eq <4 x i32> %2, zeroinitializer\n  %and2 = select <4 x i1> %3, <4 x i1> %c, <4 x i1> zeroinitializer\n  ret <4 x i1> %and2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %x.m1 = and <4 x i32> %x, { 8, 8, 8, 8 }\n  %c1 = icmp eq <4 x i32> %x.m1, { 0, 0, 0, 0 }\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, { 0, 0, 0, 0 }\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = or <4 x i32> %y, { 8, 8, 8, 8 }\n  %#2 = and <4 x i32> %x, %#1\n  %#3 = icmp eq <4 x i32> %#2, { 0, 0, 0, 0 }\n  %and2 = select <4 x i1> %#3, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  ret <4 x i1> %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %x.m1 = and <4 x i32> %x, splat (i32 8)\n  %c1 = icmp eq <4 x i32> %x.m1, zeroinitializer\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> zeroinitializer\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, zeroinitializer\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %1 = or <4 x i32> %y, <i32 8, i32 8, i32 8, i32 8>\n  %2 = and <4 x i32> %x, %1\n  %3 = icmp eq <4 x i32> %2, zeroinitializer\n  %and2 = select <4 x i1> %3, <4 x i1> %c, <4 x i1> zeroinitializer\n  ret <4 x i1> %and2\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %x.m1 = and <4 x i32> %x, { 8, 8, 8, 8 }\n  %c1 = icmp eq <4 x i32> %x.m1, { 0, 0, 0, 0 }\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, { 0, 0, 0, 0 }\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = or <4 x i32> %y, { 8, 8, 8, 8 }\n  %#2 = and <4 x i32> %x, %#1\n  %#3 = icmp eq <4 x i32> %#2, { 0, 0, 0, 0 }\n  %and2 = select <4 x i1> %#3, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  ret <4 x i1> %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %1 = or <4 x i32> %y, <i32 8, i32 8, i32 8, i32 8>\n  %2 = and <4 x i32> %x, %1\n  %3 = icmp eq <4 x i32> %2, zeroinitializer\n  %and2 = select <4 x i1> %3, <4 x i1> %c, <4 x i1> zeroinitializer\n  ret <4 x i1> %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n  %x.m1 = and <4 x i32> %x, splat (i32 8)\n  %c1 = icmp eq <4 x i32> %x.m1, zeroinitializer\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> zeroinitializer\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, zeroinitializer\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %#1 = or <4 x i32> %y, { 8, 8, 8, 8 }\n  %#2 = and <4 x i32> %x, %#1\n  %#3 = icmp eq <4 x i32> %#2, { 0, 0, 0, 0 }\n  %and2 = select <4 x i1> %#3, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  ret <4 x i1> %and2\n}\n=>\ndefine <4 x i1> @test(<4 x i1> %c, <4 x i32> %x, <4 x i32> %y) {\n#0:\n  %x.m1 = and <4 x i32> %x, { 8, 8, 8, 8 }\n  %c1 = icmp eq <4 x i32> %x.m1, { 0, 0, 0, 0 }\n  %and1 = select <4 x i1> %c1, <4 x i1> %c, <4 x i1> { 0, 0, 0, 0 }\n  %x.m2 = and <4 x i32> %x, %y\n  %c2 = icmp eq <4 x i32> %x.m2, { 0, 0, 0, 0 }\n  %and2 = and <4 x i1> %and1, %c2\n  ret <4 x i1> %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<4 x i1> %c = < #x1 (1), poison, #x1 (1), #x1 (1) >\n<4 x i32> %x = < #x00000000 (0), #x00000007 (7), #x00000000 (0), #x00000000 (0) >\n<4 x i32> %y = < #x00000000 (0), #x00000007 (7), #x00000000 (0), #x00000000 (0) >\n\nSource:\n<4 x i32> %#1 = < #x00000008 (8), #x0000000f (15), #x00000008 (8), #x00000008 (8) >\n<4 x i32> %#2 = < #x00000000 (0), #x00000007 (7), #x00000000 (0), #x00000000 (0) >\n<4 x i1> %#3 = < #x1 (1), #x0 (0), #x1 (1), #x1 (1) >\n<4 x i1> %and2 = < #x1 (1), #x0 (0), #x1 (1), #x1 (1) >\n\nTarget:\n<4 x i32> %x.m1 = < #x00000000 (0), #x00000000 (0), #x00000000 (0), #x00000000 (0) >\n<4 x i1> %c1 = < #x1 (1), #x1 (1), #x1 (1), #x1 (1) >\n<4 x i1> %and1 = < #x1 (1), poison, #x1 (1), #x1 (1) >\n<4 x i32> %x.m2 = < #x00000000 (0), #x00000007 (7), #x00000000 (0), #x00000000 (0) >\n<4 x i1> %c2 = < #x1 (1), #x0 (0), #x1 (1), #x1 (1) >\n<4 x i1> %and2 = < #x1 (1), poison, #x1 (1), #x1 (1) >\nSource value: < #x1 (1), #x0 (0), #x1 (1), #x1 (1) >\nTarget value: < #x1 (1), poison, #x1 (1), #x1 (1) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_icmp_ne",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_icmp_nonzero",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 1,
+        "expected_le_current_opt": false,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 1\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "negative_different_and_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y, i32 %z) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %z, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_select_wrong_false_value",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 1\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 1\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 true, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 1, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 1\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 true\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 true, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 1\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 1, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_select_swapped_arms",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 7,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 7\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 0, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 0, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 0, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 false, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 0, i1 %c\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test_neg(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp ne i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_zero_mask",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 4,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 0\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 0\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = select i1 %c2, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %c, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x0000000f (15)\ni32 %y = #x0000000f (15)\n\nSource:\ni32 %x.m2 = #x0000000f (15)\ni1 %c2 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m2 = #x0000000f (15)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "constant_all_ones_mask",
+      "missed_optimization": true,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, -1\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -1\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 4294967295\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 4294967295\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %c1 = icmp eq i32 %x, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -1\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %c1 = icmp eq i32 %x, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 4294967295\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -1\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %c1 = icmp eq i32 %x, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 4294967295\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %c1 = icmp eq i32 %x, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "high_bit_constant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, -2147483648\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -2147483648\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 2147483648\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 2147483648\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %c1 = icmp sgt i32 %x, -1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -2147483648\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %c1 = icmp sgt i32 %x, 4294967295\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 2147483648\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, -2147483648\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %c1 = icmp sgt i32 %x, -1\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 2147483648\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %c1 = icmp sgt i32 %x, 4294967295\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x0000000f (15)\ni32 %y = #x0000000f (15)\n\nSource:\ni32 %#1 = #x8000000f (2147483663, -2147483633)\ni32 %#2 = #x0000000f (15)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x0000000f (15)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "alternating_bits_constant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 1431655765\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 1431655765\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 1431655765\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 1431655765\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 1431655765\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 1431655765\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 1431655765\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x0000000a (10)\ni32 %y = #x0000000a (10)\n\nSource:\ni32 %#1 = #x5555555f (1431655775)\ni32 %#2 = #x0000000a (10)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x0000000a (10)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "unusual_bitwidth_i16",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %1 = or i16 %y, 8\n  %2 = and i16 %x, %1\n  %3 = icmp eq i16 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %#1 = or i16 %y, 8\n  %#2 = and i16 %x, %#1\n  %#3 = icmp eq i16 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %1 = or i16 %y, 8\n  %2 = and i16 %x, %1\n  %3 = icmp eq i16 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %#1 = or i16 %y, 8\n  %#2 = and i16 %x, %#1\n  %#3 = icmp eq i16 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i16 %x, i16 %y) {\n  %1 = or i16 %y, 8\n  %2 = and i16 %x, %1\n  %3 = icmp eq i16 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %#1 = or i16 %y, 8\n  %#2 = and i16 %x, %#1\n  %#3 = icmp eq i16 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i16 %x, i16 %y) {\n#0:\n  %x.m1 = and i16 %x, 8\n  %c1 = icmp eq i16 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i16 %x, %y\n  %c2 = icmp eq i16 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni16 %x = #x0007 (7)\ni16 %y = #x0007 (7)\n\nSource:\ni16 %#1 = #x000f (15)\ni16 %#2 = #x0007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni16 %x.m1 = #x0000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni16 %x.m2 = #x0007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "with_freeze",
+      "missed_optimization": false,
+      "cost": {
+        "source": 8,
+        "expected": 6,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %1 = or i32 %y, 8\n  %2 = and i32 %x.fr, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x.fr, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %1 = or i32 %y, 8\n  %2 = and i32 %x.fr, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x.fr, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %1 = or i32 %y, 8\n  %2 = and i32 %x.fr, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %#1 = or i32 %y, 8\n  %#2 = and i32 %x.fr, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.fr = freeze i32 %x\n  %x.m1 = and i32 %x.fr, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %and1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x.fr, %y\n  %c2 = icmp eq i32 %x.m2, 0\n  %and2 = and i1 %and1, %c2\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x00000007 (7)\ni32 %y = #x00000007 (7)\n\nSource:\ni32 %x.fr = #x00000007 (7)\ni32 %#1 = #x0000000f (15)\ni32 %#2 = #x00000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %x.fr = #x00000007 (7)\ni32 %x.m1 = #x00000000 (0)\ni1 %c1 = #x1 (1)\ni1 %and1 = poison\ni32 %x.m2 = #x00000007 (7)\ni1 %c2 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "chained_two_constants",
+      "missed_optimization": false,
+      "cost": {
+        "source": 10,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 10\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %s1 = select i1 %c1, i1 %c, i1 false\n  %x.m2 = and i32 %x, 16\n  %c2 = icmp eq i32 %x.m2, 0\n  %s2 = and i1 %s1, %c2\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 24\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %x.m1 = and i32 %x, 8\n  %c1 = icmp eq i32 %x.m1, 0\n  %s1 = select i1 %c1, i1 %c, i1 0\n  %x.m2 = and i32 %x, 16\n  %c2 = icmp eq i32 %x.m2, 0\n  %s2 = and i1 %s1, %c2\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 24\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = and i32 %x, 24\n  %2 = icmp eq i32 %1, 0\n  %s2 = select i1 %2, i1 %c, i1 false\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}\n",
+          "tgt": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 24\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = and i32 %x, 24\n  %#2 = icmp eq i32 %#1, 0\n  %s2 = select i1 %#2, i1 %c, i1 0\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 24\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = or i32 %y, 24\n  %2 = and i32 %x, %1\n  %3 = icmp eq i32 %2, 0\n  %and2 = select i1 %3, i1 %c, i1 false\n  ret i1 %and2\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n  %1 = and i32 %x, 24\n  %2 = icmp eq i32 %1, 0\n  %s2 = select i1 %2, i1 %c, i1 false\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = or i32 %y, 24\n  %#2 = and i32 %x, %#1\n  %#3 = icmp eq i32 %#2, 0\n  %and2 = select i1 %#3, i1 %c, i1 0\n  ret i1 %and2\n}\n=>\ndefine i1 @test(i1 %c, i32 %x, i32 %y) {\n#0:\n  %#1 = and i32 %x, 24\n  %#2 = icmp eq i32 %#1, 0\n  %s2 = select i1 %#2, i1 %c, i1 0\n  %x.m3 = and i32 %x, %y\n  %c3 = icmp eq i32 %x.m3, 0\n  %and2 = and i1 %s2, %c3\n  ret i1 %and2\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\ni1 %c = poison\ni32 %x = #x00000007 (7)\ni32 %y = #x00000007 (7)\n\nSource:\ni32 %#1 = #x0000001f (31)\ni32 %#2 = #x00000007 (7)\ni1 %#3 = #x0 (0)\ni1 %and2 = #x0 (0)\n\nTarget:\ni32 %#1 = #x00000000 (0)\ni1 %#2 = #x1 (1)\ni1 %s2 = poison\ni32 %x.m3 = #x00000007 (7)\ni1 %c3 = #x0 (0)\ni1 %and2 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "multiple_uses_intermediate",
+      "missed_optimization": false,
+      "cost": {
+        "source": 8,
+        "expected": 9,
+        "current_opt": 7,
+        "expected_le_current_opt": false,
+        "expected_le_source": false,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 9\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": null,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": null,
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

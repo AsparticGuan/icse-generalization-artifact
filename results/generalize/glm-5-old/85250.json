@@ -1,0 +1,403 @@
+{
+  "issue_id": "85250",
+  "dataset_file": "85250.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine <8 x i1> @fcmp_one_sel_x_negx_vec(<8 x float> %x) {\n  %f = fcmp one <8 x float> %x, zeroinitializer\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, zeroinitializer\n  ret <8 x i1> %res\n}\n\ndefine <8 x i1> @fcmp_one_sel_x_negx_vec(<8 x float> %x) {\n  %res = fcmp one <8 x float> %x, zeroinitializer\n  ret <8 x i1> %res\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"Redundant `fneg` and `select` operations when checking sign-invariant floating-point predicates against zero. The pattern `select (fcmp P x, 0), x, (fneg x)` evaluates to `x` for all predicates `P` that are invariant under negation (e.g., `oeq`, `one`, `ord`, `uno`). Consequently, a subsequent `fcmp P` of the result against zero is identical to the original condition.\",\n  \"before_after\": {\n    \"description\": \"If `%cnd = fcmp P %x, 0` and `%sel = select %cnd, %x, fneg(%x)`, then `fcmp P %sel, 0` simplifies to `%cnd`.\",\n    \"example_original\": \"%f = fcmp one %x, 0\\n%neg = fneg %x\\n%sel = select %f, %x, %neg\\n%res = fcmp one %sel, 0\",\n    \"example_optimized\": \"%res = fcmp one %x, 0\"\n  },\n  \"preconditions\": {\n    \"predicates\": [\n      \"oeq\",\n      \"one\",\n      \"ord\",\n      \"uno\",\n      \"ueq\",\n      \"une\"\n    ],\n    \"types\": \"Float or Vector of Float\",\n    \"constraints\": [\n      \"The `fcmp` constant operand must be `0.0` or `-0.0`.\",\n      \"The `select` must choose between `%x` and `fneg(%x)`.\",\n      \"The condition of the `select` must be the result of comparing `%x` against `0.0`.\",\n      \"The predicate used in the final `fcmp` must be the same as the one used in the `select`'s condition.\"\n    ]\n  },\n  \"pattern\": \"Match:\\n  %C = fcmp P %x, 0\\n  %N = fneg %x\\n  %S = select %C, %x, %N\\n  %R = fcmp P %S, 0\\n\\nFold:\\n  %R = %C\\n\\n(P is in {oeq, one, ord, uno, ueq, une})\\n\\nNote: Also matches if Select True/False are swapped and condition is inverted (e.g. `select !C, %N, %x`), or if True/False are swapped (`select C, %N, %x` implies `R == C` because `P` is invariant).\",\n  \"testcases\": [\n    {\n      \"name\": \"vec_one_original\",\n      \"ir\": \"define <8 x i1> @test(<8 x float> %x) {\\n  %f = fcmp one <8 x float> %x, zeroinitializer\\n  %neg = fneg <8 x float> %x\\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\\n  %res = fcmp one <8 x float> %sel, zeroinitializer\\n  ret <8 x i1> %res\\n}\",\n      \"expected_optimized_ir\": \"define <8 x i1> @test(<8 x float> %x) {\\n  %res = fcmp one <8 x float> %x, zeroinitializer\\n  ret <8 x i1> %res\\n}\",\n      \"why\": \"Original example: 'one' (ordered not equal) is invariant under negation.\"\n    },\n    {\n      \"name\": \"scalar_oeq\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp oeq float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp oeq float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %res = fcmp oeq float %x, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"Scalar version with 'oeq' (ordered equal). 0.0 and -0.0 compare equal.\"\n    },\n    {\n      \"name\": \"vec_ord_uno\",\n      \"ir\": \"define <4 x i1> @test(<4 x double> %x) {\\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\\n  %neg = fneg <4 x double> %x\\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\\n  %res1 = fcmp ord <4 x double> %sel1, zeroinitializer\\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\\n  %res2 = fcmp uno <4 x double> %sel2, zeroinitializer\\n  %res = or <4 x i1> %res1, %res2\\n  ret <4 x i1> %res\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x double> %x) {\\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\\n  %res = or <4 x i1> %f1, %f2\\n  ret <4 x i1> %res\\n}\",\n      \"why\": \"Tests 'ord' and 'uno' predicates, and swapped operands in select (neg, x) for uno.\"\n    },\n    {\n      \"name\": \"ueq_une\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp ueq float %x, -0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %neg, float %x\\n  %res = fcmp ueq float %sel, -0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %res = fcmp ueq float %x, -0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"Tests 'ueq' with -0.0 constant and swapped select operands.\"\n    },\n    {\n      \"name\": \"negative_oge\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp oge float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp oge float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %f = fcmp oge float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp oge float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"'oge' is NOT invariant under negation (x > 0 does not imply -x > 0). Fold must not happen.\"\n    },\n    {\n      \"name\": \"negative_olt\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp olt float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp olt float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %f = fcmp olt float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp olt float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"'olt' is NOT invariant under negation. Fold must not happen.\"\n    },\n    {\n      \"name\": \"fsub_fneg_equiv\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp one float %x, 0.0\\n  %neg = fsub float -0.0, %x\\n  %sel = select i1 %f, float %x, float %neg\\n  %res = fcmp one float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %res = fcmp one float %x, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"fsub -0.0, x is functionally equivalent to fneg x. Pattern matcher should recognize this.\"\n    },\n    {\n      \"name\": \"inverted_condition\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp one float %x, 0.0\\n  %neg = fneg float %x\\n  %not = xor i1 %f, true\\n  %sel = select i1 %not, float %neg, float %x\\n  %res = fcmp one float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %res = fcmp one float %x, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"If condition is inverted and select values are swapped, logic still holds for invariant predicates.\"\n    },\n    {\n      \"name\": \"swapped_select_branches\",\n      \"ir\": \"define i1 @test(float %x) {\\n  %f = fcmp one float %x, 0.0\\n  %neg = fneg float %x\\n  %sel = select i1 %f, float %neg, float %x\\n  %res = fcmp one float %sel, 0.0\\n  ret i1 %res\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(float %x) {\\n  %res = fcmp one float %x, 0.0\\n  ret i1 %res\\n}\",\n      \"why\": \"Even if select branches are swapped (neg on true), for 'one', result matches condition.\"\n    }\n  ],\n  \"implementation_notes\": \"This fold should be implemented in `InstCombineCompares.cpp` or `InstCombineSelect.cpp`.\\n\\nWhen visiting a `fcmp` instruction:\\n1. Check if the predicate is one of `FCmpInst::FCCOEQ`, `FCCONE`, `FCCORD`, `FCCUNO`, `FCCUEQ`, `FCCUNE`.\\n2. Check if one operand is the `select` instruction and the other is `ConstantFP::getZeroValue(Type)`.\\n3. Analyze the `select`:\\n   - Match `select C, X, Y`.\\n   - Check if `C` is an `fcmp` with the *same* predicate against *zero*.\\n   - Verify that `X` and `Y` are `%V` and `fneg(%V)` (or `fsub -0.0, %V`). Order does not matter.\\n   - Verify that the `%V` compared in the select's condition is the same `%V` used in the select values.\\n4. If all match, replace the `fcmp` with the select's condition `C`.\\n\\nPitfalls:\\n- Ensure that `fneg` matching handles `fsub -0.0, x` as well (using `m_FNeg` or `m_FSub(m_Zero(), m_Value())`).\\n- Ensure the comparison constant is actually zero (checking `isNullValue()` on the constant operand).\",\n  \"regression_test_notes\": \"Use `opt -instcombine -S` to verify.\\nFileCheck directives should ensure:\\n1. The `fneg` is eliminated.\\n2. The `select` is eliminated.\\n3. The final `fcmp` is replaced by the original condition (or the original condition dominates the use).\\n\\nExample FileCheck:\\n```\\n; CHECK-NOT: fneg\\n; CHECK-NOT: select\\n; CHECK: %res = fcmp one {{.*}}, zeroinitializer\\n```\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "Redundant `fneg` and `select` operations when checking sign-invariant floating-point predicates against zero. The pattern `select (fcmp P x, 0), x, (fneg x)` evaluates to `x` for all predicates `P` that are invariant under negation (e.g., `oeq`, `one`, `ord`, `uno`). Consequently, a subsequent `fcmp P` of the result against zero is identical to the original condition.",
+    "before_after": {
+      "description": "If `%cnd = fcmp P %x, 0` and `%sel = select %cnd, %x, fneg(%x)`, then `fcmp P %sel, 0` simplifies to `%cnd`.",
+      "example_original": "%f = fcmp one %x, 0\n%neg = fneg %x\n%sel = select %f, %x, %neg\n%res = fcmp one %sel, 0",
+      "example_optimized": "%res = fcmp one %x, 0"
+    },
+    "preconditions": {
+      "predicates": [
+        "oeq",
+        "one",
+        "ord",
+        "uno",
+        "ueq",
+        "une"
+      ],
+      "types": "Float or Vector of Float",
+      "constraints": [
+        "The `fcmp` constant operand must be `0.0` or `-0.0`.",
+        "The `select` must choose between `%x` and `fneg(%x)`.",
+        "The condition of the `select` must be the result of comparing `%x` against `0.0`.",
+        "The predicate used in the final `fcmp` must be the same as the one used in the `select`'s condition."
+      ]
+    },
+    "pattern": "Match:\n  %C = fcmp P %x, 0\n  %N = fneg %x\n  %S = select %C, %x, %N\n  %R = fcmp P %S, 0\n\nFold:\n  %R = %C\n\n(P is in {oeq, one, ord, uno, ueq, une})\n\nNote: Also matches if Select True/False are swapped and condition is inverted (e.g. `select !C, %N, %x`), or if True/False are swapped (`select C, %N, %x` implies `R == C` because `P` is invariant).",
+    "testcases": [
+      {
+        "name": "vec_one_original",
+        "ir": "define <8 x i1> @test(<8 x float> %x) {\n  %f = fcmp one <8 x float> %x, zeroinitializer\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, zeroinitializer\n  ret <8 x i1> %res\n}",
+        "expected_optimized_ir": "define <8 x i1> @test(<8 x float> %x) {\n  %res = fcmp one <8 x float> %x, zeroinitializer\n  ret <8 x i1> %res\n}",
+        "why": "Original example: 'one' (ordered not equal) is invariant under negation."
+      },
+      {
+        "name": "scalar_oeq",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp oeq float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %res = fcmp oeq float %x, 0.0\n  ret i1 %res\n}",
+        "why": "Scalar version with 'oeq' (ordered equal). 0.0 and -0.0 compare equal."
+      },
+      {
+        "name": "vec_ord_uno",
+        "ir": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, zeroinitializer\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}",
+        "why": "Tests 'ord' and 'uno' predicates, and swapped operands in select (neg, x) for uno."
+      },
+      {
+        "name": "ueq_une",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp ueq float %x, -0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, -0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %res = fcmp ueq float %x, -0.0\n  ret i1 %res\n}",
+        "why": "Tests 'ueq' with -0.0 constant and swapped select operands."
+      },
+      {
+        "name": "negative_oge",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+        "why": "'oge' is NOT invariant under negation (x > 0 does not imply -x > 0). Fold must not happen."
+      },
+      {
+        "name": "negative_olt",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+        "why": "'olt' is NOT invariant under negation. Fold must not happen."
+      },
+      {
+        "name": "fsub_fneg_equiv",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fsub float -0.0, %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+        "why": "fsub -0.0, x is functionally equivalent to fneg x. Pattern matcher should recognize this."
+      },
+      {
+        "name": "inverted_condition",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fneg float %x\n  %not = xor i1 %f, true\n  %sel = select i1 %not, float %neg, float %x\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+        "why": "If condition is inverted and select values are swapped, logic still holds for invariant predicates."
+      },
+      {
+        "name": "swapped_select_branches",
+        "ir": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+        "expected_optimized_ir": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+        "why": "Even if select branches are swapped (neg on true), for 'one', result matches condition."
+      }
+    ],
+    "implementation_notes": "This fold should be implemented in `InstCombineCompares.cpp` or `InstCombineSelect.cpp`.\n\nWhen visiting a `fcmp` instruction:\n1. Check if the predicate is one of `FCmpInst::FCCOEQ`, `FCCONE`, `FCCORD`, `FCCUNO`, `FCCUEQ`, `FCCUNE`.\n2. Check if one operand is the `select` instruction and the other is `ConstantFP::getZeroValue(Type)`.\n3. Analyze the `select`:\n   - Match `select C, X, Y`.\n   - Check if `C` is an `fcmp` with the *same* predicate against *zero*.\n   - Verify that `X` and `Y` are `%V` and `fneg(%V)` (or `fsub -0.0, %V`). Order does not matter.\n   - Verify that the `%V` compared in the select's condition is the same `%V` used in the select values.\n4. If all match, replace the `fcmp` with the select's condition `C`.\n\nPitfalls:\n- Ensure that `fneg` matching handles `fsub -0.0, x` as well (using `m_FNeg` or `m_FSub(m_Zero(), m_Value())`).\n- Ensure the comparison constant is actually zero (checking `isNullValue()` on the constant operand).",
+    "regression_test_notes": "Use `opt -instcombine -S` to verify.\nFileCheck directives should ensure:\n1. The `fneg` is eliminated.\n2. The `select` is eliminated.\n3. The final `fcmp` is replaced by the original condition (or the original condition dominates the use).\n\nExample FileCheck:\n```\n; CHECK-NOT: fneg\n; CHECK-NOT: select\n; CHECK: %res = fcmp one {{.*}}, zeroinitializer\n```",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "vec_one_original",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <8 x i1> @test(<8 x float> %x) {\n  %f = fcmp one <8 x float> %x, zeroinitializer\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, zeroinitializer\n  ret <8 x i1> %res\n}",
+          "tgt": "define <8 x i1> @test(<8 x float> %x) {\n  %res = fcmp one <8 x float> %x, zeroinitializer\n  ret <8 x i1> %res\n}",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %f = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\n=>\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %res = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <8 x i1> @test(<8 x float> %x) {\n  %f = fcmp one <8 x float> %x, zeroinitializer\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, zeroinitializer\n  ret <8 x i1> %res\n}\n",
+          "tgt": "define <8 x i1> @test(<8 x float> %x) {\n  %res = fcmp one <8 x float> %x, zeroinitializer\n  ret <8 x i1> %res\n}",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %f = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\n=>\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %res = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <8 x i1> @test(<8 x float> %x) {\n  %res = fcmp one <8 x float> %x, zeroinitializer\n  ret <8 x i1> %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <8 x i1> @test(<8 x float> %x) {\n  %f = fcmp one <8 x float> %x, zeroinitializer\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, zeroinitializer\n  ret <8 x i1> %res\n}\n",
+          "log": "\n----------------------------------------\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %res = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\n=>\ndefine <8 x i1> @test(<8 x float> %x) {\n#0:\n  %f = fcmp one <8 x float> %x, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <8 x float> %x\n  %sel = select <8 x i1> %f, <8 x float> %x, <8 x float> %neg\n  %res = fcmp one <8 x float> %sel, { 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 }\n  ret <8 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "scalar_oeq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp oeq float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp oeq float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oeq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp oeq float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp oeq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp oeq float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oeq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp oeq float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %res = fcmp oeq float %x, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp oeq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp oeq float %x, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oeq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oeq float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vec_ord_uno",
+      "missed_optimization": true,
+      "cost": {
+        "source": 9,
+        "expected": 4,
+        "current_opt": 9,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 4\n",
+        "current_opt_log": "Cost: 9\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, zeroinitializer\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}",
+          "tgt": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}\n=>\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, zeroinitializer\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}\n=>\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x double> %x) {\n  %f1 = fcmp ord <4 x double> %x, zeroinitializer\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, zeroinitializer\n  %f2 = fcmp uno <4 x double> %x, zeroinitializer\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, zeroinitializer\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %f1, %f2\n  ret <4 x i1> %res\n}\n=>\ndefine <4 x i1> @test(<4 x double> %x) {\n#0:\n  %f1 = fcmp ord <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %neg = fneg <4 x double> %x\n  %sel1 = select <4 x i1> %f1, <4 x double> %x, <4 x double> %neg\n  %res1 = fcmp ord <4 x double> %sel1, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %f2 = fcmp uno <4 x double> %x, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %sel2 = select <4 x i1> %f2, <4 x double> %neg, <4 x double> %x\n  %res2 = fcmp uno <4 x double> %sel2, { 0.000000, 0.000000, 0.000000, 0.000000 }\n  %res = or <4 x i1> %res1, %res2\n  ret <4 x i1> %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "ueq_une",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp ueq float %x, -0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, -0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp ueq float %x, -0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp ueq float %x, -0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, -0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp ueq float %x, -0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp ueq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp ueq float %x, -0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp ueq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp ueq float %x, -0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %res = fcmp ueq float %x, -0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp ueq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp ueq float %x, -0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp ueq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp ueq float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_oge",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp oge float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp oge float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp oge float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_olt",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 5,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp olt float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp olt float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp olt float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "fsub_fneg_equiv",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fsub float -0.0, %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fsub float -0.000000, %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp one float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp one float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %x, float %neg\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "inverted_condition",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fneg float %x\n  %not = xor i1 %f, true\n  %sel = select i1 %not, float %neg, float %x\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %not = xor i1 %f, 1\n  %sel = select i1 %not, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp ueq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp ueq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp ueq float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp ueq float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "swapped_select_branches",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(float %x) {\n  %f = fcmp one float %x, 0.0\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.0\n  ret i1 %res\n}",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp one float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "tgt": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(float %x) {\n  %res = fcmp one float %x, 0.0\n  ret i1 %res\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(float %x) {\n  %f = fcmp one float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000e+00\n  ret i1 %res\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(float %x) {\n#0:\n  %res = fcmp one float %x, 0.000000\n  ret i1 %res\n}\n=>\ndefine i1 @test(float %x) {\n#0:\n  %f = fcmp one float %x, 0.000000\n  %neg = fneg float %x\n  %sel = select i1 %f, float %neg, float %x\n  %res = fcmp one float %sel, 0.000000\n  ret i1 %res\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0114 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\nCMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:11 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:6 (include)\n\n\n-- Found Python3: /data/btguan/miniconda3/bin/python3 (found suitable version \"3.13.5\", minimum required is \"3.8\") found components: Interpreter \n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.3s)\n-- Generating done (0.9s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

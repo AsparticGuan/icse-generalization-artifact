@@ -1,0 +1,692 @@
+{
+  "issue_id": "117436",
+  "dataset_file": "117436.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern and summarize the pattern so it could be implemented as an InstCombine fold.\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n\n## Reference: common missed elements and patterns\n\nWhen generalizing, consider the following summary of elements frequently missed in InstCombine and patterns that are often not well handled. \n\nThe original issue is a **missed fold from path-implied non-equality**. In the motivating test, entering `if.then` means `%x != %y`; under that fact, `%or = or %x, %y` **cannot be zero** (if `x|y == 0`, then both are zero, implying `x == y`). So `icmp eq %or, 0` is always false on that path, and the whole function folds to `false`.\n\nThe patch generalizes this by teaching `ValueTracking::isKnownNonEqual(V1, V2, ...)` to derive **`V1 != V2` from control-flow and assumes**, not just local structural reasoning. Specifically:\n- It queries **dominating branch conditions** via `DominatorConditionCache`/`DominatorTree`, and checks whether the taken edge implies `icmp ne V1, V2` using `isImpliedCondition(...)`.\n- It also queries **`llvm.assume` facts** via `AssumptionCache`, gated by `isValidAssumeForContext(...)`.\n- This lets existing folds fire for any expression that relies on proving non-equality, not just the original `or == 0` shape.\n- `findValuesAffectedByCondition()` was also widened so **equality predicates mark operands as affected**, enabling these implied-condition queries to trigger for both `eq` and `ne`-based conditions.\n\nThe dev tests broaden coverage from the single example to:\n- the original `or_nonzero_from_nonequal` case with **reversed branch polarity**;\n- **dominating boolean compositions** (`select`-formed OR conditions) with both valid and invalid cases;\n- **assume-based reasoning**, including validity wrt instruction position/side effects;\n- a non-InstCombine client (`BasicAA` fallback-mayalias), showing the new `isKnownNonEqual` reasoning is reusable across analyses.\n\n## Output format requirement (strict)\n\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant. \n\n## What you must output (in JSON)\n\nInclude the following top-level keys (you may add more keys if useful):\n\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include only positive cases)\n\nEach testcase object must include at least:\n\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n\n---\n\n## Here is my single example \n\ndefine i1 @test(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n\ndefine i1 @test(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  ret i1 false\n\nif.else:\n  ret i1 false\n}\n",
+  "model_output": "{\n  \"pattern\": {\n    \"summary\": \"Path-implied non-equality enables simplification of computations whose result would force equality if they had a particular value. In particular, on any CFG path where LLVM can prove `%a != %b` from dominating branch conditions or valid `llvm.assume` facts, InstCombine/ValueTracking should treat `%a` and `%b` as known non-equal and fold predicates that are only possible when `%a == %b`.\",\n    \"instcombine_fold_shape\": {\n      \"core_fact\": \"Given a program point P, if control flow or assumes imply `a != b` at P, then any expression `E(a,b)` with a value condition `C(E)` that implies `a == b` can be simplified by contradiction.\",\n      \"motivating_instance\": {\n        \"expression\": \"or T a, b\",\n        \"predicate\": \"icmp eq (or a, b), 0\",\n        \"reason\": \"`(a | b) == 0` implies `a == 0` and `b == 0`, hence `a == b`. Therefore under `a != b`, `(a | b) == 0` is impossible.\",\n        \"fold\": \"`icmp eq (or a, b), 0` -> false when `a != b` is known at that point\"\n      },\n      \"equivalent_forms\": [\n        \"`icmp ne (or a, b), 0` -> true when `a != b` is known\",\n        \"same fold regardless of whether non-equality is established by true or false successor polarity\",\n        \"same fold when the compared zero is written on either operand side of icmp\",\n        \"same fold through trivial CFG reshaping, extra blocks, or phis that preserve the fact on the dominated path\"\n      ]\n    },\n    \"generalization_notes\": [\n      \"The reusable capability is not specific to `or`; the key improvement is path-sensitive `isKnownNonEqual(a, b, CtxI, ...)` using dominating conditions and valid `llvm.assume` facts.\",\n      \"Dominating condition reasoning should handle direct `icmp ne`, reversed branch polarity from `icmp eq`, and simple boolean compositions when `isImpliedCondition` can prove the implication.\",\n      \"Assume reasoning should only use assumes valid at the query context.\",\n      \"This pattern applies for integers and vectors lane-wise where the same `or == 0` contradiction is valid.\"\n    ],\n    \"preconditions\": [\n      \"The query point is dominated by a condition/assume implying `a != b`.\",\n      \"The `or` and the compare are in a type where `or == 0` implies both operands are zero (integers and integer vectors).\",\n      \"No poison/UB issue blocks the fold; ordinary integer `or` and `icmp` are fine.\"\n    ]\n  },\n  \"testcases\": [\n    {\n      \"name\": \"or_nonzero_from_nonequal_i8_reversed_branch_polarity\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\\nentry:\\n  %cond = icmp eq i8 %x, %y\\n  br i1 %cond, label %eq, label %ne\\n\\neq:\\n  ret i1 false\\n\\nne:\\n  %or = or i8 %x, %y\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_i32\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\\nentry:\\n  %cond = icmp ne i32 %x, %y\\n  br i1 %cond, label %if.then, label %if.else\\n\\nif.then:\\n  %or = or i32 %x, %y\\n  %cmp = icmp eq i32 %or, 0\\n  ret i1 %cmp\\n\\nif.else:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_i64_ne_compare_variant\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\\nentry:\\n  %cond = icmp ne i64 %x, %y\\n  br i1 %cond, label %if.then, label %if.else\\n\\nif.then:\\n  %or = or i64 %x, %y\\n  %cmp = icmp ne i64 %or, 0\\n  ret i1 %cmp\\n\\nif.else:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\\nentry:\\n  ret i1 true\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_zero_on_lhs\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\\nentry:\\n  %cond = icmp ne i16 %x, %y\\n  br i1 %cond, label %if.then, label %if.else\\n\\nif.then:\\n  %or = or i16 %x, %y\\n  %cmp = icmp eq i16 0, %or\\n  ret i1 %cmp\\n\\nif.else:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_extra_dom_block\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\\nentry:\\n  %cond = icmp ne i8 %x, %y\\n  br i1 %cond, label %mid, label %else\\n\\nmid:\\n  br label %then\\n\\nthen:\\n  %or = or i8 %x, %y\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_phi_preserves_values\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\\nentry:\\n  %cond = icmp ne i8 %x, %y\\n  br i1 %cond, label %a, label %else\\n\\na:\\n  br label %then\\n\\nthen:\\n  %px = phi i8 [ %x, %a ]\\n  %py = phi i8 [ %y, %a ]\\n  %or = or i8 %px, %py\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_select_formed_or_condition\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  %guard = select i1 %c, i1 true, i1 %neq\\n  br i1 %guard, label %then, label %else\\n\\nthen:\\n  %or = or i8 %x, %y\\n  %cmp = icmp ne i8 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  %guard = select i1 %c, i1 true, i1 %neq\\n  br i1 %guard, label %then, label %else\\n\\nthen:\\n  ret i1 true\\n\\nelse:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_assume_i8\",\n      \"ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  %or = or i8 %x, %y\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n}\\n\",\n      \"expected_optimized_ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_assume_i32_ne_result\",\n      \"ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\\nentry:\\n  %neq = icmp ne i32 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  %or = or i32 %x, %y\\n  %cmp = icmp ne i32 %or, 0\\n  ret i1 %cmp\\n}\\n\",\n      \"expected_optimized_ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\\nentry:\\n  %neq = icmp ne i32 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  ret i1 true\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_assume_after_bitcast_copy\",\n      \"ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\\nentry:\\n  %x2 = or i64 %x, 0\\n  %y2 = or i64 %y, 0\\n  %neq = icmp ne i64 %x2, %y2\\n  call void @llvm.assume(i1 %neq)\\n  %orv = or i64 %x2, %y2\\n  %cmp = icmp eq i64 %orv, 0\\n  ret i1 %cmp\\n}\\n\",\n      \"expected_optimized_ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\\nentry:\\n  %neq = icmp ne i64 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\\nentry:\\n  %cond = icmp ne <2 x i8> %x, %y\\n  %any = extractelement <2 x i1> %cond, i64 0\\n  br i1 %any, label %then, label %else\\n\\nthen:\\n  %or = or <2 x i8> %x, %y\\n  %cmp = icmp eq <2 x i8> %or, zeroinitializer\\n  %e0 = extractelement <2 x i1> %cmp, i64 0\\n  %e1 = extractelement <2 x i1> %cmp, i64 1\\n  %and = and i1 %e0, %e1\\n  ret i1 %and\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\\nentry:\\n  %cond = icmp ne <2 x i8> %x, %y\\n  %any = extractelement <2 x i1> %cond, i64 0\\n  br i1 %any, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_ptrtoint\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\\nentry:\\n  %pi = ptrtoint ptr %p to i64\\n  %qi = ptrtoint ptr %q to i64\\n  %cond = icmp ne i64 %pi, %qi\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  %or = or i64 %pi, %qi\\n  %cmp = icmp eq i64 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\\nentry:\\n  %pi = ptrtoint ptr %p to i64\\n  %qi = ptrtoint ptr %q to i64\\n  %cond = icmp ne i64 %pi, %qi\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_shuffled_operands\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\\nentry:\\n  %cond = icmp ne i8 %y, %x\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  %or = or i8 %y, %x\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_with_freeze\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\\nentry:\\n  %xf = freeze i8 %x\\n  %yf = freeze i8 %y\\n  %cond = icmp ne i8 %xf, %yf\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  %or = or i8 %xf, %yf\\n  %cmp = icmp eq i8 %or, 0\\n  ret i1 %cmp\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\\nentry:\\n  %xf = freeze i8 %x\\n  %yf = freeze i8 %y\\n  %cond = icmp ne i8 %xf, %yf\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_diamond_same_constant_returns\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\\nentry:\\n  %cond = icmp ne i32 %x, %y\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  %or = or i32 %x, %y\\n  %cmp = icmp eq i32 %or, 0\\n  br label %merge\\n\\nelse:\\n  br label %merge\\n\\nmerge:\\n  %r = phi i1 [ %cmp, %then ], [ false, %else ]\\n  ret i1 %r\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_nonequal_branch_on_cmp\",\n      \"ir\": \"define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\\nentry:\\n  %cond = icmp ne i8 %x, %y\\n  br i1 %cond, label %then, label %else\\n\\nthen:\\n  %or = or i8 %x, %y\\n  %cmp = icmp eq i8 %or, 0\\n  br i1 %cmp, label %t, label %f\\n\\nt:\\n  ret i1 true\\n\\nf:\\n  ret i1 false\\n\\nelse:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\\nentry:\\n  ret i1 false\\n}\\n\"\n    },\n    {\n      \"name\": \"or_nonzero_from_assume_then_branch_on_cmp\",\n      \"ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  %or = or i8 %x, %y\\n  %cmp = icmp ne i8 %or, 0\\n  br i1 %cmp, label %t, label %f\\n\\nt:\\n  ret i1 true\\n\\nf:\\n  ret i1 false\\n}\\n\",\n      \"expected_optimized_ir\": \"declare void @llvm.assume(i1)\\n\\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\\nentry:\\n  %neq = icmp ne i8 %x, %y\\n  call void @llvm.assume(i1 %neq)\\n  ret i1 true\\n}\\n\"\n    }\n  ]\n}",
+  "parsed": {
+    "pattern": {
+      "summary": "Path-implied non-equality enables simplification of computations whose result would force equality if they had a particular value. In particular, on any CFG path where LLVM can prove `%a != %b` from dominating branch conditions or valid `llvm.assume` facts, InstCombine/ValueTracking should treat `%a` and `%b` as known non-equal and fold predicates that are only possible when `%a == %b`.",
+      "instcombine_fold_shape": {
+        "core_fact": "Given a program point P, if control flow or assumes imply `a != b` at P, then any expression `E(a,b)` with a value condition `C(E)` that implies `a == b` can be simplified by contradiction.",
+        "motivating_instance": {
+          "expression": "or T a, b",
+          "predicate": "icmp eq (or a, b), 0",
+          "reason": "`(a | b) == 0` implies `a == 0` and `b == 0`, hence `a == b`. Therefore under `a != b`, `(a | b) == 0` is impossible.",
+          "fold": "`icmp eq (or a, b), 0` -> false when `a != b` is known at that point"
+        },
+        "equivalent_forms": [
+          "`icmp ne (or a, b), 0` -> true when `a != b` is known",
+          "same fold regardless of whether non-equality is established by true or false successor polarity",
+          "same fold when the compared zero is written on either operand side of icmp",
+          "same fold through trivial CFG reshaping, extra blocks, or phis that preserve the fact on the dominated path"
+        ]
+      },
+      "generalization_notes": [
+        "The reusable capability is not specific to `or`; the key improvement is path-sensitive `isKnownNonEqual(a, b, CtxI, ...)` using dominating conditions and valid `llvm.assume` facts.",
+        "Dominating condition reasoning should handle direct `icmp ne`, reversed branch polarity from `icmp eq`, and simple boolean compositions when `isImpliedCondition` can prove the implication.",
+        "Assume reasoning should only use assumes valid at the query context.",
+        "This pattern applies for integers and vectors lane-wise where the same `or == 0` contradiction is valid."
+      ],
+      "preconditions": [
+        "The query point is dominated by a condition/assume implying `a != b`.",
+        "The `or` and the compare are in a type where `or == 0` implies both operands are zero (integers and integer vectors).",
+        "No poison/UB issue blocks the fold; ordinary integer `or` and `icmp` are fine."
+      ]
+    },
+    "testcases": [
+      {
+        "name": "or_nonzero_from_nonequal_i8_reversed_branch_polarity",
+        "ir": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\neq:\n  ret i1 false\n\nne:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_i32",
+        "ir": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_i64_ne_compare_variant",
+        "ir": "define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  %cond = icmp ne i64 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i64 %x, %y\n  %cmp = icmp ne i64 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  ret i1 true\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_zero_on_lhs",
+        "ir": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond = icmp ne i16 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 0, %or\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_extra_dom_block",
+        "ir": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %mid, label %else\n\nmid:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_phi_preserves_values",
+        "ir": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %a, label %else\n\na:\n  br label %then\n\nthen:\n  %px = phi i8 [ %x, %a ]\n  %py = phi i8 [ %y, %a ]\n  %or = or i8 %px, %py\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_select_formed_or_condition",
+        "ir": "define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 true, i1 %neq\n  br i1 %guard, label %then, label %else\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 true, i1 %neq\n  br i1 %guard, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_assume_i8",
+        "ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+        "expected_optimized_ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_assume_i32_ne_result",
+        "ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n",
+        "expected_optimized_ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_assume_after_bitcast_copy",
+        "ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %x2 = or i64 %x, 0\n  %y2 = or i64 %y, 0\n  %neq = icmp ne i64 %x2, %y2\n  call void @llvm.assume(i1 %neq)\n  %orv = or i64 %x2, %y2\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n",
+        "expected_optimized_ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible",
+        "ir": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, zeroinitializer\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_ptrtoint",
+        "ir": "define i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i64 %pi, %qi\n  %cmp = icmp eq i64 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_shuffled_operands",
+        "ir": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %y, %x\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_with_freeze",
+        "ir": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_diamond_same_constant_returns",
+        "ir": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:\n  br label %merge\n\nmerge:\n  %r = phi i1 [ %cmp, %then ], [ false, %else ]\n  ret i1 %r\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_nonequal_branch_on_cmp",
+        "ir": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 true\n\nf:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n"
+      },
+      {
+        "name": "or_nonzero_from_assume_then_branch_on_cmp",
+        "ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 true\n\nf:\n  ret i1 false\n}\n",
+        "expected_optimized_ir": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n"
+      }
+    ]
+  },
+  "validation": [
+    {
+      "name": "or_nonzero_from_nonequal_i8_reversed_branch_polarity",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\neq:\n  ret i1 false\n\nne:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\nne:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\neq:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\neq:                                               ; preds = %entry\n  ret i1 false\n\nne:                                               ; preds = %entry\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\nne:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\neq:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\neq:                                               ; preds = %entry\n  ret i1 false\n\nne:                                               ; preds = %entry\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i8_reversed_branch_polarity(i8 %x, i8 %y) {\nentry:\n  %cond = icmp eq i8 %x, %y\n  br i1 %cond, label %eq, label %ne\n\nne:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\neq:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x03 (3)\ni8 %y = poison\n\nSource:\n\nTarget:\ni1 %cond = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_i32",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.else:\n  ret i1 0\n\nif.then:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:                                          ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:                                          ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i32(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %x = #x00000003 (3)\ni32 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_i64_ne_compare_variant",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  %cond = icmp ne i64 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i64 %x, %y\n  %cmp = icmp ne i64 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  %cond = icmp ne i64 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.else:\n  ret i1 0\n\nif.then:\n  %or = or i64 %x, %y\n  %cmp = icmp ne i64 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_i64_ne_compare_variant(i64 %x, i64 %y) {\nentry:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni64 %x = #x0000000000000000 (0)\ni64 %y = #x0000000000000000 (0)\n\nSource:\ni1 %cond = #x0 (0)\n  >> Jump to %if.else\n\nTarget:\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_zero_on_lhs",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond = icmp ne i16 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 0, %or\n  ret i1 %cmp\n\nif.else:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond = icmp ne i16 %x, %y\n  br i1 %cond, label %if.then, label %if.else\n\nif.else:\n  ret i1 0\n\nif.then:\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 0, %or\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond.not = icmp eq i16 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 %or, 0\n  ret i1 %cmp\n\nif.else:                                          ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond.not = icmp eq i16 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond.not = icmp eq i16 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 %or, 0\n  ret i1 %cmp\n\nif.else:                                          ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_zero_on_lhs(i16 %x, i16 %y) {\nentry:\n  %cond.not = icmp eq i16 %x, %y\n  br i1 %cond.not, label %if.else, label %if.then\n\nif.then:\n  %or = or i16 %x, %y\n  %cmp = icmp eq i16 %or, 0\n  ret i1 %cmp\n\nif.else:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni16 %x = #x0003 (3)\ni16 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_extra_dom_block",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 1,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %mid, label %else\n\nmid:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %mid, label %else\n\nelse:\n  ret i1 0\n\nmid:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %mid\n\nmid:                                              ; preds = %entry\n  br label %then\n\nthen:                                             ; preds = %mid\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %mid\n\nmid:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %mid\n\nmid:                                              ; preds = %entry\n  br label %then\n\nthen:                                             ; preds = %mid\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_extra_dom_block(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %mid\n\nmid:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x03 (3)\ni8 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_phi_preserves_values",
+      "missed_optimization": false,
+      "cost": {
+        "source": 9,
+        "expected": 1,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 9\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %a, label %else\n\na:\n  br label %then\n\nthen:\n  %px = phi i8 [ %x, %a ]\n  %py = phi i8 [ %y, %a ]\n  %or = or i8 %px, %py\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %a, label %else\n\nelse:\n  ret i1 0\n\na:\n  br label %then\n\nthen:\n  %px = phi i8 [ %x, %a ]\n  %py = phi i8 [ %y, %a ]\n  %or = or i8 %px, %py\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %a\n\na:                                                ; preds = %entry\n  br label %then\n\nthen:                                             ; preds = %a\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %a\n\na:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %a\n\na:                                                ; preds = %entry\n  br label %then\n\nthen:                                             ; preds = %a\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_phi_preserves_values(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %a\n\na:\n  br label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x03 (3)\ni8 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_select_formed_or_condition",
+      "missed_optimization": false,
+      "cost": {
+        "source": 7,
+        "expected": 5,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 7\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": false,
+      "opt_equivalent_expected": null,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 true, i1 %neq\n  br i1 %guard, label %then, label %else\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 true, i1 %neq\n  br i1 %guard, label %then, label %else\n\nthen:\n  ret i1 true\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 1, i1 %neq\n  br i1 %guard, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_select_formed_or_condition(i8 %x, i8 %y, i1 %c) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  %guard = select i1 %c, i1 1, i1 %neq\n  br i1 %guard, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 1\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nNOTE: The counterexample is unique.\n\nExample:\ni8 %x = #x00 (0)\ni8 %y = #x00 (0)\ni1 %c = #x1 (1)\n\nSource:\ni1 %neq = #x0 (0)\ni1 %guard = #x1 (1)\n  >> Jump to %then\ni8 %or = #x00 (0)\ni1 %cmp = #x0 (0)\n\nTarget:\ni1 %neq = #x0 (0)\ni1 %guard = #x1 (1)\n  >> Jump to %then\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": null,
+        "expected_to_opt": null
+      }
+    },
+    {
+      "name": "or_nonzero_from_assume_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_assume_i8(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_assume_i32_ne_result",
+      "missed_optimization": true,
+      "cost": {
+        "source": 4,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 4\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\n=>\ndefine i1 @or_nonzero_from_assume_i32_ne_result(i32 %x, i32 %y) {\nentry:\n  %neq = icmp ne i32 %x, %y\n  assume i1 %neq\n  %or = or i32 %x, %y\n  %cmp = icmp ne i32 %or, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_assume_after_bitcast_copy",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 4,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 4\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %x2 = or i64 %x, 0\n  %y2 = or i64 %y, 0\n  %neq = icmp ne i64 %x2, %y2\n  call void @llvm.assume(i1 %neq)\n  %orv = or i64 %x2, %y2\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %x2 = or i64 %x, 0\n  %y2 = or i64 %y, 0\n  %neq = icmp ne i64 %x2, %y2\n  assume i1 %neq\n  %orv = or i64 %x2, %y2\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %orv = or i64 %x, %y\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  assume i1 %neq\n  %orv = or i64 %x, %y\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %orv = or i64 %x, %y\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  assume i1 %neq\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_assume_after_bitcast_copy(i64 %x, i64 %y) {\nentry:\n  %neq = icmp ne i64 %x, %y\n  assume i1 %neq\n  %orv = or i64 %x, %y\n  %cmp = icmp eq i64 %orv, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible",
+      "missed_optimization": false,
+      "cost": {
+        "source": 10,
+        "expected": 5,
+        "current_opt": 10,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 10\n",
+        "expected_log": "Cost: 5\n",
+        "current_opt_log": "Cost: 10\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, zeroinitializer\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, { 0, 0 }\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, zeroinitializer\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, { 0, 0 }\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, zeroinitializer\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_vector_v2i8_all_zero_impossible(<2 x i8> %x, <2 x i8> %y) {\nentry:\n  %cond = icmp ne <2 x i8> %x, %y\n  %any = extractelement <2 x i1> %cond, i64 0\n  br i1 %any, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or <2 x i8> %x, %y\n  %cmp = icmp eq <2 x i8> %or, { 0, 0 }\n  %e0 = extractelement <2 x i1> %cmp, i64 0\n  %e1 = extractelement <2 x i1> %cmp, i64 1\n  %and = and i1 %e0, %e1\n  ret i1 %and\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\n<2 x i8> %x = < #x00 (0), #x03 (3) >\n<2 x i8> %y = < #x01 (1), poison >\n\nSource:\n<2 x i1> %cond = < #x1 (1), poison >\ni1 %any = #x1 (1)\n  >> Jump to %then\n\nTarget:\n<2 x i1> %cond = < #x1 (1), poison >\ni1 %any = #x1 (1)\n  >> Jump to %then\n<2 x i8> %or = < #x01 (1), poison >\n<2 x i1> %cmp = < #x0 (0), poison >\ni1 %e0 = #x0 (0)\ni1 %e1 = poison\ni1 %and = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_ptrtoint",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 6,
+        "current_opt": 7,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 7\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i64 %pi, %qi\n  %cmp = icmp eq i64 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or i64 %pi, %qi\n  %cmp = icmp eq i64 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %cond.not = icmp eq ptr %p, %q\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %0 = icmp eq ptr %p, null\n  %1 = icmp eq ptr %q, null\n  %cmp = and i1 %0, %1\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %cond.not = icmp eq ptr %p, %q\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %#0 = icmp eq ptr %p, null\n  %#1 = icmp eq ptr %q, null\n  %cmp = and i1 %#0, %#1\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "target datalayout = \"p:8:8:8\"\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "target datalayout = \"p:8:8:8\"\n; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %cond.not = icmp eq ptr %p, %q\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %0 = icmp eq ptr %p, null\n  %1 = icmp eq ptr %q, null\n  %cmp = and i1 %0, %1\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %pi = ptrtoint ptr %p to i64\n  %qi = ptrtoint ptr %q to i64\n  %cond = icmp ne i64 %pi, %qi\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_ptrtoint(ptr %p, ptr %q) {\nentry:\n  %cond.not = icmp eq ptr %p, %q\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %#0 = icmp eq ptr %p, null\n  %#1 = icmp eq ptr %q, null\n  %cmp = and i1 %#0, %#1\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_shuffled_operands",
+      "missed_optimization": false,
+      "cost": {
+        "source": 6,
+        "expected": 1,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %y, %x\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %y, %x\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %y, %x\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %y, %x\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %y, %x\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_shuffled_operands(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %y, %x\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %y, %x\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = #x03 (3)\ni8 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_with_freeze",
+      "missed_optimization": true,
+      "cost": {
+        "source": 8,
+        "expected": 6,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond.not = icmp eq i8 %xf, %yf\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond.not = icmp eq i8 %xf, %yf\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nthen:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond.not = icmp eq i8 %xf, %yf\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond = icmp ne i8 %xf, %yf\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_with_freeze(i8 %x, i8 %y) {\nentry:\n  %xf = freeze i8 %x\n  %yf = freeze i8 %y\n  %cond.not = icmp eq i8 %xf, %yf\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %xf, %yf\n  %cmp = icmp eq i8 %or, 0\n  ret i1 %cmp\n\nelse:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_diamond_same_constant_returns",
+      "missed_optimization": false,
+      "cost": {
+        "source": 8,
+        "expected": 1,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:\n  br label %merge\n\nmerge:\n  %r = phi i1 [ %cmp, %then ], [ false, %else ]\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond = icmp ne i32 %x, %y\n  br i1 %cond, label %then, label %else\n\nelse:\n  br label %merge\n\nthen:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nmerge:\n  %r = phi i1 [ %cmp, %then ], [ 0, %else ]\n  ret i1 %r\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:                                             ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %else, %then\n  %r = phi i1 [ %cmp, %then ], [ false, %else ]\n  ret i1 %r\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:\n  br label %merge\n\nmerge:\n  %r = phi i1 [ %cmp, %then ], [ 0, %else ]\n  ret i1 %r\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:                                             ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %else, %then\n  %r = phi i1 [ %cmp, %then ], [ false, %else ]\n  ret i1 %r\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_diamond_same_constant_returns(i32 %x, i32 %y) {\nentry:\n  %cond.not = icmp eq i32 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i32 %x, %y\n  %cmp = icmp eq i32 %or, 0\n  br label %merge\n\nelse:\n  br label %merge\n\nmerge:\n  %r = phi i1 [ %cmp, %then ], [ 0, %else ]\n  ret i1 %r\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni32 %x = #x00000003 (3)\ni32 %y = poison\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_nonequal_branch_on_cmp",
+      "missed_optimization": false,
+      "cost": {
+        "source": 8,
+        "expected": 1,
+        "current_opt": 8,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 8\n",
+        "expected_log": "Cost: 1\n",
+        "current_opt_log": "Cost: 8\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": false,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %then, label %else\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 true\n\nf:\n  ret i1 false\n\nelse:\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond = icmp ne i8 %x, %y\n  br i1 %cond, label %then, label %else\n\nelse:\n  ret i1 0\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 1\n\nf:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:                                                ; preds = %then\n  ret i1 true\n\nf:                                                ; preds = %then\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "tgt": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 1\n\nf:\n  ret i1 0\n\nelse:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 false\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:                                             ; preds = %entry\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:                                                ; preds = %then\n  ret i1 true\n\nf:                                                ; preds = %then\n  ret i1 false\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_nonequal_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %cond.not = icmp eq i8 %x, %y\n  br i1 %cond.not, label %else, label %then\n\nthen:\n  %or = or i8 %x, %y\n  %cmp = icmp eq i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 1\n\nf:\n  ret i1 0\n\nelse:\n  ret i1 0\n}\nTransformation doesn't verify!\n\nERROR: Source is more defined than target\n\nExample:\ni8 %x = poison\ni8 %y = #x00 (0)\n\nSource:\n\nTarget:\ni1 %cond.not = poison\nUB triggered on br\n\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "or_nonzero_from_assume_then_branch_on_cmp",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nt:\n  ret i1 true\n\nf:\n  ret i1 false\n}\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp = icmp ne i8 %or, 0\n  br i1 %cmp, label %t, label %f\n\nf:\n  ret i1 0\n\nt:\n  ret i1 1\n}\n=>\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp.not = icmp eq i8 %or, 0\n  br i1 %cmp.not, label %f, label %t\n\nt:                                                ; preds = %entry\n  ret i1 true\n\nf:                                                ; preds = %entry\n  ret i1 false\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "tgt": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp.not = icmp eq i8 %or, 0\n  br i1 %cmp.not, label %f, label %t\n\nt:\n  ret i1 1\n\nf:\n  ret i1 0\n}\n=>\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "declare void @llvm.assume(i1)\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  ret i1 true\n}\n",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\n; Function Attrs: nocallback nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  call void @llvm.assume(i1 %neq)\n  %or = or i8 %x, %y\n  %cmp.not = icmp eq i8 %or, 0\n  br i1 %cmp.not, label %f, label %t\n\nt:                                                ; preds = %entry\n  ret i1 true\n\nf:                                                ; preds = %entry\n  ret i1 false\n}\n\nattributes #0 = { nocallback nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "log": "\n----------------------------------------\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  ret i1 1\n}\n=>\ndefine i1 @or_nonzero_from_assume_then_branch_on_cmp(i8 %x, i8 %y) {\nentry:\n  %neq = icmp ne i8 %x, %y\n  assume i1 %neq\n  %or = or i8 %x, %y\n  %cmp.not = icmp eq i8 %or, 0\n  br i1 %cmp.not, label %f, label %t\n\nt:\n  ret i1 1\n\nf:\n  ret i1 0\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.1s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}

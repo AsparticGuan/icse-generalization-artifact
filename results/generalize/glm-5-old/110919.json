@@ -1,0 +1,483 @@
+{
+  "issue_id": "110919",
+  "dataset_file": "110919.json",
+  "prompt": "You are an expert LLVM compiler engineer, specializing in LLVM IR, InstCombine, and missed-optimization analysis.\n\nI found a **new missed optimization in InstCombine** and currently have **only one LLVM IR example**.\n\nYour tasks:\n1) Understand the missed optimization from my single example.\n2) Generalize it into a reusable pattern (preconditions, canonical form, legality constraints).\n3) Generate many additional LLVM IR test cases that are semantically equivalent and should trigger the same transformation, including corner cases.\n4) Summarize the pattern so it could be implemented as an InstCombine fold (or described as an Alive2/MLIR-style rewrite).\n5) Optionally propose a plausible InstCombine implementation sketch (match + fold) and list pitfalls.\n\n---\n\n## How to expand examples (optimization-oriented guidance)\nWhen generating more cases, expand along two main lines:\n\n### (1) Semantically equivalent but structurally diverse IR variants\nGoal: cover InstCombine pattern-matching blind spots by keeping semantics but changing shape.\nSystematically vary:\n- **Type/bitwidth forms**: different integer widths (including unusual widths), vectors, and any safe pointer-adjacent encodings (avoid introducing UB).\n- **Expression isomorphisms**: commuted operands, reassociated trees where legal, equivalent bitwise identities, alternative opcode families that encode the same math, and \"noise\" operations that should be transparent (`add 0`, `xor 0`, `and -1`, `zext/trunc round-trips` when type-safe).\n- **Use-def shape changes**: insert `select` or small CFG with `phi` to represent the same value flow; ensure legality and keep the fold local if possible.\n\n### (2) Boundary conditions & context perturbations\nGoal: validate \"only under some constraints\" and reveal why InstCombine might be conservative.\nSystematically vary:\n- **Constants and bit patterns**: `0/1/-1`, min/max, low-bit/high-bit masks, and structured constants like alternating-bit masks; include cases that sharpen or break preconditions.\n- **Flags/semantic constraints**: `nuw/nsw/exact`, and any poison/undef interactions. Include pairs of cases that differ only by a flag or a `freeze`, to show when the rewrite becomes legal/illegal or when InstCombine should/shouldn't fire.\n- **Context realism**: add minimal surrounding IR (extra uses, extra blocks, simple caller/callee boundary) to see if matching fails due to non-canonical forms or interference.\n\nUse these dimensions to generate grouped variants (e.g., \"only bitwidth changes\", then \"only flags changes\"), so each new case remains attributable and easy to debug.\n\n---\n\n## Output format requirement (strict)\nReturn **ONLY** JSON (a single JSON object). No Markdown, no extra text.\n\n## What I will provide\n- The original LLVM IR snippet (minimal reproducer).\n- The target triple/datalayout if relevant.\n- What I expected InstCombine to do vs what it does today.\n- Any constraints I already suspect (e.g., `nsw/nuw`, `exact`, `inbounds`, poison/undef considerations, fast-math flags, vector widths).\n\n## What you must output (in JSON)\nInclude the following top-level keys (you may add more keys if useful):\n- \"summary\"\n- \"before_after\" (describe the rewrite)\n- \"preconditions\" (legality constraints, including poison/undef/flags)\n- \"pattern\" (generalized pattern description)\n- \"testcases\" (an array of testcase objects; include both positive and negative cases)\n- \"implementation_notes\" (InstCombine-oriented notes)\n- \"regression_test_notes\" (how to test with opt/FileCheck)\n- \"clarifying_questions\" (ask at most 3, only if truly needed)\n\nEach testcase object must include at least:\n- \"name\"\n- \"ir\" (the input IR for this case)\n- \"expected_optimized_ir\" (what InstCombine should produce, at least the key simplified instructions; full function preferred)\n- \"why\" (one sentence)\n\n---\n\n## Here is my single example \ndefine i1 @and_trunc_i1(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n\ndefine i1 @and_trunc_i1(i8 %a1, i8 %a2) {\n  %and = icmp eq i8 %a1, %a2\n  ret i1 %and\n}\n",
+  "model_output": "```json\n{\n  \"summary\": \"The optimization simplifies a conjunction of range checks and bit-extraction checks into a simple equality check. Specifically, checking if a value is less than 2 (upper bits are zero) AND its least significant bit is zero implies the entire value is zero. If the value is the result of an XOR, this further simplifies to an equality check of the XOR operands.\",\n  \"before_after\": {\n    \"before\": \"and (icmp ult (xor %a, %b), 2), (xor (trunc (xor %a, %b) to i1), true)\",\n    \"after\": \"icmp eq %a, %b\"\n  },\n  \"preconditions\": [\n    \"The value being checked (V) must be an integer or vector of integers.\",\n    \"One condition must ensure bits [1, N) are zero. This is typically `icmp ult V, 2` or `icmp ule V, 1`.\",\n    \"The other condition must ensure bit 0 is zero. This is typically `icmp eq (trunc V to i1), 0` or `xor (trunc V to i1), true`.\",\n    \"The types of the constants (2, true) must match the operand types.\",\n    \"If V is a vector, the transformation applies element-wise.\"\n  ],\n  \"pattern\": \"Pattern: (and (icmp_ult V, 2), (is_zero_trunc V i1)) -> (icmp_eq V, 0)\\nWhere:\\n- V is an integer value (often `xor %a, %b`)\\n- `is_zero_trunc V i1` represents logic equivalent to `icmp eq (trunc V to i1), 0`\",\n  \"testcases\": [\n    {\n      \"name\": \"original_i8\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %cmp = icmp eq i8 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Baseline test case from the prompt.\"\n    },\n    {\n      \"name\": \"i32_variant\",\n      \"ir\": \"define i1 @test(i32 %a1, i32 %a2) {\\n  %xor = xor i32 %a1, %a2\\n  %cmp = icmp ult i32 %xor, 2\\n  %lobit = trunc i32 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i32 %a1, i32 %a2) {\\n  %cmp = icmp eq i32 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies the pattern works for larger bitwidths (i32).\"\n    },\n    {\n      \"name\": \"i64_variant\",\n      \"ir\": \"define i1 @test(i64 %a1, i64 %a2) {\\n  %xor = xor i64 %a1, %a2\\n  %cmp = icmp ult i64 %xor, 2\\n  %lobit = trunc i64 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i64 %a1, i64 %a2) {\\n  %cmp = icmp eq i64 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies the pattern works for i64.\"\n    },\n    {\n      \"name\": \"vector_i8\",\n      \"ir\": \"define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\\n  %xor = xor <4 x i8> %a1, %a2\\n  %cmp = icmp ult <4 x i8> %xor, <i8 2, i8 2, i8 2, i8 2>\\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\\n  %lobit.inv = xor <4 x i1> %lobit, <i1 true, i1 true, i1 true, i1 true>\\n  %and = and <4 x i1> %cmp, %lobit.inv\\n  ret <4 x i1> %and\\n}\",\n      \"expected_optimized_ir\": \"define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\\n  %cmp = icmp eq <4 x i8> %a1, %a2\\n  ret <4 x i1> %cmp\\n}\",\n      \"why\": \"Verifies the pattern works for vectors of i8.\"\n    },\n    {\n      \"name\": \"commuted_and_operands\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %lobit.inv, %cmp\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %cmp = icmp eq i8 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies pattern matching handles commuted `and` operands.\"\n    },\n    {\n      \"name\": \"predicate_ule\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ule i8 %xor, 1\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %cmp = icmp eq i8 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies `icmp ule` with constant 1 is recognized as equivalent to `icmp ult` with 2.\"\n    },\n    {\n      \"name\": \"lsb_check_icmp_eq\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lsb_check = icmp eq i1 %lobit, false\\n  %and = and i1 %cmp, %lsb_check\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %cmp = icmp eq i8 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies the LSB check can be `icmp eq ... false` instead of `xor true`.\"\n    },\n    {\n      \"name\": \"lsb_check_icmp_ne\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lsb_check = icmp ne i1 %lobit, true\\n  %and = and i1 %cmp, %lsb_check\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %cmp = icmp eq i8 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Verifies the LSB check can be `icmp ne ... true`.\"\n    },\n    {\n      \"name\": \"i1_inputs\",\n      \"ir\": \"define i1 @test(i1 %a1, i1 %a2) {\\n  %xor = xor i1 %a1, %a2\\n  %cmp = icmp ult i1 %xor, 2\\n  %lobit = trunc i1 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i1 %a1, i1 %a2) {\\n  %cmp = icmp eq i1 %a1, %a2\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Corner case: inputs are already i1. `icmp ult < 2` is always true. Reduces to `not (xor)` which is `eq`.\"\n    },\n    {\n      \"name\": \"negative_range_ult_4\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 4\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 4\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"why\": \"Boundary case: `ult < 4` allows values 0, 1, 2, 3. `lsb == 0` allows 0, 2. Result is not just 0. Optimization should NOT fire.\"\n    },\n    {\n      \"name\": \"negative_or_instead_of_and\",\n      \"ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %or = or i1 %cmp, %lobit.inv\\n  ret i1 %or\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %a1, i8 %a2) {\\n  %xor = xor i8 %a1, %a2\\n  %cmp = icmp ult i8 %xor, 2\\n  %lobit = trunc i8 %xor to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %or = or i1 %cmp, %lobit.inv\\n  ret i1 %or\\n}\",\n      \"why\": \"Boundary case: Using `or` changes logic significantly. Optimization should NOT fire.\"\n    },\n    {\n      \"name\": \"generic_xor_removal\",\n      \"ir\": \"define i1 @test(i8 %v) {\\n  %cmp = icmp ult i8 %v, 2\\n  %lobit = trunc i8 %v to i1\\n  %lobit.inv = xor i1 %lobit, true\\n  %and = and i1 %cmp, %lobit.inv\\n  ret i1 %and\\n}\",\n      \"expected_optimized_ir\": \"define i1 @test(i8 %v) {\\n  %cmp = icmp eq i8 %v, 0\\n  ret i1 %cmp\\n}\",\n      \"why\": \"Generalizes the pattern: checks if generic value V is 0, not just XOR results.\"\n    }\n  ],\n  \"implementation_notes\": \"The fold should be implemented in InstCombine's visitAnd (or a helper). It should match the pattern:\\n1. `and(i1 %A, i1 %B)`\\n2. One operand matches `icmp ult/ule %V, 2/1`.\\n3. The other operand matches `is_zero(trunc %V to i1)`.\\n4. If matched, replace with `icmp eq %V, 0`.\\n5. InstCombine's existing logic will then simplify `icmp eq (xor A, B), 0` to `icmp eq A, B`.\\n\\nPitfalls:\\n- Ensure the constant for the range check is exactly 2 (for ult) or 1 (for ule). Larger constants (e.g., 4) allow non-zero values and break the logic.\\n- Ensure the trunc target is i1. Truncating to i2 with ult < 2 is a mismatch.\\n- Handle vectors correctly (splat constants).\",\n  \"regression_test_notes\": \"Create a file `opt-test.ll` with the 'ir' from testcases. Run `opt -instcombine -S opt-test.ll`. Verify the output matches 'expected_optimized_ir'.\\nExample command:\\n`opt -instcombine -S test.ll | FileCheck test.ll`\\n\\nUse CHECK-LABEL for function names.\",\n  \"clarifying_questions\": []\n}\n```",
+  "parsed": {
+    "summary": "The optimization simplifies a conjunction of range checks and bit-extraction checks into a simple equality check. Specifically, checking if a value is less than 2 (upper bits are zero) AND its least significant bit is zero implies the entire value is zero. If the value is the result of an XOR, this further simplifies to an equality check of the XOR operands.",
+    "before_after": {
+      "before": "and (icmp ult (xor %a, %b), 2), (xor (trunc (xor %a, %b) to i1), true)",
+      "after": "icmp eq %a, %b"
+    },
+    "preconditions": [
+      "The value being checked (V) must be an integer or vector of integers.",
+      "One condition must ensure bits [1, N) are zero. This is typically `icmp ult V, 2` or `icmp ule V, 1`.",
+      "The other condition must ensure bit 0 is zero. This is typically `icmp eq (trunc V to i1), 0` or `xor (trunc V to i1), true`.",
+      "The types of the constants (2, true) must match the operand types.",
+      "If V is a vector, the transformation applies element-wise."
+    ],
+    "pattern": "Pattern: (and (icmp_ult V, 2), (is_zero_trunc V i1)) -> (icmp_eq V, 0)\nWhere:\n- V is an integer value (often `xor %a, %b`)\n- `is_zero_trunc V i1` represents logic equivalent to `icmp eq (trunc V to i1), 0`",
+    "testcases": [
+      {
+        "name": "original_i8",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Baseline test case from the prompt."
+      },
+      {
+        "name": "i32_variant",
+        "ir": "define i1 @test(i32 %a1, i32 %a2) {\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i32 %a1, i32 %a2) {\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies the pattern works for larger bitwidths (i32)."
+      },
+      {
+        "name": "i64_variant",
+        "ir": "define i1 @test(i64 %a1, i64 %a2) {\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i64 %a1, i64 %a2) {\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies the pattern works for i64."
+      },
+      {
+        "name": "vector_i8",
+        "ir": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, <i8 2, i8 2, i8 2, i8 2>\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, <i1 true, i1 true, i1 true, i1 true>\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}",
+        "expected_optimized_ir": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}",
+        "why": "Verifies the pattern works for vectors of i8."
+      },
+      {
+        "name": "commuted_and_operands",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %lobit.inv, %cmp\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies pattern matching handles commuted `and` operands."
+      },
+      {
+        "name": "predicate_ule",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ule i8 %xor, 1\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies `icmp ule` with constant 1 is recognized as equivalent to `icmp ult` with 2."
+      },
+      {
+        "name": "lsb_check_icmp_eq",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp eq i1 %lobit, false\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies the LSB check can be `icmp eq ... false` instead of `xor true`."
+      },
+      {
+        "name": "lsb_check_icmp_ne",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp ne i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Verifies the LSB check can be `icmp ne ... true`."
+      },
+      {
+        "name": "i1_inputs",
+        "ir": "define i1 @test(i1 %a1, i1 %a2) {\n  %xor = xor i1 %a1, %a2\n  %cmp = icmp ult i1 %xor, 2\n  %lobit = trunc i1 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i1 %a1, i1 %a2) {\n  %cmp = icmp eq i1 %a1, %a2\n  ret i1 %cmp\n}",
+        "why": "Corner case: inputs are already i1. `icmp ult < 2` is always true. Reduces to `not (xor)` which is `eq`."
+      },
+      {
+        "name": "negative_range_ult_4",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "why": "Boundary case: `ult < 4` allows values 0, 1, 2, 3. `lsb == 0` allows 0, 2. Result is not just 0. Optimization should NOT fire."
+      },
+      {
+        "name": "negative_or_instead_of_and",
+        "ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+        "why": "Boundary case: Using `or` changes logic significantly. Optimization should NOT fire."
+      },
+      {
+        "name": "generic_xor_removal",
+        "ir": "define i1 @test(i8 %v) {\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+        "expected_optimized_ir": "define i1 @test(i8 %v) {\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}",
+        "why": "Generalizes the pattern: checks if generic value V is 0, not just XOR results."
+      }
+    ],
+    "implementation_notes": "The fold should be implemented in InstCombine's visitAnd (or a helper). It should match the pattern:\n1. `and(i1 %A, i1 %B)`\n2. One operand matches `icmp ult/ule %V, 2/1`.\n3. The other operand matches `is_zero(trunc %V to i1)`.\n4. If matched, replace with `icmp eq %V, 0`.\n5. InstCombine's existing logic will then simplify `icmp eq (xor A, B), 0` to `icmp eq A, B`.\n\nPitfalls:\n- Ensure the constant for the range check is exactly 2 (for ult) or 1 (for ule). Larger constants (e.g., 4) allow non-zero values and break the logic.\n- Ensure the trunc target is i1. Truncating to i2 with ult < 2 is a mismatch.\n- Handle vectors correctly (splat constants).",
+    "regression_test_notes": "Create a file `opt-test.ll` with the 'ir' from testcases. Run `opt -instcombine -S opt-test.ll`. Verify the output matches 'expected_optimized_ir'.\nExample command:\n`opt -instcombine -S test.ll | FileCheck test.ll`\n\nUse CHECK-LABEL for function names.",
+    "clarifying_questions": []
+  },
+  "validation": [
+    {
+      "name": "original_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i32_variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i32 %a1, i32 %a2) {\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i32 %a1, i32 %a2) {\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a1, i32 %a2) {\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i32 %a1, i32 %a2) {\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i32 %a1, i32 %a2) {\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i32 %a1, i32 %a2) {\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %cmp = icmp eq i32 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i32 %a1, i32 %a2) {\n#0:\n  %xor = xor i32 %a1, %a2\n  %cmp = icmp ult i32 %xor, 2\n  %lobit = trunc i32 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i64_variant",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i64 %a1, i64 %a2) {\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i64 %a1, i64 %a2) {\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %a1, i64 %a2) {\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i64 %a1, i64 %a2) {\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i64 %a1, i64 %a2) {\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i64 %a1, i64 %a2) {\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %cmp = icmp eq i64 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i64 %a1, i64 %a2) {\n#0:\n  %xor = xor i64 %a1, %a2\n  %cmp = icmp ult i64 %xor, 2\n  %lobit = trunc i64 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "vector_i8",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, <i8 2, i8 2, i8 2, i8 2>\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, <i1 true, i1 true, i1 true, i1 true>\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}",
+          "tgt": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, { 2, 2, 2, 2 }\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, { 1, 1, 1, 1 }\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, splat (i8 2)\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, splat (i1 true)\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}\n",
+          "tgt": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, { 2, 2, 2, 2 }\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, { 1, 1, 1, 1 }\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, splat (i8 2)\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, splat (i1 true)\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}\n",
+          "log": "\n----------------------------------------\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %cmp = icmp eq <4 x i8> %a1, %a2\n  ret <4 x i1> %cmp\n}\n=>\ndefine <4 x i1> @test(<4 x i8> %a1, <4 x i8> %a2) {\n#0:\n  %xor = xor <4 x i8> %a1, %a2\n  %cmp = icmp ult <4 x i8> %xor, { 2, 2, 2, 2 }\n  %lobit = trunc <4 x i8> %xor to <4 x i1>\n  %lobit.inv = xor <4 x i1> %lobit, { 1, 1, 1, 1 }\n  %and = and <4 x i1> %cmp, %lobit.inv\n  ret <4 x i1> %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "commuted_and_operands",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %lobit.inv, %cmp\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %lobit.inv, %cmp\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "predicate_ule",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ule i8 %xor, 1\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ule i8 %xor, 1\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "lsb_check_icmp_eq",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp eq i1 %lobit, false\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp eq i1 %lobit, 0\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "lsb_check_icmp_ne",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 2,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp ne i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = icmp ne i1 %lobit, 1\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, true\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %cmp = icmp eq i8 %a1, %a2\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lsb_check = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lsb_check\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "i1_inputs",
+      "ok": false,
+      "error": "Command '['/data/btguan/auto-opt/build/bin/opt', '--passes=instcombine', '-S']' returned non-zero exit status 1."
+    },
+    {
+      "name": "negative_range_ult_4",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 6,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 4\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "negative_or_instead_of_and",
+      "missed_optimization": true,
+      "cost": {
+        "source": 6,
+        "expected": 6,
+        "current_opt": 6,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 6\n",
+        "expected_log": "Cost: 6\n",
+        "current_opt_log": "Cost: 6\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\n",
+          "tgt": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %a1, i8 %a2) {\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, true\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\n=>\ndefine i1 @test(i8 %a1, i8 %a2) {\n#0:\n  %xor = xor i8 %a1, %a2\n  %cmp = icmp ult i8 %xor, 2\n  %lobit = trunc i8 %xor to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %or = or i1 %cmp, %lobit.inv\n  ret i1 %or\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    },
+    {
+      "name": "generic_xor_removal",
+      "missed_optimization": true,
+      "cost": {
+        "source": 5,
+        "expected": 2,
+        "current_opt": 5,
+        "expected_le_current_opt": true,
+        "expected_le_source": true,
+        "ok": true,
+        "source_log": "Cost: 5\n",
+        "expected_log": "Cost: 2\n",
+        "current_opt_log": "Cost: 5\n"
+      },
+      "source_to_expected_ok": true,
+      "opt_equivalent_expected": true,
+      "alive2": {
+        "src_to_expected": {
+          "src": "define i1 @test(i8 %v) {\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}",
+          "tgt": "define i1 @test(i8 %v) {\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "opt_to_expected": {
+          "src": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %v) {\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "tgt": "define i1 @test(i8 %v) {\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n=>\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        },
+        "expected_to_opt": {
+          "src": "define i1 @test(i8 %v) {\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}",
+          "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @test(i8 %v) {\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, true\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\n",
+          "log": "\n----------------------------------------\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp eq i8 %v, 0\n  ret i1 %cmp\n}\n=>\ndefine i1 @test(i8 %v) {\n#0:\n  %cmp = icmp ult i8 %v, 2\n  %lobit = trunc i8 %v to i1\n  %lobit.inv = xor i1 %lobit, 1\n  %and = and i1 %cmp, %lobit.inv\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+        }
+      }
+    }
+  ],
+  "build": {
+    "ok": true,
+    "log": "CMake Deprecation Warning at /data/btguan/auto-opt/utils/llvm/llvm-project/cmake/Modules/CMakePolicy.cmake:6 (cmake_policy):\n  The OLD behavior for policy CMP0116 will be removed from a future version\n  of CMake.\n\n  The cmake-policies(7) manual explains that the OLD behaviors of all\n  policies are deprecated and that a policy should be set to OLD only under\n  specific short-term circumstances.  Projects should be ported to the NEW\n  behavior and not rely on setting a policy to OLD.\nCall Stack (most recent call first):\n  CMakeLists.txt:8 (include)\n\n\n-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) \n-- LLVM host triple: x86_64-unknown-linux-gnu\n-- Native target architecture is X86\n-- Threads enabled.\n-- Doxygen disabled.\n-- Ninja version: 1.11.1\n-- OCaml bindings disabled, need ctypes >=0.4.\n-- LLVM default target triple: x86_64-unknown-linux-gnu\n-- Building with -fPIC\n-- Targeting X86\n-- Targeting RISCV\n-- Targeting AArch64\n-- Targeting SystemZ\n-- Targeting Hexagon\n-- Targeting PowerPC\n-- Failed to find LLVM FileCheck\n-- Google Benchmark version: v0.0.0, normalized to 0.0.0\n-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile\n-- Performing Test HAVE_POSIX_REGEX -- success\n-- Performing Test HAVE_STEADY_CLOCK -- success\n-- Performing Test HAVE_PTHREAD_AFFINITY -- success\n-- Configuring done (2.4s)\n-- Generating done (1.0s)\n-- Build files have been written to: /data/btguan/auto-opt/build\n"
+  }
+}
