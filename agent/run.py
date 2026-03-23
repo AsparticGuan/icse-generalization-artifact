@@ -140,6 +140,10 @@ LOCALIZE_OPT_DEBUG_TIMEOUT = max(
     5, _safe_env_int("LAB_AGENT_LOCALIZE_OPT_DEBUG_TIMEOUT", 30)
 )
 LOCALIZE_TIMEOUT_SECONDS = max(15, _safe_env_int("LAB_AGENT_LOCALIZE_TIMEOUT", 120))
+LOCALIZE_RETRY_TIMES = max(0, _safe_env_int("LAB_AGENT_LOCALIZE_RETRY_TIMES", 3))
+LOCALIZE_RETRY_BACKOFF_SECONDS = max(
+    0, _safe_env_int("LAB_AGENT_LOCALIZE_RETRY_BACKOFF_SECONDS", 2)
+)
 LIMITS_RETRY_ENABLED = os.environ.get("LAB_AGENT_LIMITS_RETRY", "ON") == "ON"
 LIMITS_RETRY_EXTRA_STEPS = max(
     5, _safe_env_int("LAB_AGENT_LIMITS_RETRY_EXTRA_STEPS", 25)
@@ -657,9 +661,7 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--retest-dir",
         default="",
-        help=(
-            "复测输出目录（传给 LAB_RETEST_DIR）。" "默认：results/agent/<safe_model>"
-        ),
+        help=("复测输出目录（传给 LAB_RETEST_DIR）。默认：results/agent/<safe_model>"),
     )
 
     # LLM 参数覆盖（优先于 .env）
@@ -1433,32 +1435,45 @@ def _call_localize_model(prompt: str, *, sys_prompt: str) -> str:
         print(f"[Localize] Skip runtime localization: OpenAI SDK unavailable ({exc})")
         return ""
 
-    try:
-        client_kwargs: dict[str, object] = {}
-        if cfg.llm_token:
-            client_kwargs["api_key"] = cfg.llm_token
-        if cfg.llm_url:
-            client_kwargs["base_url"] = cfg.llm_url
+    client_kwargs: dict[str, object] = {}
+    if cfg.llm_token:
+        client_kwargs["api_key"] = cfg.llm_token
+    if cfg.llm_url:
+        client_kwargs["base_url"] = cfg.llm_url
 
-        client = OpenAI(**client_kwargs) if client_kwargs else OpenAI()
-        model_name = _normalize_localize_model_name(cfg.llm_model, cfg.llm_url)
-        if not model_name:
-            return ""
-
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=cfg.llm_temperature,
-            timeout=LOCALIZE_TIMEOUT_SECONDS,
-        )
-        content = resp.choices[0].message.content
-        return content if isinstance(content, str) else str(content or "")
-    except Exception as exc:
-        print(f"[Localize] Model call failed: {exc}")
+    client = OpenAI(**client_kwargs) if client_kwargs else OpenAI()
+    model_name = _normalize_localize_model_name(cfg.llm_model, cfg.llm_url)
+    if not model_name:
         return ""
+
+    max_attempts = 1 + LOCALIZE_RETRY_TIMES
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=cfg.llm_temperature,
+                timeout=LOCALIZE_TIMEOUT_SECONDS,
+            )
+            content = resp.choices[0].message.content
+            return content if isinstance(content, str) else str(content or "")
+        except Exception as exc:
+            err = str(exc).lower()
+            is_timeout = "timed out" in err or "timeout" in err
+            if is_timeout and attempt < max_attempts:
+                print(
+                    f"[Localize] Model timeout (attempt {attempt}/{max_attempts}), "
+                    "retrying..."
+                )
+                if LOCALIZE_RETRY_BACKOFF_SECONDS > 0:
+                    time.sleep(LOCALIZE_RETRY_BACKOFF_SECONDS)
+                continue
+            print(f"[Localize] Model call failed: {exc}")
+            return ""
+    return ""
 
 
 def _resolve_localize_file_path(
@@ -1797,7 +1812,6 @@ def build_task_description(
     localize_refresh: bool = False,
 ) -> str:
     """构造传给 agent.run(task=...) 的任务描述文本。"""
-    bug_type = env.get_bug_type()
     components = list(env.get_hint_components() or [])
     component = components[0] if components else "Unknown"
     component_hint = component if component != "Unknown" else ""
@@ -1806,12 +1820,7 @@ def build_task_description(
     )
 
     issue_desc = _first_missed_optimization_desc(env)
-
-    desc = f"**Issue ID**: {issue_id}\n"
-    desc += f"**Bug Type**: {bug_type}\n"
-    desc += f"**Component**: {component}\n"
-
-    desc += f"\n{issue_desc}"
+    desc = issue_desc or ""
 
     pred_files, pred_funcs, localize_output, localize_category = (
         _load_precomputed_localization(issue_id, force_refresh=localize_refresh)
@@ -2113,9 +2122,9 @@ def fix_issue(
         print(f"Skip {issue_id} (result exists, use -f to override)")
         return
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Fixing {issue_id}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     start_time = time.time()
 
