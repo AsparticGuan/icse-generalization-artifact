@@ -28,7 +28,7 @@ It is **not** intended as a generic auto-fix framework for arbitrary repositorie
 ```text
 agent/
 ├── run.py                  # Main orchestrator (issue loop, env/model/agent wiring, final export)
-├── run_batch.py            # Batch runner (switch model by editing .env, then run run.py)
+├── run_batch.py            # Batch runner (pass model via --model/--models, then call run.py)
 ├── llvm_agent.py           # LLVMFixAgent (safety guard + custom submit protocol)
 ├── llvm_env.py             # LLVMEnvironment (cwd/env injection + timeout)
 ├── env_config.py           # Centralized env-var config (auto-loads .env, provides `cfg` singleton)
@@ -111,7 +111,7 @@ All variables, their meanings, and defaults are documented in `.env.example`.
 | `LAB_AGENT_STEP_LIMIT` | | `30` | Max steps per issue |
 | `LAB_AGENT_COST_LIMIT` | | `5.0` | Max cost per issue (USD) |
 | `MSWEA_GLOBAL_COST_LIMIT` | | `10.0` | mini-swe-agent global cost cap |
-| `MSWEA_GLOBAL_CALL_LIMIT` | | `200` | mini-swe-agent global call cap |
+| `MSWEA_GLOBAL_CALL_LIMIT` | | `0` | mini-swe-agent global call cap (`0` means unlimited) |
 | `LAB_LLVM_DIR` | | `utils/llvm/llvm-project` | Base LLVM source (seed for per-issue clones) |
 | `LAB_LLVM_BUILD_DIR` | | `build/` | Build root |
 | `LAB_LLVM_ALIVE_TV` | | `utils/alive2/build/alive-tv` | Alive2 tool path |
@@ -127,92 +127,95 @@ All variables, their meanings, and defaults are documented in `.env.example`.
 
 ---
 
-## 6) Running
+## 6) CLI Usage
+
+### 6.1 `agent/run.py` (single-model runner)
+
+Basic usage:
 
 ```bash
-# single issue
-python agent/run.py 85250
+# all issues in dataset/
+uv run python agent/run.py
 
-# multiple issues
-python agent/run.py 85250,76128
-
-# all issues from dataset directory
-python agent/run.py
-
-# overwrite existing result JSON
-python agent/run.py 85250 -f
-
-# force runtime localization mode
-python agent/run.py 85250 --localize-mode pipeline
-python agent/run.py 85250 --localize-mode lite
+# single / multiple issues
+uv run python agent/run.py 85250
+uv run python agent/run.py 85250,76128
 ```
 
-Localization mode priority:
+Arguments (`agent/run.py`):
 
-- CLI `--localize-mode` > env `LAB_AGENT_LOCALIZE_MODE` > default `pipeline`.
-- Per issue cache file path is fixed: `results/agent/<safe_model>/<safe_issue>/localization.json`.
-- If that file exists, agent uses it first; if missing, runtime localization runs and persists to the same path.
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `issues` | positional | `all` | `all` / single issue / comma-separated issues. |
+| `-f`, `--force` | flag | off | Overwrite existing run results. |
+| `--fresh-run` | flag | off | Remove and recreate per-issue clone/build/build_cache before each issue. |
+| `--retest`, `--retest-patches` | flag | off | After run loop, call `agent/retest_patches.py` for selected issues. |
+| `--retest-force` | flag | off | Overwrite existing retest outputs (passed to retest script). |
+| `--retest-dir <path>` | string | empty | Retest output root; if empty, defaults to `results/agent/<safe_model>`. |
+| `--model <name>` | string | empty | Override `LAB_LLM_MODEL` for this run. |
+| `--localize-mode {pipeline,lite}` | enum | none | Runtime localization mode override (priority: CLI > `LAB_AGENT_LOCALIZE_MODE` > `pipeline`). |
+| `--localize-refresh` | flag | off | Ignore existing `localization.json` and recompute runtime localization. |
+| `--effort {none,minimal,low,medium,high,xhigh,max}` | enum | none | Generic reasoning level mapped by model family. |
+| `--reasoning-effort ...` | enum | none | Explicit OpenAI `reasoning.effort`. |
+| `--thinking-level ...` | enum | none | Explicit Gemini `thinkingLevel`. |
+| `--thinking-type ...` | enum | none | Explicit DeepSeek/Claude `thinking.type`. |
+| `--output-effort ...` | enum | none | Explicit Claude `output_config.effort`. |
+| `--budget-tokens <int>` | int | none | Claude `thinking.budget_tokens`. |
+| `--thinking-budget <int>` | int | none | Gemini/Qwen `thinking_budget`. |
+| `--enable-thinking <true\|false>` | bool | none | Qwen `enable_thinking`. |
+| `--reasoning-json '<json_obj>'` | JSON object | empty | Direct merge into `reasoning`. |
+| `--extra-body-json '<json_obj>'` | JSON object | empty | Direct merge into `extra_body`. |
 
-### Batch Testing Script (multiple models × shared issues)
+Behavior notes:
 
-`agent/run_batch.py` can run the same issue set across one or more models,
-strictly in the input order.
+- `--retest-force` or `--retest-dir` automatically enables `--retest`.
+- Unknown issue IDs are skipped if they do not exist under `dataset/`.
+- Non-verified issues are skipped.
+- If an issue already passes initial fast-check, fixing is skipped for that issue.
 
-Model selection is passed directly via `run.py --model` for each run.
-`run_batch.py` does **not** rewrite `agent/.env`.
+### 6.2 `agent/run_batch.py` (multi-model runner)
+
+`run_batch.py` keeps model order exactly as provided and forwards parameters into `run.py`.
 
 ```bash
-# 1) two models (order preserved), one issue
-uv run python agent/run_batch.py \
-  --model openai/gpt-5.3-codex \
-  --model qwen/qwen3.5-plus \
-  --issues 104772
-
-# 2) one model, multiple issues
-uv run python agent/run_batch.py \
-  --model openai/gpt-5.3-codex \
-  --issues 104772,85250
-
-# 3) multiple models, all issues
-uv run python agent/run_batch.py \
-  --models openai/gpt-5.3-codex,qwen/qwen3.5-plus \
-  --issues all
-
-# 4) overwrite existing results (-f passes through to run.py)
-uv run python agent/run_batch.py \
-  --model openai/gpt-5.3-codex \
-  --issues 104772 \
-  -f
-
-# 5) force pipeline runtime localization in batch mode
+# example from this repository (single model + all issues)
 uv run python agent/run_batch.py \
   --model qwen3.5-plus \
   --issues all \
   --localize-mode pipeline \
   --thinking-profile '{"enable_thinking":true,"thinking_budget":81920}' \
   -f \
+  --fresh-run \
   --retest \
   --retest-force
 ```
 
-Main options:
+Arguments (`agent/run_batch.py`):
 
-- `--model <name>`: repeatable, preserves input order.
-- `--models a,b,c`: comma-separated model list.
-- `--issues all|<id>|<id1,id2,...>`: one/many/all issues (applies to every model).
-- `--localize-mode pipeline|lite`: pass runtime localization mode to `run.py`.
-- `-f/--force`: pass `-f` to `run.py`.
-- `--stop-on-error`: stop immediately when one model fails.
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `-m`, `--model <name>` | repeatable | empty | Add model(s) in CLI order. |
+| `--models a,b,c` | CSV | empty | Add comma-separated models. |
+| `--issues all\|id\|id1,id2` | string | `all` | Shared issue set for all models. |
+| `--localize-mode {pipeline,lite}` | enum | none | Pass-through to `run.py --localize-mode`. |
+| `--localize-refresh` | flag | off | Pass-through to `run.py --localize-refresh`. |
+| `--effort ...` | repeatable | empty | Ordered generic effort values. |
+| `--efforts a,b,c` | CSV | empty | Ordered effort values (CSV form). |
+| `--thinking-profile '<json_obj>'` | repeatable | empty | Ordered per-model profile JSON. |
+| `--thinking-profiles-json '<json_obj_or_array>'` | JSON | empty | Single profile or ordered profile array. |
+| `-f`, `--force` | flag | off | Pass-through `-f` to `run.py`. |
+| `--fresh-run` | flag | off | Pass-through `--fresh-run` to `run.py`. |
+| `--stop-on-error` | flag | off | Stop remaining models on first non-zero return code. |
+| `--model-timeout-seconds <int>` | int | `0` | Per-model timeout (`0` means disabled). |
+| `--retest`, `--retest-patches` | flag | off | Pass-through `--retest` to `run.py`. |
+| `--retest-force` | flag | off | Pass-through `--retest-force` to `run.py`. |
+| `--retest-dir <path>` | string | empty | Pass-through retest root; for multiple models, `run_batch.py` auto-appends `/<safe_model>`. |
 
-For custom endpoints (`LAB_LLM_URL` not OpenAI official), `run.py` preserves
-`LAB_LLM_MODEL` as-is (both prefixed and non-prefixed names are supported).
-Use the exact model id registered on your gateway.
+Batch behavior notes:
 
-Notes:
-
-- If no issue id is given, all `*.json` in dataset are processed.
-- Non-verified issues are skipped.
-- If an issue already passes fast check before editing, it is skipped.
+- Model selection is passed via `run.py --model`; `run_batch.py` does not rewrite `agent/.env`.
+- `--retest-force` or `--retest-dir` automatically enables `--retest`.
+- With custom endpoints (`LAB_LLM_URL` not OpenAI official), use the exact gateway model id.
 
 ---
 
@@ -220,17 +223,18 @@ Notes:
 
 Primary run artifacts (per issue, timestamped):
 
-- `results/agent/<model>-<issue_id>/<timestamp>/fix.json`
-- `results/agent/<model>-<issue_id>/<timestamp>/traj.json`
-- `results/agent/<model>-<issue_id>/<timestamp>/preds.json`
+- `results/agent/<safe_model>/<safe_issue>/<timestamp>/fix.json`
+- `results/agent/<safe_model>/<safe_issue>/<timestamp>/traj.json`
+- `results/agent/<safe_model>/<safe_issue>/<timestamp>/preds.json`
 
-Pipeline-compatible flat artifacts (for direct reuse by `pipeline/retest_patches.py`):
+Localization cache (stable per issue under model root):
 
-- `results/agent/fixes-<model>-agent-<timestamp>/<issue_id>.json`
-- `results/agent/traj-<model>-agent-<timestamp>/<issue_id>.traj.json`
+- `results/agent/<safe_model>/<safe_issue>/localization.json`
 
-Result JSON is intentionally compatible with pipeline consumers
-(notably `pipeline/retest_patches.py`).
+Retest artifact (`agent/retest_patches.py`):
+
+- `<retest_root>/<safe_issue>/<timestamp>/retest.json`
+- default `<retest_root>` is `results/agent/<safe_model>`.
 
 Important result fields include:
 
@@ -242,19 +246,19 @@ Important result fields include:
 - `log.model`, `log.messages`, `log.trajectory`
 - `check_fast_log`, `check_full_log`
 
-### Retest historical patches (use pipeline directly)
+### Retest patch-selection rule
 
-For patch reproducibility retest, **reuse pipeline script directly** (do not add a
-separate agent retest implementation):
+`agent/retest_patches.py` validates with `dataset/<issue_id>.json` `dev_tests` and selects patches as follows:
+
+- `fast_check_pass` must be `true`, otherwise skip.
+- if `full_check_pass == false`, use `fast_full_mismatch_patch`.
+- otherwise use `patch`.
+
+Manual retest command:
 
 ```bash
-LAB_PATCH_DIR=<results/agent/fixes-...-<timestamp>> \
-python pipeline/retest_patches.py [issue_id_or_csv] [-f]
+uv run python agent/retest_patches.py [issue_id_or_csv] [-f]
 ```
-
-`pipeline/retest_patches.py` verifies with `dataset/<issue_id>.json` **`dev_tests`**
-(developer golden test cases). This is intentionally different from normal
-`tests` used in generate/fix loops — do not mix them.
 
 ---
 
@@ -320,7 +324,7 @@ pipeline path.
    - This means the current base already satisfies fast-check criteria for that issue.
 
 5. **Result exists and run is skipped**
-   - Use `-f` to overwrite existing `fixes-.../<issue_id>.json`.
+   - Use `-f` to overwrite existing `results/agent/<safe_model>/<safe_issue>/<timestamp>/fix.json`.
 
 ---
 
