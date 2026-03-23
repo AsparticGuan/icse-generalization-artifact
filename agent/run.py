@@ -5,6 +5,7 @@
     python agent/run.py                     # 处理 dataset/ 下全部 issue
     python agent/run.py 85250               # 处理指定 issue
     python agent/run.py 85250 -f            # 覆盖已有结果
+    python agent/run.py all --issue-workers 4  # 并行处理 issue（默认串行）
     python agent/run.py 85250 --fresh-run   # 每次从全新工作区和全新 build 开始
     python agent/run.py 85250,76128         # 处理多个 issue（逗号分隔）
     python agent/run.py 85250 --retest      # 结束后直接调用 agent/retest_patches.py 复测同批 patch
@@ -24,9 +25,11 @@
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import sys
 import json
+import shlex
 import time
 import re
 import shutil
@@ -633,6 +636,15 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
         help="issue 列表：all（默认）/单个 issue/逗号分隔多个 issue",
     )
     parser.add_argument(
+        "--issue-workers",
+        type=int,
+        default=1,
+        help=(
+            "issue 并行度（默认 1 串行）。"
+            "当 >1 且 issue 数量 >1 时，每个 issue 用独立 run.py 子进程并发执行。"
+        ),
+    )
+    parser.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -788,6 +800,126 @@ def _resolve_localize_mode(cli_mode: str | None) -> tuple[str, str]:
 def _default_retest_root() -> str:
     """构造 agent 默认复测输出根目录。"""
     return _model_results_root()
+
+
+def _append_thinking_cli_args(cmd: list[str], args: argparse.Namespace) -> None:
+    """将当前 thinking/reasoning 参数按 CLI 形式附加到命令。"""
+    if args.effort is not None:
+        cmd.extend(["--effort", args.effort])
+    if args.reasoning_effort is not None:
+        cmd.extend(["--reasoning-effort", args.reasoning_effort])
+    if args.thinking_level is not None:
+        cmd.extend(["--thinking-level", args.thinking_level])
+    if args.thinking_type is not None:
+        cmd.extend(["--thinking-type", args.thinking_type])
+    if args.output_effort is not None:
+        cmd.extend(["--output-effort", args.output_effort])
+    if args.budget_tokens is not None:
+        cmd.extend(["--budget-tokens", str(args.budget_tokens)])
+    if args.thinking_budget is not None:
+        cmd.extend(["--thinking-budget", str(args.thinking_budget)])
+    if args.enable_thinking is not None:
+        cmd.extend(["--enable-thinking", "true" if args.enable_thinking else "false"])
+    if args.reasoning_json.strip():
+        cmd.extend(["--reasoning-json", args.reasoning_json])
+    if args.extra_body_json.strip():
+        cmd.extend(["--extra-body-json", args.extra_body_json])
+
+
+def _build_single_issue_subprocess_cmd(
+    args: argparse.Namespace,
+    issue_id: str,
+) -> list[str]:
+    """构造单 issue 子进程命令（并行模式使用）。"""
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        issue_id,
+        "--issue-workers",
+        "1",
+    ]
+
+    if args.force:
+        cmd.append("-f")
+    if args.fresh_run:
+        cmd.append("--fresh-run")
+    if args.model.strip():
+        cmd.extend(["--model", args.model.strip()])
+    if args.localize_mode is not None:
+        cmd.extend(["--localize-mode", args.localize_mode])
+    if args.localize_refresh:
+        cmd.append("--localize-refresh")
+
+    _append_thinking_cli_args(cmd, args)
+    return cmd
+
+
+def _run_single_issue_in_subprocess(
+    args: argparse.Namespace,
+    issue_id: str,
+) -> tuple[str, int]:
+    """执行单 issue 子进程，返回 issue_id 与退出码。"""
+    cmd = _build_single_issue_subprocess_cmd(args, issue_id)
+    cmd_display = " ".join(shlex.quote(x) for x in cmd)
+    print(f"[Parallel] Start issue={issue_id}: {cmd_display}")
+    proc = subprocess.run(cmd, cwd=_PROJECT_ROOT, check=False)
+    return issue_id, proc.returncode
+
+
+def _run_issues_in_parallel(
+    task_list: list[str],
+    args: argparse.Namespace,
+) -> tuple[list[str], list[tuple[str, int]]]:
+    """并发执行 issue，返回成功 issue 与失败列表。"""
+    succeeded: set[str] = set()
+    failed: dict[str, int] = {}
+
+    worker_count = max(1, min(args.issue_workers, len(task_list)))
+    total_batches = (len(task_list) + worker_count - 1) // worker_count
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for batch_idx, start in enumerate(
+            range(0, len(task_list), worker_count), start=1
+        ):
+            batch_tasks = task_list[start : start + worker_count]
+            print(
+                "[Parallel] Batch "
+                f"{batch_idx}/{total_batches}: {len(batch_tasks)} issue(s)"
+            )
+
+            future_to_issue: dict[object, str] = {}
+            for task_id in batch_tasks:
+                try:
+                    future = executor.submit(
+                        _run_single_issue_in_subprocess, args, task_id
+                    )
+                except Exception as exc:
+                    failed[task_id] = 1
+                    print(f"[Parallel] issue={task_id} SUBMIT_ERROR: {exc}")
+                    continue
+                future_to_issue[future] = task_id
+
+            for future in as_completed(future_to_issue):
+                issue_id = future_to_issue[future]
+                try:
+                    _issue_id, return_code = future.result()
+                except Exception as exc:
+                    failed[issue_id] = 1
+                    print(f"[Parallel] issue={issue_id} ERROR: {exc}")
+                    continue
+
+                if return_code == 0:
+                    succeeded.add(_issue_id)
+                    print(f"[Parallel] issue={_issue_id} OK")
+                else:
+                    failed[_issue_id] = return_code
+                    print(f"[Parallel] issue={_issue_id} FAIL({return_code})")
+
+    ordered_success = [task_id for task_id in task_list if task_id in succeeded]
+    ordered_failed = [
+        (task_id, failed[task_id]) for task_id in task_list if task_id in failed
+    ]
+    return ordered_success, ordered_failed
 
 
 def _run_agent_retest(
@@ -2500,6 +2632,10 @@ Hard constraints:
 
 if __name__ == "__main__":
     args = _parse_cli_args(sys.argv[1:])
+    if args.issue_workers < 1:
+        print("[ERROR] --issue-workers 必须为正整数。")
+        sys.exit(2)
+
     if args.retest_force or args.retest_dir.strip():
         args.retest_patches = True
 
@@ -2542,12 +2678,6 @@ if __name__ == "__main__":
         print("No valid issues found in dataset/ to process")
         sys.exit(0)
 
-    # 复测 issue 选择：all 模式让 agent/retest_patches.py 按 patch 目录自动枚举；
-    # 指定 issue 模式下仅复测同一批 issue。
-    retest_issue_ids = (
-        None if (not issues_arg or issues_arg.lower() == "all") else task_list
-    )
-
     print(f"Agent workflow — {len(task_list)} issue(s) to process")
     print(f"Model: {cfg.llm_model}")
     print(f"Localization mode: {localize_mode} (source={localize_mode_source})")
@@ -2557,6 +2687,7 @@ if __name__ == "__main__":
         print(json.dumps(thinking_overrides, indent=2, ensure_ascii=False))
     print(f"Results root: {RESULTS_AGENT_DIR}")
     print(f"Run timestamp: {cfg.run_timestamp}")
+    print(f"Issue workers: {args.issue_workers}")
     print(f"Fresh run: {args.fresh_run}")
     if args.retest_patches:
         target_retest_root = args.retest_dir.strip() or _default_retest_root()
@@ -2566,23 +2697,36 @@ if __name__ == "__main__":
     print()
 
     retest_issue_ids = []
-    for task_id in task_list:
-        try:
-            fix_issue(
-                task_id,
-                override=override,
-                model_name=cfg.llm_model,
-                localize_mode=localize_mode,
-                localize_refresh=args.localize_refresh,
-                fresh_run=args.fresh_run,
-                thinking_overrides=thinking_overrides,
-            )
-            retest_issue_ids.append(task_id)
-        except Exception as e:
-            print(f"ERROR processing {task_id}: {e}")
-            import traceback
+    parallel_failed_issues: list[tuple[str, int]] = []
+    if args.issue_workers > 1 and len(task_list) > 1:
+        print(
+            "[Parallel] Issue parallelism enabled: "
+            f"workers={args.issue_workers} (isolated subprocess per issue)"
+        )
+        retest_issue_ids, failed_issues = _run_issues_in_parallel(task_list, args)
+        parallel_failed_issues = failed_issues
+        if failed_issues:
+            print("\n[Parallel] Failed issues:")
+            for issue_id, return_code in failed_issues:
+                print(f"- {issue_id}: FAIL({return_code})")
+    else:
+        for task_id in task_list:
+            try:
+                fix_issue(
+                    task_id,
+                    override=override,
+                    model_name=cfg.llm_model,
+                    localize_mode=localize_mode,
+                    localize_refresh=args.localize_refresh,
+                    fresh_run=args.fresh_run,
+                    thinking_overrides=thinking_overrides,
+                )
+                retest_issue_ids.append(task_id)
+            except Exception as e:
+                print(f"ERROR processing {task_id}: {e}")
+                import traceback
 
-            traceback.print_exc()
+                traceback.print_exc()
 
     if args.retest_patches:
         retest_code = _run_agent_retest(
@@ -2592,3 +2736,10 @@ if __name__ == "__main__":
         )
         if retest_code != 0:
             sys.exit(retest_code)
+
+    if parallel_failed_issues:
+        print(
+            f"[Parallel] {len(parallel_failed_issues)} issue(s) failed; "
+            "exit with code 1."
+        )
+        sys.exit(1)

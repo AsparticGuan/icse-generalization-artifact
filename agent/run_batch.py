@@ -297,6 +297,7 @@ def _build_cmd(
     issue_arg: str | None,
     force: bool,
     *,
+    issue_workers: int,
     fresh_run: bool,
     localize_mode: str | None,
     localize_refresh: bool,
@@ -310,6 +311,8 @@ def _build_cmd(
     cmd = [sys.executable, str(_RUN_PATH), "--model", model]
     if issue_arg is not None:
         cmd.append(issue_arg)
+    if issue_workers > 0:
+        cmd.extend(["--issue-workers", str(issue_workers)])
     if localize_mode is not None:
         cmd.extend(["--localize-mode", localize_mode])
     if localize_refresh:
@@ -393,6 +396,15 @@ def main() -> int:
         "--issues",
         default="all",
         help="测试用例：all（默认）/单个 issue/逗号分隔多个 issue。例：104772,85250",
+    )
+    parser.add_argument(
+        "--issue-workers",
+        type=int,
+        default=1,
+        help=(
+            "透传给 run.py 的 issue 并行度（默认 1 串行）。"
+            "当 >1 且 issue 数量 >1 时，run.py 会并发处理 issue。"
+        ),
     )
     parser.add_argument(
         "--localize-mode",
@@ -504,6 +516,8 @@ def main() -> int:
         models = _parse_models(args.model_args, args.models)
     if not models:
         parser.error("请至少通过 --model 或 --models 指定一个模型。")
+    if args.issue_workers < 1:
+        parser.error("--issue-workers 必须为正整数。")
 
     raw_efforts = _parse_efforts(args.effort_args, args.efforts)
     invalid_efforts = [x for x in raw_efforts if x not in _EFFORT_CHOICES]
@@ -546,6 +560,7 @@ def main() -> int:
     print("Batch agent test runner")
     print(f"Models ({len(models)}): {models}")
     print(f"Issues: {'all' if issue_arg is None else issue_arg}")
+    print(f"Issue workers (run.py): {args.issue_workers}")
     print(f"Ordered efforts: {ordered_efforts}")
     print(f"Thinking profiles count: {len(raw_profiles)}")
     print(
@@ -614,6 +629,7 @@ def main() -> int:
             model,
             issue_arg,
             args.force,
+            issue_workers=args.issue_workers,
             fresh_run=args.fresh_run,
             localize_mode=args.localize_mode,
             localize_refresh=args.localize_refresh,

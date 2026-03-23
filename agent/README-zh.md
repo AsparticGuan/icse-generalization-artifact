@@ -145,6 +145,7 @@ uv run python agent/run.py 85250,76128
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `issues` | 位置参数 | `all` | `all` / 单个 issue / 逗号分隔 issue 列表。 |
+| `--issue-workers <int>` | 整数 | `1` | issue 并行度。默认 `1` 串行；当 `>1` 且选择了多个 issue 时，会以独立子进程并发处理 issue。 |
 | `-f`, `--force` | 开关 | 关闭 | 覆盖已有结果。 |
 | `--fresh-run` | 开关 | 关闭 | 每个 issue 前删除并重建 clone/build/build_cache。 |
 | `--retest`, `--retest-patches` | 开关 | 关闭 | 全部 issue 运行后调用 `agent/retest_patches.py`。 |
@@ -195,6 +196,7 @@ uv run python agent/run_batch.py \
 | `-m`, `--model <name>` | 可重复 | 空 | 按 CLI 顺序追加模型。 |
 | `--models a,b,c` | CSV | 空 | 逗号分隔模型列表。 |
 | `--issues all\|id\|id1,id2` | 字符串 | `all` | 作用于所有模型的共享 issue 集。 |
+| `--issue-workers <int>` | 整数 | `1` | 透传到 `run.py --issue-workers`，控制每个模型下 issue 并行度。 |
 | `--localize-mode {pipeline,lite}` | 枚举 | 未指定 | 透传到 `run.py --localize-mode`。 |
 | `--localize-refresh` | 开关 | 关闭 | 透传到 `run.py --localize-refresh`。 |
 | `--effort ...` | 可重复 | 空 | 按模型顺序传通用强度。 |

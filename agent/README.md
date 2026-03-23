@@ -147,6 +147,7 @@ Arguments (`agent/run.py`):
 | Argument | Type | Default | Description |
 |---|---|---|---|
 | `issues` | positional | `all` | `all` / single issue / comma-separated issues. |
+| `--issue-workers <int>` | int | `1` | Issue parallelism. `1` means serial (default); when `>1` and multiple issues are selected, run issues concurrently in isolated subprocesses. |
 | `-f`, `--force` | flag | off | Overwrite existing run results. |
 | `--fresh-run` | flag | off | Remove and recreate per-issue clone/build/build_cache before each issue. |
 | `--retest`, `--retest-patches` | flag | off | After run loop, call `agent/retest_patches.py` for selected issues. |
@@ -197,6 +198,7 @@ Arguments (`agent/run_batch.py`):
 | `-m`, `--model <name>` | repeatable | empty | Add model(s) in CLI order. |
 | `--models a,b,c` | CSV | empty | Add comma-separated models. |
 | `--issues all\|id\|id1,id2` | string | `all` | Shared issue set for all models. |
+| `--issue-workers <int>` | int | `1` | Pass-through to `run.py --issue-workers` for per-model issue parallelism. |
 | `--localize-mode {pipeline,lite}` | enum | none | Pass-through to `run.py --localize-mode`. |
 | `--localize-refresh` | flag | off | Pass-through to `run.py --localize-refresh`. |
 | `--effort ...` | repeatable | empty | Ordered generic effort values. |
