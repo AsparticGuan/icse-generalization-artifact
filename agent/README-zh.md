@@ -157,7 +157,7 @@ uv run python agent/run.py 85250,76128
 | `--effort {none,minimal,low,medium,high,xhigh,max}` | 枚举 | 未指定 | 通用思考强度（按模型族映射）。 |
 | `--reasoning-effort ...` | 枚举 | 未指定 | 显式设置 OpenAI `reasoning.effort`。 |
 | `--thinking-level ...` | 枚举 | 未指定 | 显式设置 Gemini `thinkingLevel`。 |
-| `--thinking-type ...` | 枚举 | 未指定 | 显式设置 DeepSeek/Claude `thinking.type`。 |
+| `--thinking-type ...` | 枚举 | 未指定 | 显式设置 DeepSeek/Claude/Kimi K2.5 的 `thinking.type`（Kimi 仅支持 `enabled`/`disabled`）。 |
 | `--output-effort ...` | 枚举 | 未指定 | 显式设置 Claude `output_config.effort`。 |
 | `--budget-tokens <int>` | 整数 | 未指定 | 设置 Claude `thinking.budget_tokens`。 |
 | `--thinking-budget <int>` | 整数 | 未指定 | 设置 Gemini/Qwen `thinking_budget`。 |
@@ -171,6 +171,9 @@ uv run python agent/run.py 85250,76128
 - 不在 `dataset/` 中的 issue 会被跳过。
 - 非 `verified` 的 issue 会被跳过。
 - 初始 fast-check 已通过的 issue 会直接跳过修复阶段。
+- 对 `moonshotai/kimi-k2.5`（以及 `kimi-k2.5`），默认开启 thinking；可用 `--thinking-type disabled`（或 `--extra-body-json '{"thinking":{"type":"disabled"}}'`）关闭。
+- 对 `moonshotai/kimi-k2.5`（以及 `kimi-k2.5`），`run.py` 会固定使用 `tool_choice=auto`。
+- Kimi K2.5 使用 `thinking.type=disabled` 时，`run.py` 会将 `temperature` 设置为 `0.6` 以保持兼容。
 
 ### 6.2 `agent/run_batch.py`（多模型批量入口）
 

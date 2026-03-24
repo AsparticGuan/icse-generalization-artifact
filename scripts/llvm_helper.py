@@ -487,10 +487,10 @@ def cost_check(
     success = False
     # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or
     # \ test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
-    # if costs["current_optimized_program"] < costs["source_program"] and \
+    # if costs["current_optimized_program"] <= costs["source_program"] and \
     #     costs["current_optimized_program"] <= costs["expect_optimized_program"]:
     if (
-        costs["current_optimized_program"] < costs["source_program"]
+        costs["current_optimized_program"] <= costs["source_program"]
         and costs["current_optimized_program"] <= costs["expect_optimized_program"]
     ):
         success = True

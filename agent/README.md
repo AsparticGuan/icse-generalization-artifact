@@ -159,7 +159,7 @@ Arguments (`agent/run.py`):
 | `--effort {none,minimal,low,medium,high,xhigh,max}` | enum | none | Generic reasoning level mapped by model family. |
 | `--reasoning-effort ...` | enum | none | Explicit OpenAI `reasoning.effort`. |
 | `--thinking-level ...` | enum | none | Explicit Gemini `thinkingLevel`. |
-| `--thinking-type ...` | enum | none | Explicit DeepSeek/Claude `thinking.type`. |
+| `--thinking-type ...` | enum | none | Explicit DeepSeek/Claude/Kimi K2.5 `thinking.type` (Kimi supports `enabled`/`disabled` only). |
 | `--output-effort ...` | enum | none | Explicit Claude `output_config.effort`. |
 | `--budget-tokens <int>` | int | none | Claude `thinking.budget_tokens`. |
 | `--thinking-budget <int>` | int | none | Gemini/Qwen `thinking_budget`. |
@@ -173,6 +173,9 @@ Behavior notes:
 - Unknown issue IDs are skipped if they do not exist under `dataset/`.
 - Non-verified issues are skipped.
 - If an issue already passes initial fast-check, fixing is skipped for that issue.
+- For `moonshotai/kimi-k2.5` (and `kimi-k2.5`), thinking defaults to enabled; use `--thinking-type disabled` (or `--extra-body-json '{"thinking":{"type":"disabled"}}'`) to turn it off.
+- For `moonshotai/kimi-k2.5` (and `kimi-k2.5`), `run.py` always uses `tool_choice=auto`.
+- For Kimi K2.5 with `thinking.type=disabled`, `run.py` sets `temperature=0.6` for compatibility.
 
 ### 6.2 `agent/run_batch.py` (multi-model runner)
 

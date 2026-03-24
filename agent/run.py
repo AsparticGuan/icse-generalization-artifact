@@ -413,6 +413,9 @@ def _model_family(raw_model_name: str) -> str:
     if "qwen" in model:
         return "qwen_generic"
 
+    if "kimi-k2.5" in model:
+        return "kimi_k25"
+
     return "generic"
 
 
@@ -436,6 +439,9 @@ def _allowed_efforts_for_family(family: str) -> set[str]:
 
     if family == "deepseek_reasoner":
         return {"minimal", "low", "medium", "high", "xhigh", "max"}
+
+    if family == "kimi_k25":
+        return set(_REASONING_EFFORT_CHOICES)
 
     return set(_REASONING_EFFORT_CHOICES)
 
@@ -478,6 +484,11 @@ def _apply_generic_effort(
             )
         thinking = _ensure_nested_dict(extra_body, "thinking", arg_name="--effort")
         thinking.setdefault("type", "enabled")
+        return
+
+    if family == "kimi_k25":
+        thinking = _ensure_nested_dict(extra_body, "thinking", arg_name="--effort")
+        thinking["type"] = "disabled" if effort == "none" else "enabled"
         return
 
     if family.startswith("qwen_"):
@@ -531,8 +542,14 @@ def _build_model_thinking_overrides(
         extra_body["thinkingLevel"] = args.thinking_level
 
     if args.thinking_type:
-        if not (family.startswith("deepseek_") or family.startswith("claude_")):
-            raise ValueError("--thinking-type 仅适用于 DeepSeek/Claude 系列模型。")
+        if family == "kimi_k25" and args.thinking_type not in {"enabled", "disabled"}:
+            raise ValueError("Kimi K2.5 的 --thinking-type 仅支持 enabled/disabled。")
+        elif not (
+            family.startswith("deepseek_")
+            or family.startswith("claude_")
+            or family == "kimi_k25"
+        ):
+            raise ValueError("--thinking-type 仅适用于 DeepSeek/Claude/Kimi K2.5。")
         thinking = _ensure_nested_dict(
             extra_body, "thinking", arg_name="--thinking-type"
         )
@@ -616,11 +633,42 @@ def _build_model_thinking_overrides(
         if isinstance(thinking_obj, dict) and thinking_obj.get("type") == "disabled":
             raise ValueError("deepseek-reasoner 不支持 thinking.type=disabled。")
 
+    kimi_tool_choice: str | None = None
+    kimi_temperature: float | None = None
+    if family == "kimi_k25":
+        thinking_obj = _ensure_nested_dict(
+            extra_body, "thinking", arg_name="Kimi thinking"
+        )
+        thinking_type = thinking_obj.get("type", "enabled")
+        if not isinstance(thinking_type, str):
+            raise ValueError("Kimi K2.5 的 thinking.type 必须是字符串。")
+        thinking_type = thinking_type.strip().lower()
+        if thinking_type not in {"enabled", "disabled"}:
+            raise ValueError("Kimi K2.5 的 thinking.type 仅支持 enabled/disabled。")
+        thinking_obj["type"] = thinking_type
+
+        tool_choice_value = extra_body.pop("tool_choice", None)
+        if tool_choice_value is not None:
+            if not isinstance(tool_choice_value, str):
+                raise ValueError("Kimi K2.5 的 tool_choice 必须是字符串。")
+            tool_choice_norm = tool_choice_value.strip().lower()
+            if tool_choice_norm != "auto":
+                raise ValueError("Kimi K2.5 的 tool_choice 固定为 auto。")
+
+        kimi_tool_choice = "auto"
+
+        if thinking_type == "disabled":
+            kimi_temperature = 0.6
+
     overrides: dict[str, object] = {}
     if reasoning:
         overrides["reasoning"] = reasoning
     if extra_body:
         overrides["extra_body"] = extra_body
+    if kimi_tool_choice is not None:
+        overrides["tool_choice"] = kimi_tool_choice
+    if kimi_temperature is not None:
+        overrides["temperature"] = kimi_temperature
     return overrides
 
 
