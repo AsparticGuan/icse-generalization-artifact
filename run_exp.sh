@@ -1,26 +1,65 @@
 #!/usr/bin/env bash
-# for f in dataset/*.json; do
-#     id=$(basename "$f" .json)
-#     echo "Running task $id ..."
-#     ./pipeline/generate.py "$id"  > "log/output-gemini-3-cot-iter4-${id}.log" 2>&1
-# done
+set -euo pipefail
 
-# for id in 58342 59393 57741 145875 107228 157315 121701 63749 65968 62155 \
-#          156898 142674 76128 123175 88348 85265 85313 73904 77108 129947 \
-#          110919 60818 133367 82414 134024 66417 78038 154238 64859 85823 \
-#          67916 146263 57831 72653; do
-#     echo "Running task $id ..."
-#     ./pipeline/generate.py "$id" > "log/output-gemini-3-cot-iter4-${id}.log" 2>&1
-# done
+# dataset/ 中的全部 issue（共 43 个）
+ISSUES=(
+  58523
+  59393
+  60167
+  63749
+  64859
+  65863
+  69803
+  73446
+  73622
+  73904
+  76128
+  76623
+  85250
+  85265
+  85313
+  88348
+  92538
+  94170
+  94737
+  98800
+  105632
+  117436
+  118106
+  118155
+  118211
+  122235
+  122388
+  123175
+  133344
+  135557
+  141753
+  142497
+  142593
+  142674
+  142711
+  152948
+  154238
+  156898
+  157113
+  157315
+  157371
+  157524
+  158326
+)
 
-NPROC=4
-MAX_JOBS=${MAX_JOBS:-$NPROC}
-for f in dataset/*.json; do
-    id=$(basename "$f" .json)
-    echo "Running task $id ..."
-    ./pipeline/generate_orig.py -f  "$id" > "log/ds/output-ds-cot-iter4-${id}.log" 2>&1 &
-    while [ "$(jobs -rp | wc -l)" -ge "$MAX_JOBS" ]; do
-        wait -n
-    done
-done
-wait
+# 并行度：可通过环境变量覆盖，例如 ISSUE_WORKERS=6 ./run_exp.sh
+ISSUE_WORKERS="${ISSUE_WORKERS:-4}"
+
+# 额外参数：可透传给 agent/run.py，例如：
+#   ./run_exp.sh --model qwen3.5-plus --retest --retest-force -f
+EXTRA_ARGS=("$@")
+
+issues_csv="$(IFS=,; echo "${ISSUES[*]}")"
+echo "Running ${#ISSUES[@]} issues with agent/run.py"
+echo "Issues: ${issues_csv}"
+echo "Issue workers: ${ISSUE_WORKERS}"
+
+export no_proxy='127.0.0.1,localhost' && python -W ignore::DeprecationWarning agent/run.py "${issues_csv}" --issue-workers "${ISSUE_WORKERS}" "${EXTRA_ARGS[@]}"
+
+echo "Done."

@@ -1,0 +1,197 @@
+{
+  "wall_time": 36.66164255142212,
+  "knowledge": [
+    [
+      "base_model",
+      "1970-12-31+0000"
+    ]
+  ],
+  "build_count": 1,
+  "build_failure_count": 0,
+  "fast_check_count": 0,
+  "full_check_count": 0,
+  "fast_check_pass": false,
+  "full_check_pass": false,
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 2d7524e8018b..d5c4a9d96bbf 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -22,6 +22,7 @@\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/Transforms/InstCombine/InstCombiner.h\"\n #include \"llvm/Transforms/Utils/Local.h\"\n+#include \"llvm/Support/raw_ostream.h\"\n \n using namespace llvm;\n using namespace PatternMatch;\n@@ -1366,6 +1367,21 @@ Value *InstCombinerImpl::foldAndOrOfICmpsUsingRanges(ICmpInst *ICmp1,\n       V2 = X;\n     }\n   }\n+  // Also strip AND with negated power of two for equality comparisons.\n+  if (!MatchedAnd1 && Pred1 == ICmpInst::ICMP_EQ) {\n+    Value *X;\n+    if (match(V1, m_OneUse(m_And(m_Value(X), m_NegatedPower2(Mask1))))) {\n+      MatchedAnd1 = true;\n+      V1 = X;\n+    }\n+  }\n+  if (!MatchedAnd2 && Pred2 == ICmpInst::ICMP_EQ) {\n+    Value *X;\n+    if (match(V2, m_OneUse(m_And(m_Value(X), m_NegatedPower2(Mask2))))) {\n+      MatchedAnd2 = true;\n+      V2 = X;\n+    }\n+  }\n \n   if (V1 != V2)\n     return nullptr;\n@@ -1385,7 +1401,17 @@ Value *InstCombinerImpl::foldAndOrOfICmpsUsingRanges(ICmpInst *ICmp1,\n                 IsAnd ? ICmpInst::getInverseCmpPredicate(Pred2) : Pred2, *C2);\n   if (Offset2)\n     CR2 = CR2.subtract(*Offset2);\n-\n+  // If one comparison's true range is a subset of the other's, we can simplify.\n+  ConstantRange TrueRange1 = (IsAnd && !MatchedAnd1) ? CR1.inverse() : CR1;\n+  ConstantRange TrueRange2 = (IsAnd && !MatchedAnd2) ? CR2.inverse() : CR2;\n+  if (TrueRange1.contains(TrueRange2)) {\n+    // TrueRange2 is subset of TrueRange1.\n+    // For AND, result = subset (ICmp2); for OR, result = superset (ICmp1).\n+    return IsAnd ? ICmp2 : ICmp1;\n+  }\n+  if (TrueRange2.contains(TrueRange1)) {\n+    return IsAnd ? ICmp1 : ICmp2;\n+  }\n   Type *Ty = V1->getType();\n   Value *NewV = V1;\n   std::optional<ConstantRange> CR = CR1.exactUnionWith(CR2);\n@@ -3578,7 +3604,102 @@ Value *InstCombinerImpl::foldAndOrOfICmps(ICmpInst *LHS, ICmpInst *RHS,\n        (RHSC->isZero() && *LHSC == *MaskC)))\n     return Builder.createIsFPClass(X, IsAnd ? FPClassTest::fcNormal\n                                             : ~FPClassTest::fcNormal);\n-\n+  // (icmp ult X, C) & (icmp eq (and X, Mask), K) -> icmp eq (and X, Mask), K\n+  // when (K + (1 << trailing zeros of ~Mask) - 1) < C.\n+  // Similarly for swapped operands.\n+  if (IsAnd && LHSC && RHSC) {\n+    Value *X1, *X2;\n+    const APInt *Mask;\n+    // Check for ult on one side and eq with and on the other.\n+    if (PredL == ICmpInst::ICMP_ULT && PredR == ICmpInst::ICMP_EQ &&\n+        match(LHS0, m_Value(X1)) &&\n+        match(RHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      // Mask is negative power of two, i.e., clears low k bits.\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *RHSC + (APInt::getOneBitSet(RHSC->getBitWidth(), k) - 1);\n+      if (Max.ult(*LHSC))\n+        return RHS;\n+    }\n+    // Check for ule on one side and eq with and on the other.\n+    if (PredL == ICmpInst::ICMP_ULE && PredR == ICmpInst::ICMP_EQ &&\n+        match(LHS0, m_Value(X1)) &&\n+        match(RHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *RHSC + (APInt::getOneBitSet(RHSC->getBitWidth(), k) - 1);\n+      if (Max.ule(*LHSC))\n+        return RHS;\n+    }\n+    // Check for slt on one side and eq with and on the other.\n+    if (PredL == ICmpInst::ICMP_SLT && PredR == ICmpInst::ICMP_EQ &&\n+        match(LHS0, m_Value(X1)) &&\n+        match(RHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *RHSC + (APInt::getOneBitSet(RHSC->getBitWidth(), k) - 1);\n+      if (Max.slt(*LHSC))\n+        return RHS;\n+    }\n+    // Check for sle on one side and eq with and on the other.\n+    if (PredL == ICmpInst::ICMP_SLE && PredR == ICmpInst::ICMP_EQ &&\n+        match(LHS0, m_Value(X1)) &&\n+        match(RHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *RHSC + (APInt::getOneBitSet(RHSC->getBitWidth(), k) - 1);\n+      if (Max.sle(*LHSC))\n+        return RHS;\n+    }\n+    // Swapped.\n+    if (PredR == ICmpInst::ICMP_ULT && PredL == ICmpInst::ICMP_EQ &&\n+        match(RHS0, m_Value(X1)) &&\n+        match(LHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *LHSC + (APInt::getOneBitSet(LHSC->getBitWidth(), k) - 1);\n+      if (Max.ult(*RHSC))\n+        return LHS;\n+    }\n+    // Swapped ule.\n+    if (PredR == ICmpInst::ICMP_ULE && PredL == ICmpInst::ICMP_EQ &&\n+        match(RHS0, m_Value(X1)) &&\n+        match(LHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *LHSC + (APInt::getOneBitSet(LHSC->getBitWidth(), k) - 1);\n+      if (Max.ule(*RHSC))\n+        return LHS;\n+    }\n+    // Swapped slt.\n+    if (PredR == ICmpInst::ICMP_SLT && PredL == ICmpInst::ICMP_EQ &&\n+        match(RHS0, m_Value(X1)) &&\n+        match(LHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *LHSC + (APInt::getOneBitSet(LHSC->getBitWidth(), k) - 1);\n+      if (Max.slt(*RHSC))\n+        return LHS;\n+    }\n+    // Swapped sle.\n+    if (PredR == ICmpInst::ICMP_SLE && PredL == ICmpInst::ICMP_EQ &&\n+        match(RHS0, m_Value(X1)) &&\n+        match(LHS0, m_And(m_Value(X2), m_NegatedPower2(Mask))) &&\n+        X1 == X2) {\n+      APInt NegMask = -(*Mask);\n+      unsigned k = NegMask.exactLogBase2();\n+      APInt Max = *LHSC + (APInt::getOneBitSet(LHSC->getBitWidth(), k) - 1);\n+      if (Max.sle(*RHSC))\n+        return LHS;\n+    }\n+  }\n   return foldAndOrOfICmpsUsingRanges(LHS, RHS, IsAnd);\n }\n \n",
+  "log": {
+    "patch_source_file": "/app/data/auto-opt/results/agent/deepseek-reasoner/158326/20260419-165204/fix.json",
+    "patch_issue_id": "158326",
+    "patch_timestamp": "20260419-165204",
+    "test_issue_id": "158326",
+    "pass": false,
+    "retest_results": [
+      {
+        "func_name": null,
+        "file_path": null,
+        "source_check_fast_pass": true,
+        "source_check_full_pass": false,
+        "patch_apply": {
+          "ok": true,
+          "log": ""
+        },
+        "check_more": {
+          "ok": false,
+          "log": [
+            {
+              "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "merge_range_check_and",
+              "body": "define i1 @merge_range_check_and(i8 %a) {\n; CHECK-LABEL: @merge_range_check_and(\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED:%.*]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+              "result": false,
+              "log": {
+                "alive2": {
+                  "src": "define i1 @merge_range_check_and(i8 %a) {\n; CHECK-LABEL: @merge_range_check_and(\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED:%.*]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @merge_range_check_and(i8 %a) {\n  %and = icmp ult i8 %a, 2\n  ret i1 %and\n}\n",
+                  "log": "\n----------------------------------------\ndefine i1 @merge_range_check_and(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @merge_range_check_and(i8 %a) {\n#0:\n  %and = icmp ult i8 %a, 2\n  ret i1 %and\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ni8 %a = #x00 (0)\n\nSource:\ni1 %cmp1 = #x1 (1)\ni8 %masked = #x00 (0)\ni1 %cmp2 = #x0 (0)\ni1 %and = #x0 (0)\n\nTarget:\ni1 %and = #x1 (1)\nSource value: #x0 (0)\nTarget value: #x1 (1)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 5,
+                  "expect_optimized_program": 2,
+                  "current_optimized_program": 2
+                },
+                "filecheck": {
+                  "src": "define i1 @merge_range_check_and(i8 %a) {\n; CHECK-LABEL: @merge_range_check_and(\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED:%.*]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @merge_range_check_and(i8 %a) {\n  %and = icmp ult i8 %a, 2\n  ret i1 %and\n}\n",
+                  "log": "Command '['/app/data/auto-opt/build/158326/bin/FileCheck', '/app/data/auto-opt/.tmp/tmpv31day5t']' returned non-zero exit status 1.\n/app/data/auto-opt/.tmp/tmpv31day5t:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[CMP2:%.*]] = icmp eq i8 [[MASKED:%.*]], 2\n              ^\n<stdin>:4:34: note: scanning from here\ndefine i1 @merge_range_check_and(i8 %a) {\n                                 ^\n<stdin>:5:2: note: possible intended match here\n %and = icmp ult i8 %a, 2\n ^\n\nInput file: <stdin>\nCheck file: /app/data/auto-opt/.tmp/tmpv31day5t\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @merge_range_check_and(i8 %a) { \nnext:3'0                                      X~~~~~~~~ error: no match found\n          5:  %and = icmp ult i8 %a, 2 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                         possible intended match\n          6:  ret i1 %and \nnext:3'0     ~~~~~~~~~~~~~\n          7: } \nnext:3'0     ~~\n>>>>>>\n"
+                },
+                "source_program": "define i1 @merge_range_check_and(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+                "expect_optimized_program": "define i1 @merge_range_check_and(i8 %a) {\n  %and = icmp eq i8 %a, 2\n  ret i1 %and\n}\n",
+                "current_optimized_program": "define i1 @merge_range_check_and(i8 %a) {\n  %and = icmp ult i8 %a, 2\n  ret i1 %and\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "implied_select_icmp_eq_and_pow2",
+              "body": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @implied_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -32\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 128\n; CHECK-NEXT:    ret i1 [[TMP2]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @implied_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -32\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 128\n; CHECK-NEXT:    ret i1 [[TMP2]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  ret i1 %icmp2\n}\n",
+                  "log": "\n----------------------------------------\ndefine i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  %#1 = select i1 %icmp1, i1 %icmp2, i1 0\n  ret i1 %#1\n}\n=>\ndefine i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n#0:\n  %and = and i32 %x, 4294967264\n  %icmp2 = icmp eq i32 %and, 128\n  ret i1 %icmp2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 5,
+                  "expect_optimized_program": 3,
+                  "current_optimized_program": 3
+                },
+                "filecheck": {
+                  "src": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n; CHECK-LABEL: @implied_select_icmp_eq_and_pow2(\n; CHECK-NEXT:    [[TMP1:%.*]] = and i32 [[X:%.*]], -32\n; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i32 [[TMP1]], 128\n; CHECK-NEXT:    ret i1 [[TMP2]]\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  ret i1 %icmp2\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n  %icmp1 = icmp sgt i32 %x, 127\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  %1 = select i1 %icmp1, i1 %icmp2, i1 false\n  ret i1 %1\n}\n",
+                "expect_optimized_program": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n  %1 = and i32 %x, -32\n  %2 = icmp eq i32 %1, 128\n  ret i1 %2\n}\n",
+                "current_optimized_program": "define i1 @implied_select_icmp_eq_and_pow2(i32 %x) {\n  %and = and i32 %x, -32\n  %icmp2 = icmp eq i32 %and, 128\n  ret i1 %icmp2\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "implied_range_check",
+              "body": "define i1 @implied_range_check(i8 %a) {\n; CHECK-LABEL: @implied_range_check(\n; CHECK-NEXT:    [[MASKED:%.*]] = and i8 [[A:%.*]], -2\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i1 @implied_range_check(i8 %a) {\n; CHECK-LABEL: @implied_range_check(\n; CHECK-NEXT:    [[MASKED:%.*]] = and i8 [[A:%.*]], -2\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @implied_range_check(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  ret i1 %cmp2\n}\n",
+                  "log": "\n----------------------------------------\ndefine i1 @implied_range_check(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @implied_range_check(i8 %a) {\n#0:\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  ret i1 %cmp2\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 5,
+                  "expect_optimized_program": 3,
+                  "current_optimized_program": 3
+                },
+                "filecheck": {
+                  "src": "define i1 @implied_range_check(i8 %a) {\n; CHECK-LABEL: @implied_range_check(\n; CHECK-NEXT:    [[MASKED:%.*]] = and i8 [[A:%.*]], -2\n; CHECK-NEXT:    [[CMP2:%.*]] = icmp eq i8 [[MASKED]], 2\n; CHECK-NEXT:    ret i1 [[CMP2]]\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @implied_range_check(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  ret i1 %cmp2\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i1 @implied_range_check(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 5\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = and i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+                "expect_optimized_program": "define i1 @implied_range_check(i8 %a) {\n  %1 = and i8 %a, -2\n  %and = icmp eq i8 %1, 2\n  ret i1 %and\n}\n",
+                "current_optimized_program": "define i1 @implied_range_check(i8 %a) {\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  ret i1 %cmp2\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "merge_range_check_or",
+              "body": "define i1 @merge_range_check_or(i8 %a) {\n; CHECK-LABEL: @merge_range_check_or(\n; CHECK-NEXT:    [[AND:%.*]] = icmp ult i8 [[A:%.*]], 4\n; CHECK-NEXT:    ret i1 [[AND]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = or i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+              "result": true,
+              "log": {
+                "alive2": {
+                  "src": "define i1 @merge_range_check_or(i8 %a) {\n; CHECK-LABEL: @merge_range_check_or(\n; CHECK-NEXT:    [[AND:%.*]] = icmp ult i8 [[A:%.*]], 4\n; CHECK-NEXT:    ret i1 [[AND]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = or i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @merge_range_check_or(i8 %a) {\n  %and = icmp ult i8 %a, 4\n  ret i1 %and\n}\n",
+                  "log": "\n----------------------------------------\ndefine i1 @merge_range_check_or(i8 %a) {\n#0:\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, 254\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = or i1 %cmp1, %cmp2\n  ret i1 %and\n}\n=>\ndefine i1 @merge_range_check_or(i8 %a) {\n#0:\n  %and = icmp ult i8 %a, 4\n  ret i1 %and\n}\nTransformation seems to be correct!\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 5,
+                  "expect_optimized_program": 2,
+                  "current_optimized_program": 2
+                },
+                "filecheck": {
+                  "src": "define i1 @merge_range_check_or(i8 %a) {\n; CHECK-LABEL: @merge_range_check_or(\n; CHECK-NEXT:    [[AND:%.*]] = icmp ult i8 [[A:%.*]], 4\n; CHECK-NEXT:    ret i1 [[AND]]\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = or i1 %cmp1, %cmp2\n  ret i1 %and\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @merge_range_check_or(i8 %a) {\n  %and = icmp ult i8 %a, 4\n  ret i1 %and\n}\n",
+                  "log": ""
+                },
+                "source_program": "define i1 @merge_range_check_or(i8 %a) {\n  %cmp1 = icmp ult i8 %a, 3\n  %masked = and i8 %a, -2\n  %cmp2 = icmp eq i8 %masked, 2\n  %and = or i1 %cmp1, %cmp2\n  ret i1 %and\n}\n",
+                "expect_optimized_program": "define i1 @merge_range_check_or(i8 %a) {\n  %and = icmp ult i8 %a, 4\n  ret i1 %and\n}\n",
+                "current_optimized_program": "define i1 @merge_range_check_or(i8 %a) {\n  %and = icmp ult i8 %a, 4\n  ret i1 %and\n}\n",
+                "opt_stderr": ""
+              }
+            },
+            {
+              "file": "llvm/test/Transforms/InstCombine/icmp-range.ll",
+              "args": [
+                "opt < %s -passes=instcombine -S",
+                "FileCheck %s"
+              ],
+              "name": "isFloat",
+              "body": "define i1 @isFloat(i64 %0) {\n; CHECK-LABEL: @isFloat(\n; CHECK-NEXT:    [[TMP5:%.*]] = icmp ugt i64 [[TMP0:%.*]], 562949953421311\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}",
+              "result": false,
+              "log": {
+                "alive2": {
+                  "src": "define i1 @isFloat(i64 %0) {\n; CHECK-LABEL: @isFloat(\n; CHECK-NEXT:    [[TMP5:%.*]] = icmp ugt i64 [[TMP0:%.*]], 562949953421311\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @isFloat(i64 %0) {\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}\n",
+                  "log": "\n----------------------------------------\ndefine i1 @isFloat(i64 %#0) {\n#1:\n  %#2 = icmp ugt i64 %#0, 281474976710655\n  %#3 = and i64 %#0, -281474976710656\n  %#4 = icmp ne i64 %#3, 281474976710656\n  %#5 = and i1 %#2, %#4\n  ret i1 %#5\n}\n=>\ndefine i1 @isFloat(i64 %#0) {\n#1:\n  %#2 = icmp ugt i64 %#0, 281474976710655\n  %#3 = and i64 %#0, -281474976710656\n  %#4 = icmp ne i64 %#3, 281474976710656\n  %#5 = and i1 %#2, %#4\n  ret i1 %#5\n}\nTransformation seems to be correct! (syntactically equal)\n\nSummary:\n  1 correct transformations\n  0 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n"
+                },
+                "cost": {
+                  "source_program": 5,
+                  "expect_optimized_program": 2,
+                  "current_optimized_program": 5
+                },
+                "filecheck": {
+                  "src": "define i1 @isFloat(i64 %0) {\n; CHECK-LABEL: @isFloat(\n; CHECK-NEXT:    [[TMP5:%.*]] = icmp ugt i64 [[TMP0:%.*]], 562949953421311\n; CHECK-NEXT:    ret i1 [[TMP5]]\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}",
+                  "tgt": "; ModuleID = '<stdin>'\nsource_filename = \"<stdin>\"\n\ndefine i1 @isFloat(i64 %0) {\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}\n",
+                  "log": "Command '['/app/data/auto-opt/build/158326/bin/FileCheck', '/app/data/auto-opt/.tmp/tmphv6_pmx8']' returned non-zero exit status 1.\n/app/data/auto-opt/.tmp/tmphv6_pmx8:3:15: error: CHECK-NEXT: expected string not found in input\n; CHECK-NEXT: [[TMP5:%.*]] = icmp ugt i64 [[TMP0:%.*]], 562949953421311\n              ^\n<stdin>:4:20: note: scanning from here\ndefine i1 @isFloat(i64 %0) {\n                   ^\n<stdin>:5:2: note: possible intended match here\n %2 = icmp ugt i64 %0, 281474976710655\n ^\n\nInput file: <stdin>\nCheck file: /app/data/auto-opt/.tmp/tmphv6_pmx8\n\n-dump-input=help explains the following input dump.\n\nInput was:\n<<<<<<\n          1: ; ModuleID = '<stdin>' \n          2: source_filename = \"<stdin>\" \n          3:  \n          4: define i1 @isFloat(i64 %0) { \nnext:3'0                        X~~~~~~~~~ error: no match found\n          5:  %2 = icmp ugt i64 %0, 281474976710655 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nnext:3'1      ?                                      possible intended match\n          6:  %3 = and i64 %0, -281474976710656 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          7:  %4 = icmp ne i64 %3, 281474976710656 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n          8:  %5 = and i1 %2, %4 \nnext:3'0     ~~~~~~~~~~~~~~~~~~~~\n          9:  ret i1 %5 \nnext:3'0     ~~~~~~~~~~~\n         10: } \nnext:3'0     ~~\n>>>>>>\n"
+                },
+                "source_program": "define i1 @isFloat(i64 %0) {\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}\n",
+                "expect_optimized_program": "define i1 @isFloat(i64 %0) {\n  %2 = icmp ugt i64 %0, 562949953421311\n  ret i1 %2\n}\n",
+                "current_optimized_program": "define i1 @isFloat(i64 %0) {\n  %2 = icmp ugt i64 %0, 281474976710655\n  %3 = and i64 %0, -281474976710656\n  %4 = icmp ne i64 %3, 281474976710656\n  %5 = and i1 %2, %4\n  ret i1 %5\n}\n",
+                "opt_stderr": ""
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "check_fast_log": [],
+  "check_full_log": []
+}

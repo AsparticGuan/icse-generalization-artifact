@@ -151,6 +151,25 @@ LIMITS_RETRY_ENABLED = os.environ.get("LAB_AGENT_LIMITS_RETRY", "ON") == "ON"
 LIMITS_RETRY_EXTRA_STEPS = max(
     5, _safe_env_int("LAB_AGENT_LIMITS_RETRY_EXTRA_STEPS", 25)
 )
+PROMPT_STRATEGY_BASELINE = "baseline"
+PROMPT_STRATEGY_SINGLE_PROMPT = "single-prompt"
+PROMPT_STRATEGY_HISTORY = "history"
+PROMPT_STRATEGY_RAG = "rag"
+PROMPT_STRATEGY_CHOICES = (
+    PROMPT_STRATEGY_BASELINE,
+    PROMPT_STRATEGY_SINGLE_PROMPT,
+    PROMPT_STRATEGY_HISTORY,
+    PROMPT_STRATEGY_RAG,
+)
+PROMPT_STRATEGY_ENV_KEY = "LAB_AGENT_PROMPT_STRATEGY"
+PROMPT_DEFAULT_STRATEGY = PROMPT_STRATEGY_BASELINE
+PROMPT_RAG_TOP_K = max(1, _safe_env_int("LAB_AGENT_PROMPT_RAG_TOP_K", 3))
+PROMPT_RAG_DEDUPE_PR = _safe_env_bool("LAB_AGENT_PROMPT_RAG_DEDUPE_PR", True)
+PROMPT_RAG_DEVICE = os.environ.get("LAB_AGENT_PROMPT_RAG_DEVICE", "").strip() or None
+PROMPT_MAX_IR_CHARS = max(500, _safe_env_int("LAB_AGENT_PROMPT_MAX_IR_CHARS", 2500))
+PROMPT_MAX_SUMMARY_CHARS = max(
+    500, _safe_env_int("LAB_AGENT_PROMPT_MAX_SUMMARY_CHARS", 4000)
+)
 
 LOCALIZE_CATEGORY_CHOICES = (
     "ConstraintElimination",
@@ -744,6 +763,15 @@ def _parse_cli_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="强制重算 localization：忽略并覆盖 issue 目录下现有 localization.json。",
     )
+    parser.add_argument(
+        "--prompt-strategy",
+        choices=list(PROMPT_STRATEGY_CHOICES),
+        default=None,
+        help=(
+            "instance prompt strategy：baseline|single-prompt|history|rag。"
+            f"优先级：CLI > {PROMPT_STRATEGY_ENV_KEY} > {PROMPT_DEFAULT_STRATEGY}。"
+        ),
+    )
 
     # 通用强度档位（会根据模型自动映射到 reasoning/thinking 参数）
     parser.add_argument(
@@ -845,6 +873,31 @@ def _resolve_localize_mode(cli_mode: str | None) -> tuple[str, str]:
     return mode, source
 
 
+def _resolve_prompt_strategy(cli_strategy: str | None) -> tuple[str, str]:
+    """Resolve prompt strategy with priority: CLI > env > default."""
+    if cli_strategy:
+        strategy = cli_strategy.strip().lower()
+        source = "cli"
+    else:
+        raw_env = os.environ.get(PROMPT_STRATEGY_ENV_KEY, "").strip().lower()
+        if raw_env:
+            strategy = raw_env
+            source = "env"
+        else:
+            strategy = PROMPT_DEFAULT_STRATEGY
+            source = "default"
+
+    if strategy == "single":
+        strategy = PROMPT_STRATEGY_SINGLE_PROMPT
+
+    if strategy not in PROMPT_STRATEGY_CHOICES:
+        allowed = ", ".join(PROMPT_STRATEGY_CHOICES)
+        raise ValueError(
+            f"{PROMPT_STRATEGY_ENV_KEY}={strategy!r} 无效（允许值：{allowed}）。"
+        )
+    return strategy, source
+
+
 def _default_retest_root() -> str:
     """构造 agent 默认复测输出根目录。"""
     return _model_results_root()
@@ -897,6 +950,8 @@ def _build_single_issue_subprocess_cmd(
         cmd.extend(["--localize-mode", args.localize_mode])
     if args.localize_refresh:
         cmd.append("--localize-refresh")
+    if args.prompt_strategy is not None:
+        cmd.extend(["--prompt-strategy", args.prompt_strategy])
 
     _append_thinking_cli_args(cmd, args)
     return cmd
@@ -1062,6 +1117,20 @@ def _get_first_missed_optimization_test_case(
     env: Env,
 ) -> tuple[str, str, str, dict] | None:
     """Return first mismatched test case: source/current/expected/test_file."""
+    cases = _get_missed_optimization_test_cases(env, limit=1)
+    if not cases:
+        return None
+    source_program, cur, exp, test_file, _test = cases[0]
+    return source_program, cur, exp, test_file
+
+
+def _get_missed_optimization_test_cases(
+    env: Env,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str, str, dict, dict]]:
+    """Return mismatched source/current/expected IR cases from the issue."""
+    cases: list[tuple[str, str, str, dict, dict]] = []
     for test_file in env.get_tests():
         tests = test_file.get("tests", [])
         if not isinstance(tests, list):
@@ -1073,8 +1142,10 @@ def _get_first_missed_optimization_test_case(
             cur = str(test.get("current_optimized_program", "")).strip()
             exp = str(test.get("expect_optimized_program", "")).strip()
             if cur != exp:
-                return source_program, cur, exp, test_file
-    return None
+                cases.append((source_program, cur, exp, test_file, test))
+                if limit is not None and len(cases) >= limit:
+                    return cases
+    return cases
 
 
 def _build_pipeline_issue_desc(
@@ -2137,6 +2208,7 @@ def convert_to_pipeline_format(
     start_time: float,
     exit_status: str = "",
     submission: str = "",
+    prompt_strategy: str = "",
 ) -> dict:
     """将 agent 运行结果转换为与 pipeline/generate.py 兼容的 JSON 格式。
 
@@ -2168,6 +2240,7 @@ def convert_to_pipeline_format(
         "patch": patch,
         "exit_status": exit_status,
         "submission": submission,
+        "prompt_strategy": prompt_strategy,
         "log": {
             "model": model_name,
             "messages": agent_messages,
@@ -2284,6 +2357,7 @@ def fix_issue(
     *,
     model_name: str,
     localize_mode: str,
+    prompt_strategy: str,
     localize_refresh: bool = False,
     fresh_run: bool = False,
     thinking_overrides: dict[str, object] | None = None,
@@ -2418,7 +2492,7 @@ def fix_issue(
 
     # 系统和实例模板
     system_tpl = _load_system_template()
-    instance_tpl = _load_instance_template()
+    instance_tpl = _load_instance_template(prompt_strategy, env=env)
 
     agent = LLVMFixAgent(
         model,
@@ -2433,6 +2507,7 @@ def fix_issue(
     # 6. 运行 agent
     print(f"Running agent (step_limit={cfg.step_limit}, cost_limit={cfg.cost_limit})")
     print(f"Model: {litellm_name}")
+    print(f"Prompt strategy: {prompt_strategy}")
     print(f"LLVM dir: {issue_llvm_dir}")
     print(f"Build dir: {build_dir}")
     print(f"Output dir: {run_output_dir}")
@@ -2539,6 +2614,7 @@ def fix_issue(
         start_time,
         exit_status=exit_status,
         submission=submission,
+        prompt_strategy=prompt_strategy,
     )
 
     with open(fix_log_path, "w") as f:
@@ -2587,6 +2663,301 @@ def _update_preds_json(issue_id: str, cert: dict, model_name: str, preds_path: s
 
     with open(preds_path, "w") as f:
         json.dump(preds, f, indent=2)
+
+
+def _format_strategy_ir_block(label: str, text: str, *, max_chars: int) -> str:
+    body = _truncate_text((text or "").strip(), max_chars)
+    return f"{label}\n```llvm\n{body}\n```"
+
+
+def _build_single_prompt_block() -> str:
+    return (
+        "Ensure that the final generated patch can handle more general patterns, "
+        "rather than being limited to the provided test cases."
+    )
+
+
+def _build_history_prompt_block() -> str:
+    return """\
+## Elements Frequently Missed
+
+- **Vector Types**: Many optimizations were initially written for scalar types only and missed vector variants. This includes both fixed-width and scalable vectors (SVE), requiring matchers to handle splat constants, poison elements, and vector-aware constant folding.
+- **Poison and Undef Values**: Transformations frequently failed to account for poison propagation semantics, especially when matching constants like `-1` (all-ones) where poison elements in vectors should be allowed via `m_APIntAllowPoison` variants.
+- **Overflow Flags (nsw/nuw)**: Optimizations often missed opportunities to propagate or infer overflow flags, particularly when combining operations like `add` with `min/max` intrinsics or when flags enable predicate conversions.
+- **Fast-Math Flags (FMF)**: Floating-point optimizations frequently mishandled flag propagation (`nnan`, `ninf`, `nsz`, `fast`), either dropping flags incorrectly or failing to merge flags from multiple sources.
+- **Multi-Use Scenarios**: Transformations were often blocked by single-use constraints when the optimization would still be profitable, or conversely, applied when multi-use would increase instruction count.
+- **Commutative Operand Variations**: Pattern matchers frequently missed commuted operand forms, requiring explicit handling via `m_c_`* matchers or operand swapping logic.
+- **Dominance and Control Flow**: Optimizations involving PHI nodes often missed dominance-based reasoning, leading to infinite loops on backedges or missed opportunities when values dominate use sites.
+- **Edge Cases and Boundary Constants**: Specific constant values like `0`, `-1`, `INT_MIN`, and power-of-two values often required special handling that was initially overlooked.
+- **Metadata Preservation**: Debug locations (`DebugLoc`), annotations, and other metadata were frequently lost during instruction replacement or decomposition.
+- **Type Mismatches and Extensions**: Transformations involving `zext`, `sext`, `trunc`, and type conversions often missed cases where source and destination types differed.
+- **Target-Specific Intrinsics**: SVE, NVPTX, and X86 intrinsics required specialized handling that was often incomplete or missed across intrinsic families.
+- **Constant Expressions**: Optimizations sometimes treated `ConstantExpr` differently from instructions, missing folding opportunities or causing crashes.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Overly Specific Pattern Matching
+
+Many optimizations were written to match exact IR patterns with hardcoded constants, specific operand orders, or narrow type constraints. The generalization strategy consistently involved:
+
+- Replacing literal constants with semantic matchers (`m_Power2`, `m_SignMask`, `m_NonNegative`)
+- Using commutative matchers (`m_c_Add`, `m_c_ICmp`) to handle operand permutations
+- Parameterizing type constraints rather than hardcoding bit widths
+- Extracting core mathematical/algebraic properties rather than matching surface syntax
+
+### Pattern 2: Overly Restrictive Preconditions
+
+Optimizations frequently included unnecessary guards that blocked valid transformations:
+
+- Type restrictions (scalar-only, specific bit widths) that weren't semantically required
+- Single-use constraints that could be relaxed with profitability analysis
+- Declaration-specific guards that prevented optimizing calls to external functions
+- Metadata-specific guards (like `invariant.load`) that excluded more general safe cases
+
+### Pattern 3: Incomplete Intrinsic Recognition
+
+Transformations involving intrinsics often missed:
+
+- Multiple intrinsic variants within a family (e.g., all `isspacep.`* intrinsics)
+- Both signed and unsigned comparison intrinsics (`scmp`/`ucmp`)
+- Intrinsic-to-manual-code equivalence patterns (e.g., `uadd.sat` vs select-based saturation)
+- Flag propagation when creating or replacing intrinsics
+
+### Pattern 4: Comparison Predicate Handling
+
+Optimizations involving comparisons frequently missed:
+
+- Predicate equivalence classes (e.g., `ULT` vs `ULE` with adjusted constants)
+- Signed-to-unsigned predicate conversion when operands have known signs
+- Predicate swapping when operands are commuted
+- The `samesign` attribute and its implications for predicate canonicalization
+
+### Pattern 5: Control Flow and PHI Node Transformations
+
+Transformations involving PHI nodes often failed to handle:
+
+- Loop backedges causing infinite combine loops
+- Multiple predecessors with different source values
+- Moving operations into predecessor blocks safely
+- Critical edges and dominance relationships
+
+### Pattern 6: Bitwise and Shift Operation Idioms
+
+Complex bit manipulation patterns were frequently missed:
+
+- Bit testing via sign-bit shifting (`icmp slt (shl X, (sub bw-1, Y)), 0`)
+- Mask decomposition for comparisons (`(X & Mask) == C` patterns)
+- Distributivity of operations over bitwise operations (`add` over `min/max`)
+- `disjoint` flag enabling xor distribution over or
+
+### Pattern 7: Select Instruction Folding
+
+Select-based patterns often missed:
+
+- Folding operations into select arms when one arm simplifies
+- Recognizing three-way comparison idioms (`scmp`/`ucmp` patterns)
+- Handling vector conditions in select-shuffle folding
+- Poison safety when condition could be poison
+
+### Pattern 8: Memory and Pointer Operations
+
+Transformations involving memory operations frequently missed:
+
+- Address space semantics and pointer validity
+- Null pointer undefined behavior across address spaces
+- Load sinking past calls with proper alias analysis
+- GEP canonicalization and constant offset folding"""
+
+
+def _normalize_bug_location_lineno(
+    raw: object,
+) -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...] | None:
+    """Normalize hints.bug_location_lineno for stable equality checks."""
+    if not isinstance(raw, dict):
+        return None
+
+    normalized: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+    for raw_file, raw_ranges in raw.items():
+        file_path = str(raw_file).strip()
+        if not file_path or not isinstance(raw_ranges, list):
+            continue
+        ranges: list[tuple[int, int]] = []
+        for item in raw_ranges:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            try:
+                start = int(item[0])
+                end = int(item[1])
+            except (TypeError, ValueError):
+                continue
+            ranges.append((start, end))
+        ranges.sort()
+        normalized.append((file_path, tuple(ranges)))
+
+    normalized.sort(key=lambda x: x[0])
+    return tuple(normalized) if normalized else None
+
+
+def _load_bug_location_lineno_from_patch_path(
+    patch_path: str,
+    cache: dict[str, tuple[tuple[str, tuple[tuple[int, int], ...]], ...] | None],
+) -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...] | None:
+    """Load and normalize hints.bug_location_lineno from a retrieval hit patch file."""
+    cached = cache.get(patch_path)
+    if cached is not None:
+        return cached
+    if patch_path in cache:
+        return None
+
+    path = Path(patch_path)
+    if not path.is_absolute():
+        path = Path(_PROJECT_ROOT) / path
+    if not path.is_file():
+        cache[patch_path] = None
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cache[patch_path] = None
+        return None
+
+    hints = payload.get("hints")
+    if not isinstance(hints, dict):
+        cache[patch_path] = None
+        return None
+
+    normalized = _normalize_bug_location_lineno(hints.get("bug_location_lineno"))
+    cache[patch_path] = normalized
+    return normalized
+
+
+def _build_rag_prompt_block(env: Env) -> str:
+    case = _get_first_missed_optimization_test_case(env)
+    if not case:
+        return (
+            "No current source/expected IR pair was available for retrieval. Proceed from the task description."
+        )
+    source_program, _cur, expect_optimized_program, _test_file = case
+
+    try:
+        if _PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, _PROJECT_ROOT)
+        from RAG.retriever import IRPairRetriever
+    except Exception as exc:
+        print(f"[PromptStrategy:RAG] import failed: {exc}")
+        return (
+            "RAG retrieval was requested, but the retriever could not be imported. Proceed from the task description and localization guidance."
+        )
+
+    try:
+        retriever = IRPairRetriever(device=PROMPT_RAG_DEVICE)
+        retrieval_top_k = PROMPT_RAG_TOP_K
+        current_bug_location = _normalize_bug_location_lineno(
+            env.get_hint_line_level_bug_locations()
+        )
+        if current_bug_location is not None:
+            # 需要预留被“同位置”过滤掉的候选，避免返回命中数不足。
+            retrieval_top_k = max(PROMPT_RAG_TOP_K + 5, PROMPT_RAG_TOP_K * 4)
+        hits = retriever.retrieve(
+            source_program,
+            expect_optimized_program,
+            top_k=retrieval_top_k,
+            dedupe_pr=PROMPT_RAG_DEDUPE_PR,
+        )
+    except Exception as exc:
+        print(f"[PromptStrategy:RAG] retrieval failed: {exc}")
+        return (
+            "RAG retrieval was requested, but retrieval failed at runtime. Proceed from the task description and localization guidance."
+        )
+
+    if not hits:
+        return (
+            "RAG retrieval returned no similar examples. Proceed from the task description and localization guidance."
+        )
+
+    filtered_hits = hits
+    if current_bug_location is not None:
+        filtered_hits = []
+        skipped_same_location = 0
+        location_cache: dict[
+            str, tuple[tuple[str, tuple[tuple[int, int], ...]], ...] | None
+        ] = {}
+        for hit in hits:
+            retrieved_bug_location = _load_bug_location_lineno_from_patch_path(
+                hit.patch_path, location_cache
+            )
+            if (
+                retrieved_bug_location is not None
+                and retrieved_bug_location == current_bug_location
+            ):
+                skipped_same_location += 1
+                continue
+            filtered_hits.append(hit)
+            if len(filtered_hits) >= PROMPT_RAG_TOP_K:
+                break
+        if skipped_same_location:
+            print(
+                "[PromptStrategy:RAG] skipped retrieval hits with matching "
+                f"bug_location_lineno: {skipped_same_location}"
+            )
+    else:
+        filtered_hits = hits[:PROMPT_RAG_TOP_K]
+
+    if not filtered_hits:
+        return (
+            "RAG retrieval only returned examples whose bug location matched the current issue, "
+            "so they were skipped. Proceed from the task description and localization guidance."
+        )
+
+    lines = [
+        "The following examples were retrieved using the current issue's source IR and expected target IR. Treat them as hints about likely rewrite style or LLVM implementation location; verify everything against the current task and tests.",
+    ]
+    for idx, hit in enumerate(filtered_hits, start=1):
+        lines.extend(
+            [
+                "",
+                f"### Retrieved Example {idx}",
+            ]
+        )
+        if hit.summary:
+            lines.extend(
+                [
+                    "",
+                    "Summary:",
+                    _truncate_text(hit.summary.strip(), PROMPT_MAX_SUMMARY_CHARS),
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                _format_strategy_ir_block(
+                    "Retrieved source IR:",
+                    hit.source_ir,
+                    max_chars=PROMPT_MAX_IR_CHARS,
+                ),
+                _format_strategy_ir_block(
+                    "Retrieved target IR:",
+                    hit.target_ir,
+                    max_chars=PROMPT_MAX_IR_CHARS,
+                ),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _build_prompt_strategy_block(prompt_strategy: str, env: Env | None) -> str:
+    if prompt_strategy == PROMPT_STRATEGY_BASELINE:
+        return ""
+    if prompt_strategy == PROMPT_STRATEGY_SINGLE_PROMPT:
+        return _build_single_prompt_block()
+    if prompt_strategy == PROMPT_STRATEGY_HISTORY:
+        return _build_history_prompt_block()
+    if env is None:
+        return _build_single_prompt_block()
+    if prompt_strategy == PROMPT_STRATEGY_RAG:
+        return _build_rag_prompt_block(env)
+    return _build_single_prompt_block()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2651,22 +3022,29 @@ You can also use standard bash commands (grep, find, cat, head, tail, etc.) for 
   behavior changes — adjust to preserve existing behavior while keeping the optimization."""
 
 
-def _load_instance_template() -> str:
+def _load_instance_template(
+    prompt_strategy: str = PROMPT_DEFAULT_STRATEGY,
+    *,
+    env: Env | None = None,
+) -> str:
     """加载 instance prompt 模板。"""
-    return """\
+    strategy_block = _build_prompt_strategy_block(prompt_strategy, env)
+    strategy_section = f"\n{strategy_block}\n" if strategy_block.strip() else ""
+    return f"""\
 ## Task: Fix Missed Optimization
 
-{{task}}
+{{{{task}}}}
 
 ## Getting Started
 
 Start by examining the test cases in the task description above. Then locate the relevant source code.
-Use `cd {{cwd}} && python $AGENT_TOOLS_DIR/view_source.py <file> <start> <end>` to browse the code.
+Use `cd {{{{cwd}}}} && python $AGENT_TOOLS_DIR/view_source.py <file> <start> <end>` to browse the code.
 Prioritize the top-ranked file/function in **Localization Predictions** first; use `grep` within predicted files or their pass directory before broader search.
 
 When ready, make your changes. After each `apply_code.py` edit, immediately run
-`cd {{cwd}} && python $AGENT_TOOLS_DIR/build_and_check.py`.
+`cd {{{{cwd}}}} && python $AGENT_TOOLS_DIR/build_and_check.py`.
 Repeat this edit -> fast-check cycle as needed before `check_full.py`.
+{strategy_section}
 
 Hard constraints:
 - First edit + first `build_and_check.py` must happen within 8 actions.
@@ -2700,6 +3078,13 @@ if __name__ == "__main__":
     except ValueError as exc:
         print(f"[ERROR] Invalid localization mode: {exc}")
         sys.exit(2)
+    try:
+        prompt_strategy, prompt_strategy_source = _resolve_prompt_strategy(
+            args.prompt_strategy
+        )
+    except ValueError as exc:
+        print(f"[ERROR] Invalid prompt strategy: {exc}")
+        sys.exit(2)
 
     override = args.force
     issues_arg = args.issues.strip()
@@ -2730,6 +3115,7 @@ if __name__ == "__main__":
     print(f"Model: {cfg.llm_model}")
     print(f"Localization mode: {localize_mode} (source={localize_mode_source})")
     print(f"Localization refresh: {args.localize_refresh}")
+    print(f"Prompt strategy: {prompt_strategy} (source={prompt_strategy_source})")
     print("Thinking overrides:")
     if thinking_overrides:
         print(json.dumps(thinking_overrides, indent=2, ensure_ascii=False))
@@ -2765,6 +3151,7 @@ if __name__ == "__main__":
                     override=override,
                     model_name=cfg.llm_model,
                     localize_mode=localize_mode,
+                    prompt_strategy=prompt_strategy,
                     localize_refresh=args.localize_refresh,
                     fresh_run=args.fresh_run,
                     thinking_overrides=thinking_overrides,
