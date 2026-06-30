@@ -149,7 +149,7 @@ def fuzz_collect_ll_files(
 
     try:
         timeout_s = max(60.0, per_fuzz_timeout * max(1, target_ll))
-        subprocess.run(
+        proc = subprocess.run(
             [
                 str(mutator_bin),
                 seed_path,
@@ -166,8 +166,14 @@ def fuzz_collect_ll_files(
             text=True,
             timeout=timeout_s,
         )
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            if err:
+                print("[WARN] alive-mutate failed:", err.splitlines()[0])
+            else:
+                print(f"[WARN] alive-mutate failed with exit code {proc.returncode}")
     except subprocess.TimeoutExpired:
-        pass
+        print(f"[WARN] alive-mutate timed out after {timeout_s:.1f}s")
     finally:
         try:
             os.unlink(seed_path)
@@ -321,6 +327,7 @@ def _build_intrinsic_decl_table() -> dict[str, str]:
         "llvm.fabs.f64": "declare double @llvm.fabs.f64(double)",
         "llvm.fabs.f80": "declare x86_fp80 @llvm.fabs.f80(x86_fp80)",
         "llvm.fabs.f128": "declare fp128 @llvm.fabs.f128(fp128)",
+        "llvm.assume": "declare void @llvm.assume(i1)",
     }
     for bits in (8, 16, 32, 64):
         ty = f"i{bits}"
@@ -328,6 +335,33 @@ def _build_intrinsic_decl_table() -> dict[str, str]:
         decls[f"llvm.smin.{ty}"] = f"declare {ty} @llvm.smin.{ty}({ty}, {ty})"
         decls[f"llvm.umax.{ty}"] = f"declare {ty} @llvm.umax.{ty}({ty}, {ty})"
         decls[f"llvm.umin.{ty}"] = f"declare {ty} @llvm.umin.{ty}({ty}, {ty})"
+        decls[f"llvm.uadd.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.uadd.with.overflow.{ty}({ty}, {ty})"
+        )
+        decls[f"llvm.sadd.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.sadd.with.overflow.{ty}({ty}, {ty})"
+        )
+        decls[f"llvm.usub.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.usub.with.overflow.{ty}({ty}, {ty})"
+        )
+        decls[f"llvm.ssub.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.ssub.with.overflow.{ty}({ty}, {ty})"
+        )
+        decls[f"llvm.umul.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.umul.with.overflow.{ty}({ty}, {ty})"
+        )
+        decls[f"llvm.smul.with.overflow.{ty}"] = (
+            f"declare {{ {ty}, i1 }} @llvm.smul.with.overflow.{ty}({ty}, {ty})"
+        )
+        for op_bits in (8, 16, 32, 64):
+            op_ty = f"i{op_bits}"
+            # Some datasets use compare intrinsics without explicit declarations in source_program.
+            decls[f"llvm.ucmp.{ty}.{op_ty}"] = (
+                f"declare {ty} @llvm.ucmp.{ty}.{op_ty}({op_ty}, {op_ty})"
+            )
+            decls[f"llvm.scmp.{ty}.{op_ty}"] = (
+                f"declare {ty} @llvm.scmp.{ty}.{op_ty}({op_ty}, {op_ty})"
+            )
     return decls
 
 
@@ -358,10 +392,95 @@ def _inject_missing_intrinsic_decls(seed_ir: str) -> tuple[str, list[str]]:
         missing_known.append(name)
         decl_lines.append(decl)
 
+    # Fallback: infer declaration from call sites for llvm intrinsics not in table.
+    for line in seed_ir.splitlines():
+        m = re.search(
+            r"\bcall\s+(.+?)\s+@((?:llvm)\.[A-Za-z0-9_$.]+)\((.*)\)\s*$",
+            line.strip(),
+        )
+        if not m:
+            continue
+        ret_ty_raw, name, args_raw = m.group(1), m.group(2), m.group(3)
+        if _seed_has_intrinsic_decl(seed_ir, name):
+            continue
+        if any(f"@{name}(" in d for d in decl_lines):
+            continue
+        ret_ty = ret_ty_raw.strip()
+        ret_ty = re.sub(r"\bnoundef\b", "", ret_ty).strip()
+        ret_ty = re.sub(r"\brange\([^)]*\)", "", ret_ty).strip()
+        if not ret_ty:
+            continue
+
+        arg_types: list[str] = []
+        cur: list[str] = []
+        depth = 0
+        for ch in args_raw:
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                arg = "".join(cur).strip()
+                if arg:
+                    arg_types.append(arg)
+                cur = []
+                continue
+            cur.append(ch)
+        last_arg = "".join(cur).strip()
+        if last_arg:
+            arg_types.append(last_arg)
+
+        canonical_args: list[str] = []
+        for a in arg_types:
+            a = re.sub(r"\bnoundef\b", "", a).strip()
+            a = re.sub(r"\brange\([^)]*\)", "", a).strip()
+            a = re.sub(r"\bcaptures\([^)]*\)", "", a).strip()
+            a = re.sub(r"\binitializes\(\([^)]*\)\)", "", a).strip()
+            a = re.sub(r"\binitializes\([^)]*\)", "", a).strip()
+            if not a:
+                continue
+            if a.startswith("{"):
+                # Struct-typed operand: keep leading '{...}' type.
+                close = a.find("}")
+                if close >= 0:
+                    canonical_args.append(a[: close + 1].strip())
+                    continue
+            tok = a.split()
+            if not tok:
+                continue
+            canonical_args.append(tok[0])
+        if not canonical_args and args_raw.strip():
+            continue
+        decl_lines.append(f"declare {ret_ty} @{name}({', '.join(canonical_args)})")
+        missing_known.append(name)
+
     if not decl_lines:
         return seed_ir, []
     patched = seed_ir.rstrip() + "\n\n" + "\n".join(decl_lines) + "\n"
     return patched, missing_known
+
+
+def _sanitize_seed_for_mutator(seed_ir: str) -> tuple[str, list[str]]:
+    """Drop newer IR syntax that old alive-mutate parsers reject."""
+    sanitized = seed_ir
+    notes: list[str] = []
+    rewrites: list[tuple[re.Pattern[str], str, str]] = [
+        (re.compile(r"\brange\([^)]*\)\s*"), "", "range(...) attrs"),
+        (re.compile(r"\bcaptures\([^)]*\)\s*"), "", "captures(...) attrs"),
+        (re.compile(r"\binitializes\(\([^)]*\)\)\s*"), "", "initializes((...)) attrs"),
+        (re.compile(r"\binitializes\([^)]*\)\s*"), "", "initializes(...) attrs"),
+        (re.compile(r"\bnoundef\b\s*"), "", "noundef attrs"),
+    ]
+    for pat, repl, tag in rewrites:
+        next_text, n = pat.subn(repl, sanitized)
+        if n:
+            notes.append(f"{tag} x{n}")
+            sanitized = next_text
+    cast_pat = re.compile(r"\b(trunc|zext|sext)\s+((?:(?:nuw|nsw)\s+)+)")
+    sanitized, cast_n = cast_pat.subn(r"\1 ", sanitized)
+    if cast_n:
+        notes.append(f"cast nuw/nsw flags x{cast_n}")
+    return sanitized, notes
 
 
 def _dataset_seed_source(dataset: dict[str, Any]) -> str | None:
@@ -536,6 +655,12 @@ def process_issue(
         print(
             f"[SEED] {test_issue_id} 自动补充 intrinsic 声明: "
             + ", ".join(injected_intrinsics)
+        )
+    seed_ll, sanitize_notes = _sanitize_seed_for_mutator(seed_ll)
+    if sanitize_notes:
+        print(
+            f"[SEED] {test_issue_id} 为兼容 alive-mutate 清洗语法: "
+            + ", ".join(sanitize_notes)
         )
 
     mutator_path = Path(mutator_bin).expanduser()

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""agent/run.py — 基于 mini-swe-agent 的 LLVM InstCombine 修复主编排脚本。
+"""agent/run_real.py — 基于 mini-swe-agent 的 LLVM InstCombine 修复主编排脚本（dataset-real）。
 
 用法:
-    python agent/run.py                     # 处理 dataset/ 下全部 issue
-    python agent/run.py 85250               # 处理指定 issue
-    python agent/run.py 85250 -f            # 覆盖已有结果
-    python agent/run.py all --issue-workers 4  # 并行处理 issue（默认串行）
-    python agent/run.py 85250 --fresh-run   # 每次从全新工作区和全新 build 开始
-    python agent/run.py 85250,76128         # 处理多个 issue（逗号分隔）
-    python agent/run.py 85250 --retest      # 结束后直接调用 agent/retest_patches.py 复测同批 patch
-    python agent/run.py 85250 --retest --retest-force
+    python agent/run_real.py                     # 处理 dataset-real/ 下全部 issue
+    python agent/run_real.py 186554            # 处理指定 issue
+    python agent/run_real.py 186554 -f         # 覆盖已有结果
+    python agent/run_real.py all --issue-workers 4  # 并行处理 issue（默认串行）
+    python agent/run_real.py 186554 --fresh-run   # 每次从全新工作区和全新 build 开始
+    python agent/run_real.py 186554,184131     # 处理多个 issue（逗号分隔）
+    python agent/run_real.py 186554 --retest   # 结束后直接调用 agent/retest_patches.py 复测同批 patch
+    python agent/run_real.py 186554 --retest --retest-force
 
 输出:
     results/agent/<safe_model>/<safe_issue>/<timestamp>/fix.json
@@ -21,7 +21,7 @@
 
 环境变量配置:
     cp agent/.env.example agent/.env   # 复制模板并填写，即可完全替代 init_agent_env.sh
-    详见 env_config.py（优先级：系统环境变量 > .env > 代码默认值；dataset 固定为仓库 dataset/）
+    详见 env_config.py（优先级：系统环境变量 > .env > 代码默认值；dataset 固定为仓库 dataset-real/）
 """
 
 import argparse
@@ -41,10 +41,10 @@ from urllib.parse import urlparse
 # 设置 sys.path
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
-_PROJECT_DATASET_DIR = os.path.join(_PROJECT_ROOT, "dataset")
+_PROJECT_DATASET_DIR = os.path.join(_PROJECT_ROOT, "dataset-real")
 
-# 与 pipeline 保持一致：强制仅使用仓库内 dataset/。
-# 需要在导入 env_config / llvm_helper 之前设置，避免读取到旧数据集路径。
+# 强制仅使用仓库内 dataset-real/。
+# 需要在导入 env_config / llvm_helper 之前设置，避免读取到其它数据集路径。
 os.environ["LAB_DATASET_DIR"] = _PROJECT_DATASET_DIR
 
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "scripts"))
@@ -54,7 +54,7 @@ sys.path.insert(0, _THIS_DIR)
 # 避免 scripts/llvm_helper.py 在 import 时读取不到 LAB_LLVM_DIR。
 from env_config import cfg
 
-# 双保险：即便外部 shell/.env 注入了其它值，也仅使用 dataset/。
+# 双保险：即便外部 shell/.env 注入了其它值，也仅使用 dataset-real/。
 cfg.dataset_dir = _PROJECT_DATASET_DIR
 
 
@@ -308,7 +308,7 @@ def _build_output_paths(issue_id: str) -> tuple[str, str, str, str]:
 
 
 def _list_dataset_issue_ids() -> list[str]:
-    """仅枚举 dataset/ 下的 issue JSON（不混入其它文件）。"""
+    """仅枚举 dataset-real/ 下的 issue JSON（不混入其它文件）。"""
     issue_ids: list[str] = []
     for name in sorted(os.listdir(llvm_helper.dataset_dir)):
         if not name.endswith(".json"):
@@ -3158,18 +3158,18 @@ if __name__ == "__main__":
         ids = issues_arg.split(",")
         task_list = [x.strip().removesuffix(".json") for x in ids if x.strip()]
 
-    # 仅保留 dataset/ 中存在的 issue，避免误跑历史/外部数据。
+    # 仅保留 dataset-real/ 中存在的 issue，避免误跑历史/外部数据。
     filtered_task_list: list[str] = []
     for task_id in task_list:
         dataset_file = os.path.join(llvm_helper.dataset_dir, f"{task_id}.json")
         if os.path.isfile(dataset_file):
             filtered_task_list.append(task_id)
         else:
-            print(f"[WARN] Skip unknown issue {task_id}: not found in dataset/")
+            print(f"[WARN] Skip unknown issue {task_id}: not found in dataset-real/")
     task_list = filtered_task_list
 
     if not task_list:
-        print("No valid issues found in dataset/ to process")
+        print("No valid issues found in dataset-real/ to process")
         sys.exit(0)
 
     print(f"Agent workflow — {len(task_list)} issue(s) to process")

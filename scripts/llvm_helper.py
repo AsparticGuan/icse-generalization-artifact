@@ -449,6 +449,57 @@ def lli_check(tgt: bytes, expected_out: str):
         return (False, str(e) + "\n" + decode_output(e.output))
 
 
+def _use_dataset_real_cost() -> bool:
+    """dataset-real 使用 llvm-mca Block RThroughput 作为 cost。"""
+    return Path(dataset_dir).name == "dataset-real"
+
+
+def _run_mca_block_rthroughput(ir: str) -> int:
+    """IR -> llc -> llvm-mca，返回 Block RThroughput（×1000 取整，便于比较）。"""
+    ir = (ir or "").strip()
+    if not ir:
+        raise ValueError("empty IR for llvm-mca")
+    llc = os.path.join(llvm_build_dir, "bin", "llc")
+    mca = os.path.join(llvm_build_dir, "bin", "llvm-mca")
+    with _named_temp_file(suffix=".ll") as ir_file:
+        ir_file.write(ir.encode())
+        ir_file.flush()
+        with _named_temp_file(suffix=".s") as asm_file:
+            subprocess.check_output(
+                [
+                    llc,
+                    "-mtriple=x86_64--",
+                    "-mcpu=skylake",
+                    ir_file.name,
+                    "-o",
+                    asm_file.name,
+                ],
+                stderr=subprocess.STDOUT,
+            )
+            out = subprocess.check_output(
+                [mca, asm_file.name], stderr=subprocess.STDOUT
+            ).decode()
+    match = re.search(r"Block RThroughput:\s*([0-9.]+)", out)
+    if not match:
+        raise ValueError(f"Block RThroughput not found in llvm-mca output:\n{out[:800]}")
+    return int(round(float(match.group(1)) * 1000))
+
+
+def _measure_ir_cost(ir: str) -> int:
+    """对单份 IR 调用 cost 工具；失败返回 -1。"""
+    with _named_temp_file(suffix=".ll") as code_file:
+        code_file.write(ir.encode())
+        code_file.flush()
+        try:
+            out = subprocess.check_output(
+                [llvm_cost_tool, code_file.name], stderr=subprocess.STDOUT
+            ).decode()
+            return int(out.strip().split("Cost: ")[1])
+        except Exception as e:
+            print(e)
+            return -1
+
+
 def cost_check(
     source_program: str, expect_optimized_program: str, current_optimized_program: str
 ):
@@ -459,8 +510,12 @@ def cost_check(
     - current_optimized_program: 当前待评估结果
 
     判定策略：current 需优于 source，且不劣于 expected。
+    dataset-real 走 cost_check_real（llvm-mca Block RThroughput）。
     """
-    cost_command = []
+    if _use_dataset_real_cost():
+        return cost_check_real(
+            source_program, expect_optimized_program, current_optimized_program
+        )
     programs = {
         "source_program": source_program,
         "expect_optimized_program": expect_optimized_program,
@@ -471,19 +526,8 @@ def cost_check(
         "expect_optimized_program": -1,
         "current_optimized_program": -1,
     }
-    for prog_name in programs:
-        with _named_temp_file(suffix=".ll") as code_file:
-            code_file.write(programs[prog_name].encode())
-            code_file.flush()
-            try:
-                out = subprocess.check_output(
-                    [llvm_cost_tool, code_file.name], stderr=subprocess.STDOUT
-                ).decode()
-                cost = int(out.strip().split("Cost: ")[1])
-                costs[prog_name] = cost
-            except Exception as e:
-                print(e)
-                pass
+    for prog_name, ir in programs.items():
+        costs[prog_name] = _measure_ir_cost(ir)
     success = False
     # Should be modified to if test["cost"]["current_optimized_program"] < test["cost"]["source_program"] or
     # \ test["cost"]["current_optimized_program"] <= test["cost"]["expect_optimized_program"]:
@@ -497,6 +541,41 @@ def cost_check(
 
     print(f"costs: {costs}")
     print(f"success: {success}")
+    return (success, costs)
+
+
+def cost_check_real(
+    source_program: str, expect_optimized_program: str, current_optimized_program: str
+):
+    """
+    dataset-real 专用 cost：基于 llvm-mca Block RThroughput。
+    任一份 cost 失败（-1）则整体判定为未通过。
+    """
+    programs = {
+        "source_program": source_program,
+        "expect_optimized_program": expect_optimized_program,
+        "current_optimized_program": current_optimized_program,
+    }
+    costs = {
+        "source_program": -1,
+        "expect_optimized_program": -1,
+        "current_optimized_program": -1,
+    }
+    for prog_name in programs:
+        try:
+            costs[prog_name] = _run_mca_block_rthroughput(programs[prog_name])
+        except Exception as e:
+            print(e)
+            pass
+    success = False
+    if all(v >= 0 for v in costs.values()):
+        if (
+            costs["current_optimized_program"] <= costs["source_program"]
+            and costs["current_optimized_program"] <= costs["expect_optimized_program"]
+        ):
+            success = True
+
+    print(f"costs (real): {costs}")
     return (success, costs)
 
 
